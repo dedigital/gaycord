@@ -1,84 +1,50 @@
-# Gaycord V5 kurulum/yayınlama
+# Gaycord V6 Security kurulum/yayınlama
 
-## Mevcut GitHub repona güncelleme
+1. `gaycord-v6.zip` dosyasını çıkar.
+2. Zip içindeki `gaycord-v6` klasörünün içindeki dosya/klasörleri mevcut `gaycord` repo klasörüne kopyala.
+3. GitHub Desktop:
 
-1. Bu zip'i çıkar.
-2. Zip içindeki `gaycord-v5` klasörünü aç.
-3. İçindeki dosyaları mevcut `gaycord` repo klasörünün içine kopyala ve değiştir.
-4. GitHub Desktop:
-
-```text
-Summary: Gaycord V5 layout and persistence fix
+```txt
+Summary: Gaycord V6 security update
 Commit to main
 Push origin
 ```
 
-5. Render otomatik deploy etmezse:
+4. Render otomatik deploy etmezse:
 
-```text
+```txt
 Render > gaycord > Manual Deploy > Deploy latest commit
 ```
 
-Deploy bitince kontrol:
+5. Deploy sonrası kontrol:
 
-```text
+```txt
 https://gaycord.onrender.com/api/health
 ```
 
-Cevapta şunlar görünmeli:
+Şu alanları görmelisin:
 
-```text
-app: gaycord-v5
-version: 5.0.0
+```txt
+app: gaycord-v6
+version: 6.0.0
+storageMode: postgres
+persistentData: true
 ```
 
-## Hesaplar/sunucular tekrar silinmesin
+## Kalıcı veri
 
-Kod düzeltmesi tek başına bunu çözemez; Render'da kalıcı veri alanı açman gerekir. En kolay ve sağlam yöntem PostgreSQL'dir.
+Render web service Environment bölümünde şu olmalı:
 
-Render'da:
-
-```text
-Render > gaycord > Environment > Add Environment Variable
-Key: DATABASE_URL
-Value: postgresql://...
-Save Changes
+```txt
+DATABASE_URL = Internal Database URL
 ```
 
-Sonra Render yeni deploy başlatır. Bittiğinde uygulama Ayarlar > Veri kalıcılığı bölümünde `Kalıcı veri aktif` göstermeli.
+## E2EE kullanımı
 
-Alternatif Render Disk:
+1. Kanal veya DM aç.
+2. Üstte `🔓 E2EE` butonuna bas.
+3. En az 8 karakterlik ortak anahtar yaz.
+4. Arkadaşına aynı anahtarı Gaycord dışında söyle.
+5. Bu mod açıkken yeni metin/dosya/foto/sesli mesajlar server tarafından okunamaz.
 
-```text
-Disk mount path: /var/data
-Environment Variable:
-GAYCORD_DATA_DIR=/var/data/gaycord
-```
-
-Önemli: Şu ana kadar silinen eski veriyi geri getiremezsin; eski deploydan yedek indirmediysen Render'ın geçici dosya sistemi onu silmiş olabilir. Ama `DATABASE_URL` ekledikten sonra sonraki güncellemelerde aynı veriyi okumaya devam eder.
-
-## Windows app
-
-GitHub Actions'ta build bitince artifact:
-
-```text
-Gaycord-Windows-Native
-```
-
-İndir, `server.txt` içine şu linki yaz:
-
-```text
-https://gaycord.onrender.com
-```
-
-Sonra klasörü zipleyip arkadaşlarına gönderebilirsin.
-
-## Güncellemeden önce önerilen güvenli yol
-
-1. Varsa mevcut çalışan sitede admin hesabınla giriş yap.
-2. `Ayarlar > Yedek > Yedek indir` ile yedek al.
-3. V5'i pushla.
-4. PostgreSQL `DATABASE_URL` ekle.
-5. Deploydan sonra eski hesap yoksa giriş ekranındaki yedek yükleme ile geri getir.
-
-Tarayıcıdaki otomatik yedek butonu yalnızca veritabanı tamamen boşsa görünür. Bu sayede yanlışlıkla dolu sistemi ezmez.
+Anahtar servera gönderilmez. Anahtar unutulursa şifreli mesajlar açılamaz.

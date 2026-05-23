@@ -6,7 +6,7 @@ const els = {
   homeButton: $('homeButton'), serverDots: $('serverDots'), createServerButton: $('createServerButton'), joinServerButton: $('joinServerButton'),
   sidebarMode: $('sidebarMode'), sidebarTitle: $('sidebarTitle'), connectionState: $('connectionState'), dynamicPanel: $('dynamicPanel'),
   meAvatar: $('meAvatar'), meName: $('meName'), meUsername: $('meUsername'), settingsButton: $('settingsButton'), logoutButton: $('logoutButton'),
-  chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
+  chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), e2eeButton: $('e2eeButton'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
   messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'),
   membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast'),
   publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput')
@@ -15,6 +15,7 @@ const els = {
 const state = {
   authMode: 'login',
   user: null,
+  csrfToken: '',
   isAppOwner: false,
   settings: { theme: 'dark', compactMode: false, reduceMotion: false },
   dataStatus: null,
@@ -39,7 +40,8 @@ const state = {
   sendingFile: false,
   voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null },
   publicStatus: null,
-  autoBackupTimer: null
+  autoBackupTimer: null,
+  e2ee: { passphrases: new Map(), enabled: new Set(), objectUrls: new Map() }
 };
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
@@ -78,15 +80,110 @@ function autoGrowInput() {
   els.messageInput.style.height = `${Math.min(132, els.messageInput.scrollHeight)}px`;
 }
 async function api(path, options = {}) {
+  const method = options.method || 'GET';
+  const headers = options.body ? { 'Content-Type': 'application/json' } : {};
+  if (options.body && state.csrfToken) headers['x-gaycord-csrf'] = state.csrfToken;
   const res = await fetch(path, {
-    method: options.method || 'GET',
+    method,
     credentials: 'same-origin',
-    headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'İstek başarısız oldu.');
   return data;
+}
+
+const E2EE_ITERATIONS = 250000;
+const E2EE_ENCODER = new TextEncoder();
+const E2EE_DECODER = new TextDecoder();
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  return btoa(binary);
+}
+function base64ToBytes(base64) {
+  const binary = atob(String(base64 || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+async function deriveE2eeKey(passphrase, salt) {
+  const keyMaterial = await crypto.subtle.importKey('raw', E2EE_ENCODER.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: E2EE_ITERATIONS }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+function e2eeChannelKey(channelId = state.currentChannelId) { return String(channelId || ''); }
+function e2eeEnabled(channelId = state.currentChannelId) { return Boolean(channelId && state.e2ee.enabled.has(e2eeChannelKey(channelId)) && state.e2ee.passphrases.has(e2eeChannelKey(channelId))); }
+function e2eePassphrase(channelId = state.currentChannelId) { return state.e2ee.passphrases.get(e2eeChannelKey(channelId)) || ''; }
+function setE2eePassphrase(channelId, passphrase, enabled = true) {
+  const key = e2eeChannelKey(channelId);
+  if (!key) return;
+  if (!passphrase) { state.e2ee.passphrases.delete(key); state.e2ee.enabled.delete(key); }
+  else { state.e2ee.passphrases.set(key, passphrase); if (enabled) state.e2ee.enabled.add(key); }
+  renderE2eeButton();
+  decryptVisibleMessages();
+}
+async function encryptPayload(channelId, payload) {
+  if (!crypto.subtle) throw new Error('Tarayıcı Web Crypto desteklemiyor.');
+  const passphrase = e2eePassphrase(channelId);
+  if (!passphrase) throw new Error('Bu kanal için E2EE anahtarı yok.');
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveE2eeKey(passphrase, salt);
+  const plaintext = E2EE_ENCODER.encode(JSON.stringify(payload));
+  const aad = E2EE_ENCODER.encode(`gaycord-v6:${channelId}`);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext));
+  return { v: 1, alg: 'AES-GCM', kdf: 'PBKDF2-SHA256', iterations: E2EE_ITERATIONS, salt: bytesToBase64(salt), iv: bytesToBase64(iv), ciphertext: bytesToBase64(ciphertext) };
+}
+async function decryptPayload(channelId, e2ee) {
+  const passphrase = e2eePassphrase(channelId);
+  if (!passphrase) throw new Error('Anahtar yok');
+  const salt = base64ToBytes(e2ee.salt); const iv = base64ToBytes(e2ee.iv); const ciphertext = base64ToBytes(e2ee.ciphertext);
+  const key = await deriveE2eeKey(passphrase, salt);
+  const aad = E2EE_ENCODER.encode(`gaycord-v6:${channelId}`);
+  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ciphertext);
+  return JSON.parse(E2EE_DECODER.decode(plaintext));
+}
+function dataUrlToBlob(dataUrl) {
+  const [head, body] = String(dataUrl || '').split(',');
+  const mime = (head.match(/^data:([^;]+)/) || [])[1] || 'application/octet-stream';
+  return new Blob([base64ToBytes(body || '')], { type: mime });
+}
+function objectUrlForMessage(messageId, dataUrl) {
+  const old = state.e2ee.objectUrls.get(messageId);
+  if (old) return old;
+  const url = URL.createObjectURL(dataUrlToBlob(dataUrl));
+  state.e2ee.objectUrls.set(messageId, url);
+  return url;
+}
+function renderE2eeButton() {
+  if (!els.e2eeButton) return;
+  const hasChannel = Boolean(state.currentChannelId);
+  els.e2eeButton.classList.toggle('hidden', !hasChannel);
+  if (!hasChannel) return;
+  const on = e2eeEnabled(state.currentChannelId);
+  els.e2eeButton.classList.toggle('e2ee-on', on);
+  els.e2eeButton.textContent = on ? '🔒 E2EE açık' : '🔓 E2EE';
+  els.messageInput.placeholder = on ? 'Şifreli mesaj yaz... Server sadece ciphertext görür.' : 'Mesaj yaz, fotoğraf yapıştır veya dosya sürükle...';
+}
+function promptE2eeKey() {
+  if (!state.currentChannelId) return;
+  const current = e2eePassphrase(state.currentChannelId);
+  const passphrase = prompt('Bu kanal/DM için E2EE anahtarı yaz. Aynı anahtarı arkadaşlarınla uygulama dışından paylaş. Server bu anahtarı görmez.', current ? '********' : '');
+  if (passphrase === null) return;
+  if (!passphrase || passphrase === '********') return;
+  if (passphrase.length < 8) return toast('E2EE anahtarı en az 8 karakter olsun.');
+  setE2eePassphrase(state.currentChannelId, passphrase, true);
+  toast('E2EE bu sekmede açıldı. Yeni mesajlar şifreli gönderilecek.');
+}
+async function decryptVisibleMessages() {
+  const items = [...els.messages.querySelectorAll('[data-secure-message="1"]')];
+  for (const item of items) {
+    const raw = item.dataset.messageJson;
+    if (!raw) continue;
+    try { await renderDecryptedMessage(JSON.parse(raw), item); } catch {}
+  }
 }
 
 const LOCAL_BACKUP_KEY = 'gaycord:last-light-backup:v1';
@@ -189,6 +286,7 @@ function warnTemporaryStorageOnce() {
 }
 function ingestMe(data) {
   state.user = data.user || state.user;
+  if (data.csrfToken) state.csrfToken = data.csrfToken;
   state.isAppOwner = Boolean(data.isAppOwner || state.user?.isAppOwner);
   state.settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(state.user?.settings || {}) };
   state.dataStatus = data.dataStatus || data.appInfo?.dataStatus || null;
@@ -273,6 +371,7 @@ function resetChat(title = 'Hoş geldin', subtitle = 'Bir kanal veya DM seç.') 
   els.chatTitle.textContent = title;
   els.chatSubtitle.textContent = subtitle;
   els.copyInviteButton.classList.add('hidden');
+  els.e2eeButton?.classList.add('hidden');
   els.messageInput.value = '';
   autoGrowInput();
   els.messageInput.disabled = true;
@@ -290,7 +389,63 @@ function renderMessages(messages = []) {
   for (const message of messages) appendMessage(message, { scroll: false });
   scrollMessages();
 }
+function renderDecryptedPayloadInto(bubble, message, payload) {
+  bubble.innerHTML = '';
+  const meta = document.createElement('div'); meta.className = 'message-meta';
+  const name = document.createElement('strong'); name.textContent = `${message.user?.displayName || message.user?.username || 'Bilinmeyen'} 🔒`;
+  const time = document.createElement('time'); time.textContent = formatTime(message.createdAt);
+  meta.append(name, time); bubble.appendChild(meta);
+  if (payload.kind === 'voice') {
+    const label = document.createElement('div'); label.className = 'message-body secure-ok'; label.textContent = `🔒🎙️ Şifreli sesli mesaj${payload.durationMs ? ` • ${Math.max(1, Math.round(payload.durationMs / 1000))} sn` : ''}`;
+    const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'metadata'; audio.src = objectUrlForMessage(message.id, payload.audioData);
+    bubble.append(label, audio);
+  } else if (payload.kind === 'file') {
+    if (payload.text) { const caption = document.createElement('div'); caption.className = 'file-caption secure-ok'; caption.textContent = `🔒 ${payload.text}`; bubble.appendChild(caption); }
+    const mime = String(payload.mimeType || '').toLowerCase();
+    const url = objectUrlForMessage(message.id, payload.fileData);
+    if (!state.settings.compactMode && mime.startsWith('image/')) { const img = document.createElement('img'); img.className = 'message-image'; img.src = url; img.alt = payload.fileName || 'şifreli fotoğraf'; img.loading = 'lazy'; bubble.appendChild(img); }
+    else if (!state.settings.compactMode && mime.startsWith('video/')) { const video = document.createElement('video'); video.className = 'message-video'; video.src = url; video.controls = true; video.preload = 'metadata'; bubble.appendChild(video); }
+    else if (!state.settings.compactMode && mime.startsWith('audio/')) { const audio = document.createElement('audio'); audio.src = url; audio.controls = true; audio.preload = 'metadata'; bubble.appendChild(audio); }
+    const link = document.createElement('a'); link.className = 'message-file'; link.href = url; link.download = payload.fileName || 'encrypted-file'; link.textContent = `🔒📎 ${payload.fileName || 'şifreli dosya'} ${formatBytes(payload.sizeBytes)}`; bubble.appendChild(link);
+  } else {
+    const text = document.createElement('div'); text.className = 'message-body secure-ok'; text.textContent = `🔒 ${payload.text || ''}`; bubble.appendChild(text);
+  }
+}
+async function renderDecryptedMessage(message, article) {
+  const bubble = article.querySelector('.message-bubble');
+  if (!bubble) return;
+  try {
+    const payload = await decryptPayload(message.channelId, message.e2ee);
+    renderDecryptedPayloadInto(bubble, message, payload);
+    article.classList.remove('secure-locked'); article.classList.add('secure-unlocked');
+  } catch {
+    article.classList.add('secure-locked'); article.classList.remove('secure-unlocked');
+  }
+}
+function appendSecureMessage(message, { scroll = true } = {}) {
+  if (!message || message.channelId !== state.currentChannelId) return;
+  if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
+  if (els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
+  const article = document.createElement('article');
+  article.className = `message secure-message ${message.user?.id === state.user?.id ? 'own' : ''}`;
+  article.dataset.messageId = message.id;
+  article.dataset.secureMessage = '1';
+  article.dataset.messageJson = JSON.stringify(message);
+  const avatar = document.createElement('div'); avatar.className = `avatar ${state.onlineIds.has(message.user?.id) || message.user?.online ? 'online' : ''}`; avatar.textContent = initials(message.user?.displayName || message.user?.username || '?');
+  const bubble = document.createElement('div'); bubble.className = 'message-bubble';
+  const meta = document.createElement('div'); meta.className = 'message-meta';
+  const name = document.createElement('strong'); name.textContent = message.user?.displayName || message.user?.username || 'Bilinmeyen';
+  const time = document.createElement('time'); time.textContent = formatTime(message.createdAt); meta.append(name, time); bubble.appendChild(meta);
+  const locked = document.createElement('div'); locked.className = 'secure-card'; locked.innerHTML = '<strong>🔒 Şifreli mesaj</strong><small>Bu mesaj serverda okunamaz. Açmak için bu kanalın E2EE anahtarını gir.</small>';
+  const unlock = document.createElement('button'); unlock.type = 'button'; unlock.className = 'mini-button'; unlock.textContent = 'Anahtar gir / çöz'; unlock.addEventListener('click', promptE2eeKey);
+  locked.appendChild(unlock); bubble.appendChild(locked);
+  article.append(avatar, bubble); els.messages.appendChild(article);
+  if (e2eePassphrase(message.channelId)) renderDecryptedMessage(message, article);
+  if (scroll) scrollMessages();
+}
+
 function appendMessage(message, { scroll = true } = {}) {
+  if (message?.encrypted && message?.e2ee) return appendSecureMessage(message, { scroll });
   if (!message || message.channelId !== state.currentChannelId) return;
   if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
   if (els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
@@ -449,7 +604,8 @@ async function openChannel(channel, context = {}) {
   els.chatTitle.textContent = context.title || channel.name || 'Sohbet';
   els.chatSubtitle.textContent = context.subtitle || 'Mesajlaşmaya başla.';
   els.copyInviteButton.classList.toggle('hidden', !state.currentInviteCode);
-  els.messageInput.disabled = false; els.sendButton.disabled = false; els.recordButton.disabled = false; els.fileButton.disabled = false;
+  renderE2eeButton();
+  els.messageInput.disabled = false; els.sendButton.disabled = false; els.recordButton.disabled = false; els.fileButton.disabled = false; renderE2eeButton();
   els.messageInput.focus(); renderVoicePanel();
   if (state.socket?.connected) {
     state.socket.emit('channel:join', { channelId: channel.id }, (response) => { if (response?.error) return toast(response.error); renderMessages(response.messages || []); });
@@ -478,9 +634,24 @@ function connectSocket() {
   state.socket.on('voice:signal', handleVoiceSignal);
 }
 
+async function sendSecurePayload(payload) {
+  if (!state.currentChannelId) return;
+  const e2ee = await encryptPayload(state.currentChannelId, payload);
+  const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', encrypted: true, e2ee } });
+  if (!state.socket?.connected) appendMessage(data.message);
+  return data.message;
+}
 async function sendTextMessage() {
   const text = els.messageInput.value.trim(); if (!text || !state.currentChannelId) return;
   els.sendButton.disabled = true;
+  if (e2eeEnabled(state.currentChannelId)) {
+    try {
+      await sendSecurePayload({ kind: 'text', text });
+      els.messageInput.value = ''; autoGrowInput(); state.socket?.emit('typing', { channelId: state.currentChannelId, isTyping: false });
+    } catch (e) { toast(e.message); }
+    finally { els.sendButton.disabled = false; }
+    return;
+  }
   if (state.socket?.connected) {
     state.socket.emit('message:text', { channelId: state.currentChannelId, text }, (response) => {
       els.sendButton.disabled = false;
@@ -581,9 +752,17 @@ async function stopRecording() {
     const blob = encodeWav(mergeFloat32(chunks), recorder.sampleRate || 48000);
     if (!blob.size) throw new Error('Ses kaydı boş geldi.');
     const dataUrl = await blobToDataURL(blob);
-    const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs } });
-    if (!state.socket?.connected) appendMessage(response.message);
-    toast('Sesli mesaj gönderildi.');
+    if (e2eeEnabled(channelId)) {
+      const oldChannel = state.currentChannelId;
+      state.currentChannelId = channelId;
+      await sendSecurePayload({ kind: 'voice', audioData: dataUrl, mimeType: 'audio/wav', durationMs });
+      state.currentChannelId = oldChannel;
+      toast('Şifreli sesli mesaj gönderildi.');
+    } else {
+      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs } });
+      if (!state.socket?.connected) appendMessage(response.message);
+      toast('Sesli mesaj gönderildi.');
+    }
   } catch (error) { toast(error.message || 'Sesli mesaj gönderilemedi.'); }
   finally { try { await recorder.context?.close?.(); } catch {} }
 }
@@ -593,10 +772,16 @@ async function sendFile(file) {
   state.sendingFile = true; els.fileButton.disabled = true;
   try {
     const fileData = await fileToDataURL(file); const caption = els.messageInput.value.trim();
-    const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption } });
-    if (caption) { els.messageInput.value = ''; autoGrowInput(); }
-    if (!state.socket?.connected) appendMessage(data.message);
-    toast('Dosya gönderildi.');
+    if (e2eeEnabled(state.currentChannelId)) {
+      await sendSecurePayload({ kind: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', sizeBytes: file.size || 0, text: caption });
+      if (caption) { els.messageInput.value = ''; autoGrowInput(); }
+      toast('Şifreli dosya gönderildi.');
+    } else {
+      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption } });
+      if (caption) { els.messageInput.value = ''; autoGrowInput(); }
+      if (!state.socket?.connected) appendMessage(data.message);
+      toast('Dosya gönderildi.');
+    }
   } catch (e) { toast(e.message); }
   finally { state.sendingFile = false; els.fileButton.disabled = false; els.fileInput.value = ''; }
 }
@@ -675,6 +860,7 @@ async function showSettings() {
     <section class="settings-section"><h3>Profil</h3><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
+    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Tüm oturumları kapat</button></section>
     <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
     <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
@@ -694,6 +880,11 @@ async function showSettings() {
     const info = await api('/api/storage-info'); const ok = Boolean(info.persistentData);
     $('storageInfo').innerHTML = `<span class="avatar ${ok ? 'online' : ''}">${ok ? '✓' : '!'}</span><span class="row-grow"><strong>${ok ? 'Kalıcı veri aktif' : 'Kalıcı veri garanti değil'}</strong><br><small>${escapeHTML(info.storageMode || 'file')} • ${escapeHTML(info.dataDir || '')} • ${info.uploadCount || 0} dosya • ${escapeHTML(info.warning || '')}</small></span>`;
   } catch { $('storageInfo').innerHTML = '<span class="row-grow"><strong>Veri bilgisi alınamadı</strong><br><small>/api/storage-info yanıt vermedi.</small></span>'; }
+  try {
+    const sec = await api('/api/security/status');
+    $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V6 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
+  } catch { $('securityInfo').innerHTML = '<span class="row-grow"><strong>Güvenlik durumu alınamadı</strong><br><small>/api/security/status yanıt vermedi.</small></span>'; }
+  $('logoutAllButton')?.addEventListener('click', async () => { if (!confirm('Tüm cihazlardaki oturumların kapatılsın mı?')) return; try { await api('/api/security/logout-all', { method: 'POST', body: {} }); toast('Oturumlar kapatıldı.'); setTimeout(() => location.reload(), 500); } catch (e) { toast(e.message); } });
   $('downloadBackupButton')?.addEventListener('click', async () => {
     try { const response = await fetch('/api/admin/export', { credentials: 'same-origin' }); if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Yedek indirilemedi.'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `gaycord-backup-${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(url); } catch (e) { toast(e.message); }
   });
@@ -735,6 +926,7 @@ function wireEvents() {
   els.joinServerButton.addEventListener('click', async () => { const inviteCode = prompt('Davet kodu?'); if (!inviteCode) return; try { const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode } }); replaceServer(data.server); renderServerPanel(data.server.id); toast('Sunucuya katıldın.'); } catch (e) { toast(e.message); } });
   els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); state.socket?.disconnect(); cleanupVoice(false); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
+  els.e2eeButton?.addEventListener('click', promptE2eeKey);
   els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });
   els.messageInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendTextMessage(); } });
   els.messageInput.addEventListener('input', () => { autoGrowInput(); if (!state.currentChannelId || !state.socket?.connected) return; state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: true }); clearTimeout(state.typingTimeout); state.typingTimeout = setTimeout(() => state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false }), 900); });

@@ -1,9 +1,3 @@
-# Gaycord Windows Native
+# Gaycord Native Windows
 
-Bu klasör WPF tabanlı native Windows istemcisidir. V5 ile proje adı Gaycord olarak kalır. Web/PWA tarafı V5'te daha fazla özellik içerir: ayarlar, fotoğraf önizleme, web sesli arama ve üyeler paneli.
-
-Build için GitHub Actions kullanılır. Çıkan pakette `server.txt` içine Render linkini yaz:
-
-```text
-https://gaycord.onrender.com
-```
+WPF tabanlı native Windows istemcisidir. V6 Security güncellemesinin en güçlü güvenlik özellikleri web/PWA tarafındadır: CSRF, korumalı upload ve opsiyonel E2EE. Windows istemcisi temel mesajlaşma/sesli mesaj/native kullanım içindir.

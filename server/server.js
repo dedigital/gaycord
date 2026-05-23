@@ -12,12 +12,18 @@ const PORT = Number(process.env.PORT || 3000);
 const MAX_TEXT_LENGTH = Number(process.env.MAX_TEXT_LENGTH || 2000);
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 15 * 1024 * 1024);
 const MAX_BACKUP_BYTES = Number(process.env.MAX_BACKUP_BYTES || 60 * 1024 * 1024);
-const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 140000);
+const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 310000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
 const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4'); // bilerek sabit: güncellemelerde PostgreSQL verisi aynı anahtarda kalır
-const APP_VERSION = '5.0.0';
-const APP_NAME = 'gaycord-v5';
+const APP_VERSION = '6.0.0';
+const APP_NAME = 'gaycord-v6';
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
+const CSRF_HEADER = 'x-gaycord-csrf';
+const MAX_E2EE_PAYLOAD_LENGTH = Number(process.env.MAX_E2EE_PAYLOAD_LENGTH || Math.ceil(MAX_BACKUP_BYTES * 1.35));
+const SECURITY_LOG_LIMIT = Number(process.env.SECURITY_LOG_LIMIT || 500);
+const TRUSTED_ORIGINS = String(process.env.TRUSTED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
+const REQUIRE_HTTPS = String(process.env.REQUIRE_HTTPS || (process.env.RENDER === 'true' ? '1' : '0')) === '1';
 
 const ROOT = __dirname;
 const LEGACY_DATA_DIR = path.join(ROOT, 'data');
@@ -52,7 +58,7 @@ function id(prefix = '') { return `${prefix}${crypto.randomBytes(10).toString('h
 function inviteCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
 
 const emptyDb = () => ({
-  version: 5,
+  version: 6,
   adminUserId: '',
   users: {},
   usernameIndex: {},
@@ -63,7 +69,8 @@ const emptyDb = () => ({
   messages: {},
   uploads: {},
   uploadBlobs: {},
-  appSettings: { createdAt: now(), lastBackupHintAt: null }
+  appSettings: { createdAt: now(), lastBackupHintAt: null },
+  securityEvents: []
 });
 
 let db = emptyDb();
@@ -77,7 +84,7 @@ function normalizeUsername(username) { return String(username || '').trim().toLo
 
 function normalizeDb(raw) {
   const db = { ...emptyDb(), ...(raw || {}) };
-  db.version = 5;
+  db.version = 6;
   db.users ||= {};
   db.usernameIndex ||= {};
   db.sessions ||= {};
@@ -88,6 +95,7 @@ function normalizeDb(raw) {
   db.uploads ||= {};
   db.uploadBlobs ||= {};
   db.appSettings ||= { createdAt: now(), lastBackupHintAt: null };
+  db.securityEvents = Array.isArray(db.securityEvents) ? db.securityEvents.slice(-SECURITY_LOG_LIMIT) : [];
 
   db.usernameIndex = {};
   for (const [userId, user] of Object.entries(db.users)) {
@@ -96,7 +104,9 @@ function normalizeDb(raw) {
     user.displayName ||= user.username;
     user.status ||= '';
     user.createdAt ||= now();
-    user.settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(user.settings || {}) };
+    user.settings = { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true, ...(user.settings || {}) };
+    user.passwordIterations ||= user.passwordHash ? 140000 : undefined;
+    user.failedLoginCount ||= 0;
     db.usernameIndex[user.username] = user.id;
   }
 
@@ -181,8 +191,8 @@ async function loadDb() {
 }
 
 async function saveDbNowAsync() {
-  db.meta ||= { version: 5, createdAt: now(), ownerUserId: '' };
-  db.meta.version = 5;
+  db.meta ||= { version: 6, createdAt: now(), ownerUserId: '' };
+  db.meta.version = 6;
   db.meta.updatedAt = now();
   if (pgPool) {
     await pgPool.query(
@@ -208,8 +218,8 @@ function saveDbNow() {
   clearTimeout(saveTimer);
   if (pgPool) saveDbNowAsync().catch((error) => console.error('Veritabani kaydedilemedi:', error));
   else {
-    db.meta ||= { version: 5, createdAt: now(), ownerUserId: '' };
-    db.meta.version = 5;
+    db.meta ||= { version: 6, createdAt: now(), ownerUserId: '' };
+    db.meta.version = 6;
     db.meta.updatedAt = now();
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -223,13 +233,33 @@ async function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, 32, 'sha256').toString('hex');
-  return { salt, hash };
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex'), iterations = PBKDF2_ITERATIONS) {
+  const hash = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256').toString('hex');
+  return { salt, hash, iterations };
 }
 function verifyPassword(password, user) {
-  const candidate = hashPassword(password, user.passwordSalt).hash;
+  const iterations = Number(user.passwordIterations || 140000);
+  const candidate = hashPassword(password, user.passwordSalt, iterations).hash;
+  if (!/^[a-f0-9]{64}$/i.test(String(candidate)) || !/^[a-f0-9]{64}$/i.test(String(user.passwordHash || ''))) return false;
   return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'));
+}
+function hashToken(token) { return crypto.createHash('sha256').update(String(token || ''), 'utf8').digest('hex'); }
+function randomToken(prefix = '') { return `${prefix}${crypto.randomBytes(32).toString('base64url')}`; }
+function getSessionByToken(token) {
+  if (!token) return null;
+  const hashed = hashToken(token);
+  let session = db.sessions[hashed];
+  if (!session && db.sessions[token]) {
+    session = db.sessions[token];
+    delete db.sessions[token];
+    db.sessions[hashed] = session;
+    saveDbSoon();
+  }
+  if (!session) return null;
+  if (session.expiresAt && Date.parse(session.expiresAt) < Date.now()) { delete db.sessions[hashed]; saveDbSoon(); return null; }
+  session.id = hashed;
+  session.csrfToken ||= randomToken('csrf_');
+  return session;
 }
 
 function parseCookies(cookieHeader = '') {
@@ -244,12 +274,12 @@ function getTokenFromRequest(req) {
   return parseCookies(req.headers.cookie || '').sid || '';
 }
 function getUserByToken(token) {
-  if (!token) return null;
-  const session = db.sessions[token];
+  const session = getSessionByToken(token);
   if (!session) return null;
   const user = db.users[session.userId];
   if (!user) return null;
   session.lastSeenAt = now();
+  session.expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
   saveDbSoon();
   return user;
 }
@@ -272,7 +302,7 @@ function publicUser(user) {
 }
 
 function meUser(user) {
-  return { ...publicUser(user), settings: user?.settings || { theme: 'dark', compactMode: false, reduceMotion: false } };
+  return { ...publicUser(user), settings: user?.settings || { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true } };
 }
 
 function isAdminUser(user) {
@@ -383,11 +413,13 @@ function sanitizeMessage(message) {
     mimeType: message.mimeType || '',
     sizeBytes: message.sizeBytes || null,
     durationMs: message.durationMs || null,
+    encrypted: Boolean(message.encrypted),
+    e2ee: message.e2ee || null,
     createdAt: message.createdAt
   };
 }
-function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null }) {
-  const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, createdAt: now() };
+function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null, encrypted = false, e2ee = null }) {
+  const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, encrypted: Boolean(encrypted), e2ee: e2ee || null, createdAt: now() };
   db.messages[channelId] ||= [];
   db.messages[channelId].push(message);
   if (db.messages[channelId].length > 1000) db.messages[channelId] = db.messages[channelId].slice(-1000);
@@ -425,10 +457,72 @@ function mimeForFileName(fileName) {
   const ext = path.extname(String(fileName || '')).toLowerCase();
   const map = {
     '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav',
-    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-    '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8', '.zip': 'application/zip'
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+    '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8', '.zip': 'application/zip'
   };
   return map[ext] || 'application/octet-stream';
+}
+const BLOCKED_UPLOAD_EXTENSIONS = new Set(['html','htm','svg','js','mjs','cjs','wasm','exe','dll','bat','cmd','ps1','sh','php','phtml','asp','aspx','jsp','jar','msi','scr','com']);
+const ALLOWED_UPLOAD_MIMES = new Set([
+  'image/png','image/jpeg','image/gif','image/webp',
+  'audio/wav','audio/webm','audio/ogg','audio/mpeg','audio/mp4',
+  'video/mp4','video/webm',
+  'application/pdf','text/plain','application/zip','application/x-zip-compressed','application/octet-stream'
+]);
+function canonicalMime(mimeType) { return String(mimeType || 'application/octet-stream').split(';')[0].trim().toLowerCase(); }
+function isProbablyText(buffer) {
+  if (!buffer.length || buffer.length > 1024 * 1024) return false;
+  for (let i = 0; i < Math.min(buffer.length, 4096); i += 1) if (buffer[i] === 0) return false;
+  return true;
+}
+function detectMagicMime(buffer, fallback = '') {
+  const fb = canonicalMime(fallback);
+  if (buffer.length >= 8 && buffer.subarray(0,8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return 'image/png';
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 6 && ['GIF87a','GIF89a'].includes(buffer.subarray(0,6).toString('ascii'))) return 'image/gif';
+  if (buffer.length >= 12 && buffer.subarray(0,4).toString('ascii') === 'RIFF' && buffer.subarray(8,12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buffer.length >= 12 && buffer.subarray(0,4).toString('ascii') === 'RIFF' && buffer.subarray(8,12).toString('ascii') === 'WAVE') return 'audio/wav';
+  if (buffer.length >= 4 && buffer.subarray(0,4).toString('ascii') === 'OggS') return 'audio/ogg';
+  if (buffer.length >= 3 && buffer.subarray(0,3).toString('ascii') === 'ID3') return 'audio/mpeg';
+  if (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'audio/mpeg';
+  if (buffer.length >= 4 && buffer.subarray(0,4).toString('hex') === '1a45dfa3') return fb.includes('video') ? 'video/webm' : 'audio/webm';
+  if (buffer.length >= 12 && buffer.subarray(4,8).toString('ascii') === 'ftyp') return fb.includes('audio') ? 'audio/mp4' : 'video/mp4';
+  if (buffer.length >= 4 && buffer.subarray(0,4).toString('ascii') === '%PDF') return 'application/pdf';
+  if (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && [0x03,0x05,0x07].includes(buffer[2])) return 'application/zip';
+  if (fb === 'text/plain' && isProbablyText(buffer)) return 'text/plain';
+  return ''; // Bilinmeyen içeriği sadece Content-Type'a güvenerek kabul etme.
+}
+function sanitizeOriginalFileName(fileName) {
+  const base = path.basename(String(fileName || 'dosya')).replace(/[\r\n\t]/g, ' ').trim().slice(0, 120) || 'dosya';
+  return base.replace(/[<>:"\/\\|?*]/g, '_');
+}
+function validateUploadBuffer(buffer, mimeType, originalName = '', encrypted = false) {
+  const safeName = sanitizeOriginalFileName(originalName);
+  if (encrypted) return { mimeType: 'application/octet-stream', originalName: safeName || 'encrypted.gce', extension: 'gce' };
+  const ext = extensionFor(mimeType, safeName).toLowerCase();
+  if (BLOCKED_UPLOAD_EXTENSIONS.has(ext)) throw new Error('Bu dosya türü güvenlik nedeniyle engellendi.');
+  const claimed = canonicalMime(mimeType);
+  const detected = detectMagicMime(buffer, claimed);
+  const effectiveMime = ALLOWED_UPLOAD_MIMES.has(detected) ? detected : '';
+  if (!effectiveMime || effectiveMime === 'application/octet-stream') throw new Error('Bu dosya türü desteklenmiyor veya güvenli değil.');
+  if (effectiveMime.startsWith('image/') && !['image/png','image/jpeg','image/gif','image/webp'].includes(effectiveMime)) throw new Error('Bu görsel formatı desteklenmiyor.');
+  if (effectiveMime === 'text/plain' && !isProbablyText(buffer)) throw new Error('Metin dosyası güvenli görünmüyor.');
+  return { mimeType: effectiveMime, originalName: safeName, extension: extensionFor(effectiveMime, safeName).toLowerCase() };
+}
+function cleanE2eePayload(e2ee) {
+  if (!e2ee || typeof e2ee !== 'object') return null;
+  const payload = {
+    v: Number(e2ee.v || 1),
+    alg: String(e2ee.alg || 'AES-GCM'),
+    kdf: String(e2ee.kdf || 'PBKDF2-SHA256'),
+    iterations: Number(e2ee.iterations || 250000),
+    salt: String(e2ee.salt || ''),
+    iv: String(e2ee.iv || ''),
+    ciphertext: String(e2ee.ciphertext || '')
+  };
+  if (!payload.salt || !payload.iv || !payload.ciphertext) throw new Error('Şifreli mesaj verisi eksik.');
+  if (payload.ciphertext.length > MAX_E2EE_PAYLOAD_LENGTH) throw new Error('Şifreli veri çok büyük.');
+  return payload;
 }
 function hydrateUploadBlobsFromDir(state, uploadDir) {
   if (!state || !uploadDir || !fs.existsSync(uploadDir)) return state;
@@ -447,23 +541,24 @@ function hydrateUploadBlobsFromDir(state, uploadDir) {
   }
   return state;
 }
-function persistUpload({ data, mimeType, fileName = '', prefix = 'file_' }) {
+function persistUpload({ data, mimeType, fileName = '', prefix = 'file_', channelId = '', userId = '', encrypted = false }) {
   const decoded = decodeBase64Upload(data, mimeType);
-  const extension = extensionFor(decoded.mimeType, fileName);
-  const storedName = `${id(prefix)}.${extension}`;
+  const validated = validateUploadBuffer(decoded.buffer, decoded.mimeType, fileName, encrypted);
+  const storedName = `${id(prefix)}.${validated.extension}`;
   fs.writeFileSync(path.join(UPLOAD_DIR, storedName), decoded.buffer);
-  db.uploads[storedName] = { storedName, mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: path.basename(String(fileName || storedName)), createdAt: now() };
+  db.uploads[storedName] = { storedName, mimeType: validated.mimeType, sizeBytes: decoded.buffer.length, originalName: validated.originalName, channelId, userId, encrypted: Boolean(encrypted), createdAt: now() };
   // Upload'u DB içinde de tutuyoruz; Postgres kullanınca ses/fotoğraf deploy sonrası kaybolmaz.
   db.uploadBlobs ||= {};
-  db.uploadBlobs[storedName] = { mimeType: decoded.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
+  db.uploadBlobs[storedName] = { mimeType: validated.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
   saveDbSoon();
-  return { storedName, url: uploadUrl(storedName), mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: fileName || storedName };
+  return { storedName, url: uploadUrl(storedName), mimeType: validated.mimeType, sizeBytes: decoded.buffer.length, originalName: validated.originalName };
 }
 function sendUpload(req, res) {
   const fileName = path.basename(String(req.params.fileName || ''));
   if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) return res.status(404).end();
   const filePath = path.join(UPLOAD_DIR, fileName);
   const meta = db.uploads?.[fileName] || {};
+  if (meta.channelId && !canAccessChannel(req.user.id, meta.channelId) && !isAdminUser(req.user)) return res.status(403).json({ error: 'Bu dosyaya erişimin yok.' });
   const blob = db.uploadBlobs?.[fileName];
   if (!fs.existsSync(filePath) && blob?.base64) {
     try { fs.writeFileSync(filePath, Buffer.from(blob.base64, 'base64')); } catch {}
@@ -471,7 +566,12 @@ function sendUpload(req, res) {
   if (!fs.existsSync(filePath) && !blob?.base64) return res.status(404).json({ error: 'Dosya bulunamadı.' });
   const contentType = meta.mimeType || blob?.mimeType || mimeForFileName(fileName);
   res.setHeader('Content-Type', contentType);
-  res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  if (!(contentType.startsWith('image/') || contentType.startsWith('audio/') || contentType.startsWith('video/'))) {
+    const safeOriginal = String(meta.originalName || fileName).replace(/[\r\n"]/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeOriginal}"`);
+  }
   res.setHeader('Accept-Ranges', 'bytes');
 
   if (!fs.existsSync(filePath) && blob?.base64) {
@@ -523,10 +623,11 @@ function importUploads(uploads = {}) {
     if (!safeName) continue;
     const decoded = decodeBase64Upload(String(data || ''), mimeForFileName(safeName));
     if (decoded.buffer.length > MAX_UPLOAD_BYTES) continue;
+    const validated = validateUploadBuffer(decoded.buffer, decoded.mimeType, safeName, safeName.endsWith('.gce'));
     fs.writeFileSync(path.join(UPLOAD_DIR, safeName), decoded.buffer);
-    db.uploads[safeName] = { storedName: safeName, mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: safeName, createdAt: now() };
+    db.uploads[safeName] = { storedName: safeName, mimeType: validated.mimeType, sizeBytes: decoded.buffer.length, originalName: validated.originalName, createdAt: now() };
     db.uploadBlobs ||= {};
-    db.uploadBlobs[safeName] = { mimeType: decoded.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
+    db.uploadBlobs[safeName] = { mimeType: validated.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
     count += 1;
   }
   return count;
@@ -538,6 +639,15 @@ function sendNative(ws, type, payload = {}) {
 }
 function broadcastNative(type, payload = {}, predicate = () => true) {
   for (const ws of nativeClients) if (ws.readyState === ws.OPEN && predicate(ws)) sendNative(ws, type, payload);
+}
+function emitToUsers(userIds = [], event, payload) {
+  const allowed = new Set(userIds);
+  for (const socket of io.sockets.sockets.values()) if (socket.user && allowed.has(socket.user.id)) socket.emit(event, payload);
+  broadcastNative(event, payload, (ws) => ws.user && allowed.has(ws.user.id));
+}
+function broadcastServerUpdated(serverObj) {
+  const server = ensureServerView(serverObj);
+  emitToUsers(serverObj.memberIds || [], 'server:updated', { server });
 }
 function broadcastMessage(channelId, message) {
   io.to(channelId).emit('message:new', message);
@@ -571,24 +681,109 @@ function leaveWebVoice(socket) {
   emitVoiceMembers(channelId);
 }
 
-function createSession(userId) {
-  const sessionToken = id('sess_');
-  db.sessions[sessionToken] = { userId, createdAt: now(), lastSeenAt: now() };
+function createSession(userId, req = null) {
+  const sessionToken = randomToken('sess_');
+  const sessionHash = hashToken(sessionToken);
+  db.sessions[sessionHash] = { userId, createdAt: now(), lastSeenAt: now(), expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(), csrfToken: randomToken('csrf_'), ip: req ? clientIp(req) : '', ua: req ? String(req.headers['user-agent'] || '').slice(0, 180) : '' };
   saveDbSoon();
   return sessionToken;
 }
-function setSessionCookie(res, token) {
-  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: Boolean(PUBLIC_URL.startsWith('https://')), maxAge: 1000 * 60 * 60 * 24 * 30 });
+function setSessionCookie(req, res, token) {
+  const secure = Boolean(PUBLIC_URL.startsWith('https://') || req?.secure || String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0] === 'https');
+  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: SESSION_TTL_MS });
+}
+function sessionPayload(token) {
+  const session = getSessionByToken(token);
+  return session ? { csrfToken: session.csrfToken, expiresAt: session.expiresAt } : {};
+}
+function clientIp(req) { return String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim().slice(0, 80) || 'unknown'; }
+function recordSecurityEvent(type, details = {}) {
+  db.securityEvents ||= [];
+  db.securityEvents.push({ id: id('sec_'), type, details, createdAt: now() });
+  if (db.securityEvents.length > SECURITY_LOG_LIMIT) db.securityEvents = db.securityEvents.slice(-SECURITY_LOG_LIMIT);
+  saveDbSoon();
+}
+const rateBuckets = new Map();
+function checkRateLimit(name, key, max, windowMs) {
+  const nowMs = Date.now();
+  const bucketKey = `${name}:${key}`;
+  let bucket = rateBuckets.get(bucketKey);
+  if (!bucket || bucket.resetAt < nowMs) bucket = { count: 0, resetAt: nowMs + windowMs };
+  bucket.count += 1;
+  rateBuckets.set(bucketKey, bucket);
+  if (bucket.count > max) return { ok: false, retryAfter: Math.ceil((bucket.resetAt - nowMs) / 1000) };
+  return { ok: true };
+}
+function rateLimit(name, max, windowMs, keyFn = (req) => clientIp(req)) {
+  return (req, res, next) => {
+    const checked = checkRateLimit(name, keyFn(req), max, windowMs);
+    if (!checked.ok) {
+      res.setHeader('Retry-After', String(checked.retryAfter));
+      recordSecurityEvent('rate_limit', { name, ip: clientIp(req), path: req.path });
+      return res.status(429).json({ error: 'Çok hızlı deniyorsun. Biraz bekle.' });
+    }
+    next();
+  };
+}
+function originAllowed(req) {
+  const origin = String(req.headers.origin || '').replace(/\/$/, '');
+  const referer = String(req.headers.referer || '');
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0];
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
+  const ownOrigin = host ? `${proto}://${host}`.replace(/\/$/, '') : '';
+  const allowed = new Set([ownOrigin, PUBLIC_URL, ...TRUSTED_ORIGINS].filter(Boolean).map((v) => String(v).replace(/\/$/, '')));
+  if (origin) return allowed.has(origin);
+  if (referer) { try { return allowed.has(new URL(referer).origin); } catch { return false; } }
+  return true;
+}
+function csrfGuard(req, res, next) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  if (!req.path.startsWith('/api/')) return next();
+  if (!originAllowed(req)) { recordSecurityEvent('bad_origin', { ip: clientIp(req), path: req.path, origin: req.headers.origin || '', referer: req.headers.referer || '' }); return res.status(403).json({ error: 'Güvenlik kontrolü başarısız: origin reddedildi.' }); }
+  if (/^Bearer\s+/i.test(String(req.headers.authorization || ''))) return next();
+  const session = getSessionByToken(getTokenFromRequest(req));
+  if (!session) return next();
+  const supplied = String(req.headers[CSRF_HEADER] || req.headers['x-csrf-token'] || '');
+  if (!supplied || supplied !== session.csrfToken) { recordSecurityEvent('csrf_block', { ip: clientIp(req), path: req.path, userId: session.userId }); return res.status(403).json({ error: 'Güvenlik anahtarı eksik veya hatalı. Sayfayı yenile.' }); }
+  next();
+}
+function securityHeaders(req, res, next) {
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' data: blob:",
+    "connect-src 'self' ws: wss:",
+    "font-src 'self' data:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    REQUIRE_HTTPS ? "upgrade-insecure-requests" : ''
+  ].filter(Boolean).join('; ');
+  res.setHeader('Content-Security-Policy', csp);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), payment=(), usb=(), interest-cohort=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  next();
 }
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP_BYTES) + 1024 * 1024, cors: { origin: false } });
 const wss = new WebSocketServer({ noServer: true });
 
+app.use(securityHeaders);
 app.use(express.json({ limit: `${Math.ceil(Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP_BYTES) / 1024 / 1024) + 2}mb` }));
-app.get('/uploads/:fileName', sendUpload);
-app.use(express.static(path.join(ROOT, 'public')));
+app.use(csrfGuard);
+app.get('/uploads/:fileName', auth, sendUpload);
+app.use(express.static(path.join(ROOT, 'public'), { etag: true, maxAge: '1h', setHeaders(res, filePath) { if (/\.html$/i.test(filePath)) res.setHeader('Cache-Control', 'no-store'); } }));
 
 function dataStatusPayload() {
   const uploadCount = Object.keys(db.uploads || {}).length || (fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR).filter((name) => !name.startsWith('.')).length : 0);
@@ -614,8 +809,27 @@ function dataStatusPayload() {
 app.get('/api/health', (_req, res) => res.json({ ...dataStatusPayload(), time: now() }));
 app.get('/api/public-status', (_req, res) => res.json({ ...dataStatusPayload(), hasUsers: Object.keys(db.users || {}).length > 0 }));
 app.get('/api/storage-info', auth, (_req, res) => res.json(dataStatusPayload()));
+app.get('/api/security/status', auth, (req, res) => res.json({
+  ok: true,
+  version: APP_VERSION,
+  securityHeaders: true,
+  csrf: true,
+  rateLimit: true,
+  uploadAuthorization: true,
+  sessionStorage: 'sha256-token-hash',
+  passwordKdf: `PBKDF2-SHA256/${PBKDF2_ITERATIONS}`,
+  e2ee: { available: true, mode: 'optional per-channel client-side passphrase; AES-GCM via Web Crypto; server stores ciphertext only', liveVoiceContentE2EE: false, metadataVisible: true },
+  recentSecurityEvents: isAdminUser(req.user) ? (db.securityEvents || []).slice(-25).reverse() : undefined
+}));
+app.get('/api/csrf', auth, (req, res) => res.json({ csrfToken: getSessionByToken(getTokenFromRequest(req))?.csrfToken || '' }));
+app.post('/api/security/logout-all', auth, (req, res) => {
+  for (const [key, session] of Object.entries(db.sessions || {})) if (session.userId === req.user.id) delete db.sessions[key];
+  saveDbSoon();
+  res.clearCookie('sid');
+  res.json({ ok: true });
+});
 
-app.post('/api/bootstrap-import', (req, res) => {
+app.post('/api/bootstrap-import', rateLimit('bootstrap_import', 3, 15 * 60 * 1000), (req, res) => {
   if (Object.keys(db.users || {}).length > 0) return res.status(409).json({ error: 'Yedek yükleme sadece veritabanı boşken giriş ekranından yapılabilir. Hesabın varsa Ayarlar > Yedek yükle kullan.' });
   const incoming = req.body?.db;
   if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
@@ -625,42 +839,54 @@ app.post('/api/bootstrap-import', (req, res) => {
   res.json({ ok: true, uploads: uploadCount, userCount: Object.keys(db.users || {}).length });
 });
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', rateLimit('register', 8, 10 * 60 * 1000), (req, res) => {
   const username = normalizeUsername(req.body.username);
   const displayName = String(req.body.displayName || username).trim().slice(0, 32);
   const password = String(req.body.password || '');
   if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Kullanıcı adı 3-20 karakter olmalı; harf, rakam ve _ kullan.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Şifre en az 6 karakter olmalı.' });
+  if (password.length < 8) return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı.' });
   if (db.usernameIndex[username]) return res.status(409).json({ error: 'Bu kullanıcı adı alınmış.' });
 
   const userId = id('usr_');
-  const { salt, hash } = hashPassword(password);
-  const user = { id: userId, username, displayName, passwordSalt: salt, passwordHash: hash, status: '', settings: { theme: 'dark', compactMode: false, reduceMotion: false }, createdAt: now() };
+  const { salt, hash, iterations } = hashPassword(password);
+  const user = { id: userId, username, displayName, passwordSalt: salt, passwordHash: hash, passwordIterations: iterations, status: '', settings: { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true }, failedLoginCount: 0, createdAt: now() };
   db.users[userId] = user;
   db.usernameIndex[username] = userId;
   if (!db.adminUserId) db.adminUserId = userId;
-  const token = createSession(userId);
-  setSessionCookie(res, token);
-  res.status(201).json({ user: meUser(user), token });
+  const token = createSession(userId, req);
+  setSessionCookie(req, res, token);
+  res.status(201).json({ user: meUser(user), token, ...sessionPayload(token) });
 });
-app.post('/api/login', (req, res) => {
+app.post('/api/login', rateLimit('login', 20, 10 * 60 * 1000), (req, res) => {
   const username = normalizeUsername(req.body.username);
   const user = db.users[db.usernameIndex[username]];
-  if (!user || !verifyPassword(String(req.body.password || ''), user)) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı.' });
-  const token = createSession(user.id);
-  setSessionCookie(res, token);
-  res.json({ user: meUser(user), token });
+  const userLimit = checkRateLimit('login_user', `${clientIp(req)}:${username}`, 6, 10 * 60 * 1000);
+  if (!userLimit.ok) return res.status(429).json({ error: 'Bu kullanıcı için çok fazla deneme yapıldı. Biraz bekle.' });
+  if (!user || !verifyPassword(String(req.body.password || ''), user)) {
+    if (user) { user.failedLoginCount = (user.failedLoginCount || 0) + 1; user.lastFailedLoginAt = now(); saveDbSoon(); }
+    recordSecurityEvent('failed_login', { username, ip: clientIp(req) });
+    return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı.' });
+  }
+  user.failedLoginCount = 0;
+  user.lastLoginAt = now();
+  if (Number(user.passwordIterations || 0) < PBKDF2_ITERATIONS) {
+    const upgraded = hashPassword(String(req.body.password || ''));
+    user.passwordSalt = upgraded.salt; user.passwordHash = upgraded.hash; user.passwordIterations = upgraded.iterations;
+  }
+  const token = createSession(user.id, req);
+  setSessionCookie(req, res, token);
+  res.json({ user: meUser(user), token, ...sessionPayload(token) });
 });
 app.post('/api/logout', auth, (req, res) => {
   const token = getTokenFromRequest(req);
-  if (token) delete db.sessions[token];
+  if (token) { delete db.sessions[hashToken(token)]; delete db.sessions[token]; }
   saveDbSoon();
   res.clearCookie('sid');
   res.json({ ok: true });
 });
 app.get('/api/me', auth, (req, res) => {
   const dataStatus = { storageMode, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, persistentData: isPersistentDataEnabled(), persistentDataDir: isPersistentDataEnabled(), needsPersistentSetup: needsPersistentSetup(), dbStateKey: DB_STATE_KEY };
-  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) }, isAppOwner: isAdminUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()], dataStatus, appInfo: { version: APP_VERSION, storageMode, dataStatus } });
+  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) }, isAppOwner: isAdminUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()], dataStatus, appInfo: { version: APP_VERSION, storageMode, dataStatus }, ...sessionPayload(getTokenFromRequest(req)) });
 });
 app.patch('/api/me', auth, (req, res) => {
   const displayName = String(req.body.displayName || req.user.displayName || req.user.username).trim().slice(0, 32);
@@ -672,7 +898,8 @@ app.patch('/api/me', auth, (req, res) => {
     ...(req.user.settings || {}),
     theme: ['dark', 'midnight', 'rainbow'].includes(settings.theme) ? settings.theme : (req.user.settings?.theme || 'dark'),
     compactMode: Boolean(settings.compactMode),
-    reduceMotion: Boolean(settings.reduceMotion)
+    reduceMotion: Boolean(settings.reduceMotion),
+    e2eeHints: settings.e2eeHints !== false
   };
   saveDbSoon();
   res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
@@ -681,7 +908,7 @@ app.patch('/api/me', auth, (req, res) => {
 app.get('/api/admin/export', auth, requireAdmin, (req, res) => {
   saveDbNow();
   const light = String(req.query.light || '') === '1';
-  const outDb = light ? { ...db, uploadBlobs: {} } : db;
+  const outDb = light ? { ...db, sessions: {}, securityEvents: [], uploadBlobs: {} } : { ...db, sessions: {}, securityEvents: [] };
   res.json({ app: 'gaycord', version: APP_VERSION, exportedAt: now(), light, db: outDb, uploads: light ? {} : exportUploads() });
 });
 app.post('/api/admin/import', auth, requireAdmin, (req, res) => {
@@ -751,8 +978,7 @@ app.post('/api/servers/join', auth, (req, res) => {
   if (!serverObj) return res.status(404).json({ error: 'Davet kodu bulunamadı.' });
   if (!serverObj.memberIds.includes(req.user.id)) serverObj.memberIds.push(req.user.id);
   saveDbSoon();
-  io.emit('server:updated', { server: ensureServerView(serverObj) });
-  broadcastNative('server:updated', { server: ensureServerView(serverObj) });
+  broadcastServerUpdated(serverObj);
   res.json({ server: ensureServerView(serverObj, req.user.id) });
 });
 app.patch('/api/servers/:serverId', auth, (req, res) => {
@@ -767,7 +993,7 @@ app.patch('/api/servers/:serverId', auth, (req, res) => {
   if (req.body.regenerateInvite) serverObj.inviteCode = inviteCode();
   serverObj.updatedAt = now();
   saveDbSoon();
-  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  broadcastServerUpdated(serverObj);
   res.json({ server: ensureServerView(serverObj, req.user.id) });
 });
 app.delete('/api/servers/:serverId', auth, (req, res) => {
@@ -778,8 +1004,7 @@ app.delete('/api/servers/:serverId', auth, (req, res) => {
   for (const channelId of channelIds) { delete db.messages[channelId]; delete db.channels[channelId]; }
   delete db.servers[serverObj.id];
   saveDbSoon();
-  io.emit('server:deleted', { serverId: serverObj.id, channelIds });
-  broadcastNative('server:deleted', { serverId: serverObj.id, channelIds });
+  emitToUsers(serverObj.memberIds || [], 'server:deleted', { serverId: serverObj.id, channelIds });
   res.json({ ok: true });
 });
 app.post('/api/servers/:serverId/leave', auth, (req, res) => {
@@ -788,8 +1013,7 @@ app.post('/api/servers/:serverId/leave', auth, (req, res) => {
   if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahibi olduğun sunucudan çıkamazsın; silebilirsin.' });
   serverObj.memberIds = serverObj.memberIds.filter((id) => id !== req.user.id);
   saveDbSoon();
-  io.emit('server:updated', { server: ensureServerView(serverObj) });
-  broadcastNative('server:updated', { server: ensureServerView(serverObj) });
+  broadcastServerUpdated(serverObj);
   res.json({ ok: true });
 });
 app.post('/api/servers/:serverId/channels', auth, (req, res) => {
@@ -805,7 +1029,7 @@ app.post('/api/servers/:serverId/channels', auth, (req, res) => {
   serverObj.channelIds.push(channelId);
   saveDbSoon();
   const view = ensureServerView(serverObj, req.user.id);
-  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  broadcastServerUpdated(serverObj);
   res.status(201).json({ server: view, channel: db.channels[channelId] });
 });
 app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
@@ -820,7 +1044,7 @@ app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
   saveDbSoon();
   io.to(channel.id).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
   io.to(`voice:${channel.id}`).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
-  broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
+  broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id }, (ws) => serverObj.memberIds?.includes(ws.user?.id));
   res.json({ ok: true, server: ensureServerView(serverObj, req.user.id), channelId: channel.id });
 });
 
@@ -828,23 +1052,32 @@ app.get('/api/channels/:channelId/messages', auth, (req, res) => {
   if (!canAccessChannel(req.user.id, req.params.channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   res.json({ messages: (db.messages[req.params.channelId] || []).slice(-200).map(sanitizeMessage) });
 });
-app.post('/api/channels/:channelId/messages', auth, (req, res) => {
+app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', 120, 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
   try {
     const channelId = req.params.channelId;
     if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
     const type = String(req.body.type || 'text').toLowerCase();
     let message;
     if (type === 'text') {
-      const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
-      if (!text) return res.status(400).json({ error: 'Boş mesaj gönderilemez.' });
-      message = createMessage({ channelId, userId: req.user.id, type: 'text', text });
+      if (req.body.encrypted) {
+        const e2ee = cleanE2eePayload(req.body.e2ee);
+        message = createMessage({ channelId, userId: req.user.id, type: 'text', text: '', encrypted: true, e2ee });
+      } else {
+        const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
+        if (!text) return res.status(400).json({ error: 'Boş mesaj gönderilemez.' });
+        message = createMessage({ channelId, userId: req.user.id, type: 'text', text });
+      }
     } else if (type === 'voice') {
-      const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/webm', fileName: req.body.fileName || 'voice.webm', prefix: 'voice_' });
-      if (!upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formatı desteklenmiyor.' });
-      message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null });
+      const encrypted = Boolean(req.body.encrypted);
+      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee) : null;
+      const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/webm', fileName: req.body.fileName || 'voice.webm', prefix: 'voice_', channelId, userId: req.user.id, encrypted });
+      if (!encrypted && !upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formatı desteklenmiyor.' });
+      message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null, encrypted, e2ee });
     } else if (type === 'file') {
-      const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'application/octet-stream', fileName: req.body.fileName || 'dosya', prefix: 'file_' });
-      message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: String(req.body.text || '').slice(0, 300) });
+      const encrypted = Boolean(req.body.encrypted);
+      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee) : null;
+      const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'application/octet-stream', fileName: req.body.fileName || 'dosya', prefix: 'file_', channelId, userId: req.user.id, encrypted });
+      message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: encrypted ? 'encrypted.gce' : upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: encrypted ? '' : String(req.body.text || '').slice(0, 300), encrypted, e2ee });
     } else return res.status(400).json({ error: 'Bilinmeyen mesaj türü.' });
     broadcastMessage(channelId, message);
     res.status(201).json({ message });
@@ -852,6 +1085,7 @@ app.post('/api/channels/:channelId/messages', auth, (req, res) => {
 });
 
 io.use((socket, next) => {
+  if (socket.handshake.headers.origin && !originAllowed({ headers: socket.handshake.headers, protocol: String(socket.handshake.headers['x-forwarded-proto'] || 'https'), path: '/socket.io' })) return next(new Error('Origin reddedildi.'));
   const user = getUserByToken(parseCookies(socket.handshake.headers.cookie || '').sid);
   if (!user) return next(new Error('Giriş gerekli.'));
   socket.user = user;
@@ -876,15 +1110,24 @@ io.on('connection', (socket) => {
     broadcastMessage(channelId, message);
     callback({ ok: true, message });
   });
-  socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs } = {}, callback = () => {}) => {
+  socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs, encrypted, e2ee } = {}, callback = () => {}) => {
     try {
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
-      const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: 'voice.webm', prefix: 'voice_' });
-      if (!upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formatı desteklenmiyor.' });
-      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null });
+      const secure = Boolean(encrypted);
+      const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: secure ? 'encrypted-voice.gce' : 'voice.webm', prefix: 'voice_', channelId, userId, encrypted: secure });
+      if (!secure && !upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formatı desteklenmiyor.' });
+      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null, encrypted: secure, e2ee: secure ? cleanE2eePayload(e2ee) : null });
       broadcastMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Sesli mesaj gönderilemedi.' }); }
+  });
+  socket.on('message:secure', ({ channelId, e2ee } = {}, callback = () => {}) => {
+    try {
+      if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
+      const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee) });
+      broadcastMessage(channelId, message);
+      callback({ ok: true, message });
+    } catch (error) { callback({ error: error.message || 'Şifreli mesaj gönderilemedi.' }); }
   });
   socket.on('typing', ({ channelId, isTyping } = {}) => {
     if (!canAccessChannel(userId, channelId)) return;
@@ -1001,8 +1244,8 @@ wss.on('connection', (ws) => {
 
 async function start() {
   db = await loadDb();
-  console.log(`Gaycord V5 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}${needsPersistentSetup() ? ' | UYARI: Render dosya sistemi geçici; DATABASE_URL veya disk ekle.' : ''}`);
-  server.listen(PORT, () => console.log(`Gaycord V5 çalışıyor: http://localhost:${PORT}`));
+  console.log(`Gaycord V6 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}${needsPersistentSetup() ? ' | UYARI: Render dosya sistemi geçici; DATABASE_URL veya disk ekle.' : ''}`);
+  server.listen(PORT, () => console.log(`Gaycord V6 çalışıyor: http://localhost:${PORT}`));
 }
 
 start().catch((error) => {

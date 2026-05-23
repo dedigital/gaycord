@@ -354,7 +354,7 @@ body[data-theme="rainbow"] {
   .composer { align-items: stretch; }
 }
 
-/* Gaycord V5 layout and persistence UI fixes */
+/* Gaycord V6 layout and persistence UI fixes */
 .auth-note {
   margin-top: 14px;
   padding: 12px 14px;
@@ -414,7 +414,7 @@ body[data-theme="rainbow"] {
   .composer { grid-template-columns: 42px 42px minmax(0,1fr); }
 }
 
-/* Gaycord V5: layout, wrap and persistence warning fixes */
+/* Gaycord V6: layout, wrap and persistence warning fixes */
 html, body { width: 100%; height: 100%; overflow: hidden; background: #070a14; }
 body { background: #070a14; }
 body::before { opacity: .45; }
@@ -574,3 +574,29 @@ body::before { opacity: .45; }
   border: 1px solid var(--line);
 }
 .bootstrap-restore small { color: var(--muted-2); }
+
+/* Gaycord V6 security UI */
+.e2ee-on {
+  color: #dcfff3 !important;
+  border-color: rgba(52,211,153,.42) !important;
+  background: linear-gradient(135deg, rgba(52,211,153,.20), rgba(6,182,212,.14)) !important;
+}
+.secure-message .message-bubble {
+  border-color: rgba(52,211,153,.22);
+  background: linear-gradient(135deg, rgba(16,185,129,.10), rgba(6,182,212,.06));
+}
+.secure-card {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  margin-top: 8px;
+  border-radius: 16px;
+  border: 1px dashed rgba(52,211,153,.35);
+  background: rgba(52,211,153,.08);
+  color: #dcfff3;
+}
+.secure-card small { color: #baf7e0; }
+.secure-ok { color: #eafff8; }
+.security-list { display: grid; gap: 8px; }
+.security-list li { margin-left: 18px; color: var(--muted); }
+.security-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 999px; background: rgba(52,211,153,.12); color: var(--good); font-size: 12px; font-weight: 950; }

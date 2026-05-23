@@ -1,70 +1,46 @@
-# Gaycord V5
+# Gaycord V6 Security
 
-Discord benzeri Web/PWA + gerçek Windows Native başlangıç projesi.
+Gaycord; arkadaşlarla sunucu/DM tabanlı mesajlaşma, sesli mesaj, fotoğraf/dosya gönderme ve ses odası için hazırlanmış web/PWA + Windows native istemcili küçük Discord benzeri projedir.
 
-## V5 düzeltmeleri
+## V6 Security güncellemesi
 
-- Mesaj balonlarında tek tek harf alta düşme hatası düzeltildi.
-- Alt taraftaki kırmızı/mavi şerit ve boş satır görüntüsü kapatıldı.
-- Sol üst logo ve sunucu rail alanı daha düzgün sığacak şekilde yenilendi.
-- Render üzerinde veri kalıcı değilse uygulama artık uyarı gösterir.
-- `DATABASE_URL` veya kalıcı disk varsa hesaplar, sunucular, mesajlar ve dosya bilgileri güncellemelerde korunur.
-- Service worker cache sürümü `v5.0` yapıldı; eski arayüz takılırsa `Ctrl + F5` yeterli olur.
+- Uygulama adı ve logo Gaycord olarak kalır.
+- PostgreSQL bağlıysa hesaplar, sunucular, mesajlar ve uploadlar güncellemelerde silinmez.
+- Security headers ve CSP eklendi.
+- CSRF koruması eklendi.
+- Login/register/message rate-limit eklendi.
+- Session tokenları veritabanında düz token olarak değil SHA-256 hash olarak tutulur.
+- Upload dosyaları artık herkese açık değil; aynı kanala erişimi olan giriş yapmış kullanıcılar görebilir.
+- SVG/HTML/JS/EXE gibi tehlikeli upload türleri engellenir.
+- Ayarlar > Güvenlik bölümü eklendi.
+- Kanal/DM başlığındaki kilit butonuyla opsiyonel E2EE açılabilir.
 
-## Render ayarları
+## E2EE nasıl çalışır?
 
-```text
-Root Directory: server
-Build Command: npm install
-Start Command: npm start
-Health Check Path: /api/health
+Bir kanal veya DM seç, üstteki `🔓 E2EE` butonuna bas ve ortak bir anahtar yaz. Aynı anahtarı arkadaşlarınla uygulama dışından paylaş. Bu mod açıkken yeni metin mesajları, dosya/fotoğraf ve sesli mesajlar tarayıcıda AES-GCM ile şifrelenir; sunucu sadece ciphertext saklar.
+
+Not: E2EE anahtarını unutursan eski şifreli mesajlar açılamaz. Canlı ses odası bu sürümde HTTPS/WebRTC üzerinden gider; E2EE kilidi canlı ses için değil mesaj/dosya/sesli mesaj içindir.
+
+## Render ayarı
+
+Kalıcı veri için web service Environment kısmında şu zorunlu:
+
+```txt
+DATABASE_URL=postgresql://...
 ```
 
-## Veriler silinmesin diye zorunlu ayar
+Deploy sonrası kontrol:
 
-Render'ın varsayılan dosya sistemi kalıcı değildir. Sadece kod güncellemesi yapmak, yerel dosyaya yazılmış hesap/sunucu/mesaj verilerini korumaz.
-
-En sağlam çözüm PostgreSQL kullanmak:
-
-```text
-Render > gaycord > Environment > Add Environment Variable
-Key: DATABASE_URL
-Value: postgresql://...
+```txt
+https://gaycord.onrender.com/api/health
 ```
 
-Sonra:
+Beklenen önemli alanlar:
 
-```text
-Manual Deploy > Deploy latest commit
+```json
+{ "app": "gaycord-v6", "version": "6.0.0", "storageMode": "postgres", "persistentData": true }
 ```
 
-Alternatif olarak Render Disk kullanacaksan:
+## Güncelleme
 
-```text
-Disk mount path: /var/data
-Environment Variable:
-GAYCORD_DATA_DIR=/var/data/gaycord
-```
-
-`DB_STATE_KEY` değişkenini elle değiştirme. Varsayılan anahtar bilerek sabit tutuldu; gelecek güncellemelerde aynı PostgreSQL verisini okumaya devam eder.
-
-## Windows app
-
-GitHub Actions artifact adı:
-
-```text
-Gaycord-Windows-Native
-```
-
-Zip'i indir, `server.txt` içine kendi Render linkini yaz:
-
-```text
-https://gaycord.onrender.com
-```
-
-Sonra `Gaycord.exe` çalışır.
-
-## V5.0 ek güvenlik
-
-- Admin hesabı giriş yaptığında uygulama tarayıcıya hafif bir yedek kaydetmeye çalışır. Render geçici dosyası sıfırlanırsa giriş ekranında “Tarayıcıdaki son yedeği geri yükle” butonu çıkar.
-- Bu otomatik yedek özellikle hesap/sunucu/mesaj metinlerini kurtarmak içindir; büyük fotoğraf/ses dosyaları için yine Ayarlar > Yedek indir kullan.
+Zip içindeki `gaycord-v6` klasörünün içindekileri repo köküne kopyala, GitHub Desktop ile commit/push yap. Render otomatik deploy eder.

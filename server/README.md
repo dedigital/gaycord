@@ -1,28 +1,22 @@
-# Gaycord Server V5
+# Gaycord Server V6
 
-```bash
-npm install
-npm start
+V6 Security sürümü: HTTPS arkasında çalışan Node/Socket.IO sunucusu.
+
+## Önemli güvenlikler
+
+- `DATABASE_URL` ile PostgreSQL kalıcı veri modu
+- HTTP security headers + CSP
+- CSRF koruması (`x-gaycord-csrf`)
+- Login/register/message rate limit
+- Session tokenlarının DB içinde SHA-256 hash olarak saklanması
+- Upload dosyalarına yetki kontrolü
+- Tehlikeli dosya türlerini engelleme
+- Opsiyonel kanal/DM bazlı E2EE: AES-GCM + PBKDF2, anahtar sadece tarayıcıda
+
+## Health check
+
+```txt
+/api/health
 ```
 
-Render:
-
-```text
-Root Directory: server
-Build Command: npm install
-Start Command: npm start
-Health Check Path: /api/health
-```
-
-Environment:
-
-```text
-NODE_ENV=production
-PUBLIC_URL=https://gaycord.onrender.com
-MAX_UPLOAD_BYTES=15728640
-DATABASE_URL=postgresql://...
-# veya disk kullanıyorsan:
-GAYCORD_DATA_DIR=/var/data/gaycord
-```
-
-`DATABASE_URL` varsa hesaplar, sunucular, kanallar, mesajlar ve küçük upload blobları PostgreSQL içinde saklanır. `DATABASE_URL` yoksa Render redeploy/restart sonrası yerel dosya verisi kalıcı olmayabilir.
+`storageMode: postgres` ve `persistentData: true` görüyorsan veri kalıcıdır.

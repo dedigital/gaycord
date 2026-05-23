@@ -1,17 +1,13 @@
-# Gaycord packaging
+# Gaycord Packaging
 
-V5 build artifact adı:
+V6 build artifact adı:
 
-```text
+```txt
 Gaycord-Windows-Native
 ```
 
-İçerik:
+Windows paketini indirince `server.txt` içine Render URL'ini yaz:
 
-```text
-Gaycord.exe
-server.txt
-*.dll / runtime dosyaları gerekirse
+```txt
+https://gaycord.onrender.com
 ```
-
-Arkadaşlara gönderirken klasörü komple zipleyin; sadece exe göndermeyin.
