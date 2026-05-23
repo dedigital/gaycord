@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: arkadas-odasi
+    env: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAX_UPLOAD_BYTES
+        value: 15728640

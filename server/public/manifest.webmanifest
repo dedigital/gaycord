@@ -1,0 +1,17 @@
+{
+  "name": "Arkadaş Odası",
+  "short_name": "Arkadaş",
+  "description": "Arkadaşlarla yazılı sohbet, DM, kanal, dosya ve sesli mesaj uygulaması.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#15171f",
+  "theme_color": "#5865f2",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

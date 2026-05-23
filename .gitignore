@@ -1,0 +1,13 @@
+node_modules/
+npm-debug.log*
+.env
+.DS_Store
+server/data/db.json
+server/data/uploads/*
+!server/data/uploads/.gitkeep
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+publish/
