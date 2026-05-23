@@ -1,13 +1,14 @@
 {
-  "name": "arkadas-odasi-server",
-  "version": "2.0.0",
-  "description": "Arkadaş Odası: web/PWA ve native Windows istemcisi için gerçek zamanlı chat + ses sunucusu.",
+  "name": "gaycord-server",
+  "version": "3.0.0",
+  "description": "Gaycord: web/PWA ve native Windows istemcisi için gerçek zamanlı chat + ses sunucusu.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js"
   },
-  "keywords": ["chat", "websocket", "socket.io", "voice", "pwa"],
+  "keywords": ["chat", "websocket", "socket.io", "voice", "pwa", "gaycord"],
   "license": "MIT",
   "dependencies": {
     "express": "^4.19.2",

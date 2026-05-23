@@ -1,33 +1,81 @@
-# Node / PowerShell uğraşmadan yayınlama
+# Gaycord V3 kurulum / yayınlama
 
-Bu dosya arkadaşların için değil; sadece senin bir kez yayınlaman için.
+## 1. Dosyaları repoya kopyala
 
-## 1) Sunucu için
+Bu paketin içindeki her şeyi mevcut `gaycord` GitHub repo klasörüne kopyala. Aynı dosyalar sorulursa **Değiştir / Replace** de.
 
-1. GitHub'da yeni repository aç.
-2. Bu paketin içindeki dosyaları GitHub web arayüzünden yükle.
-3. Render/Railway/Fly gibi bir yerde yeni web service oluştur.
-4. Repo'yu bağla.
-5. Ayarlar:
-   - Root Directory: `server`
-   - Build Command: `npm install`
-   - Start Command: `npm start`
-6. Deploy bitince verilen HTTPS adresini kopyala.
+Repo kökünde şöyle görünmeli:
 
-Bu adresten web sürüm açılır. Arkadaşların linke girer; localhost gerekmez.
+```text
+.github
+packaging
+server
+windows-native
+.gitignore
+render.yaml
+README.md
+KURULUM-YAYINLAMA.md
+```
 
-## 2) Windows uygulaması için
+GitHub Desktop'ta:
 
-1. GitHub repo sayfasında `Actions` sekmesine gir.
-2. `Build Windows Native App` workflow'unu çalıştır.
-3. İş bitince `ArkadasOdasi-Windows-Native` artifact'ını indir.
-4. İçindeki `server.txt` dosyasına kendi HTTPS adresini yaz.
-5. Klasörü zipleyip arkadaşlarına gönder.
+```text
+Summary: Gaycord V3 update
+Commit to main
+Push origin
+```
 
-Arkadaşların sadece `ArkadasOdasi.exe` dosyasını açar.
+## 2. Render yeniden deploy
 
-## 3) Web mi app mi?
+Render genelde push sonrası otomatik deploy eder. Etmezse:
 
-- Web için HTTPS yayınla.
-- Windows için EXE gönder.
-- İkisi de aynı sunucuya bağlanır.
+```text
+Render > gaycord > Manual Deploy > Deploy latest commit
+```
+
+Ayarlar:
+
+```text
+Language: Node
+Branch: main
+Root Directory: server
+Build Command: npm install
+Start Command: npm start
+Health Check Path: /api/health
+```
+
+Deploy bitince kontrol:
+
+```text
+https://gaycord.onrender.com/api/health
+```
+
+`gaycord-v3` cevabı gelmeli.
+
+## 3. Windows native app
+
+GitHub'da:
+
+```text
+Actions > Build Gaycord Windows App
+```
+
+Yeşil build'in en altında artifact indir:
+
+```text
+Gaycord-Windows-Native
+```
+
+Zip'i çıkar. İçindeki `server.txt` içine kendi Render linkini yaz:
+
+```text
+https://gaycord.onrender.com
+```
+
+Klasörü tekrar zipleyip arkadaşlarına atabilirsin.
+
+## Notlar
+
+- Free Render instance kullanılmayınca uyuyabilir; ilk giriş 30-60 saniye sürebilir.
+- Daha hızlı ve sürekli açık olması için sonra Starter plana geçebilirsin.
+- Windows uyarısı normaldir; exe kod imzalı değilse Windows "bilinmeyen yayıncı" diyebilir.

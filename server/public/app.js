@@ -18,6 +18,7 @@ const els = {
   sidebarTitle: $('sidebarTitle'),
   connectionState: $('connectionState'),
   dynamicPanel: $('dynamicPanel'),
+  meAvatar: $('meAvatar'),
   meName: $('meName'),
   meUsername: $('meUsername'),
   logoutButton: $('logoutButton'),
@@ -27,6 +28,8 @@ const els = {
   messages: $('messages'),
   typingLine: $('typingLine'),
   messageForm: $('messageForm'),
+  fileButton: $('fileButton'),
+  fileInput: $('fileInput'),
   recordButton: $('recordButton'),
   messageInput: $('messageInput'),
   sendButton: $('sendButton'),
@@ -43,20 +46,22 @@ const state = {
   view: 'home',
   currentServerId: null,
   currentChannelId: null,
+  currentChannelKind: 'text',
   currentInviteCode: '',
   recorder: null,
   recordStream: null,
   recordChunks: [],
   recordStartedAt: 0,
   typingTimeout: null,
-  remoteTypingTimeout: null
+  remoteTypingTimeout: null,
+  sendingFile: false
 };
 
 function toast(message) {
   els.toast.textContent = message;
   els.toast.classList.remove('hidden');
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => els.toast.classList.add('hidden'), 3200);
+  toast.timer = setTimeout(() => els.toast.classList.add('hidden'), 3400);
 }
 
 function escapeHTML(value) {
@@ -78,11 +83,21 @@ function initials(name) {
 }
 
 function formatTime(iso) {
-  try {
-    return new Intl.DateTimeFormat('tr-TR', { hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
-  } catch {
-    return '';
-  }
+  try { return new Intl.DateTimeFormat('tr-TR', { hour: '2-digit', minute: '2-digit' }).format(new Date(iso)); }
+  catch { return ''; }
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return '';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10240 ? 1 : 0)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function autoGrowTextarea() {
+  els.messageInput.style.height = 'auto';
+  els.messageInput.style.height = Math.min(els.messageInput.scrollHeight, 130) + 'px';
 }
 
 async function api(path, options = {}) {
@@ -92,7 +107,6 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
     credentials: 'same-origin'
   });
-
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'İstek başarısız oldu.');
   return data;
@@ -110,7 +124,7 @@ function setAuthMode(mode) {
 function showAuth() {
   els.auth.classList.remove('hidden');
   els.app.classList.add('hidden');
-  els.usernameInput.focus();
+  setTimeout(() => els.usernameInput.focus(), 0);
 }
 
 function showApp() {
@@ -121,8 +135,8 @@ function showApp() {
 async function refreshMe({ keepPanel = true } = {}) {
   const data = await api('/api/me');
   state.user = data.user;
-  state.friends = data.friends;
-  state.servers = data.servers;
+  state.friends = data.friends || state.friends;
+  state.servers = data.servers || [];
   state.onlineIds = new Set(data.onlineIds || []);
   renderMe();
   renderRail();
@@ -132,6 +146,7 @@ async function refreshMe({ keepPanel = true } = {}) {
 }
 
 function renderMe() {
+  els.meAvatar.textContent = initials(state.user?.displayName || state.user?.username);
   els.meName.textContent = state.user?.displayName || '-';
   els.meUsername.textContent = state.user ? `@${state.user.username}` : '-';
 }
@@ -144,7 +159,7 @@ function renderRail() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `rail-button server-dot ${state.currentServerId === server.id && state.view === 'server' ? 'active' : ''}`;
-    button.title = server.name;
+    button.title = `${server.name} • ${server.memberIds?.length || 0} üye`;
     button.textContent = initials(server.name);
     button.addEventListener('click', () => {
       state.view = 'server';
@@ -156,12 +171,29 @@ function renderRail() {
   }
 }
 
+function resetChat(title = 'Hoş geldin', subtitle = 'Sol taraftan arkadaş, sunucu veya kanal seç.') {
+  state.currentChannelId = null;
+  state.currentChannelKind = 'text';
+  state.currentInviteCode = '';
+  els.chatTitle.textContent = title;
+  els.chatSubtitle.textContent = subtitle;
+  els.copyInviteButton.classList.add('hidden');
+  els.messageInput.value = '';
+  autoGrowTextarea();
+  els.messageInput.disabled = true;
+  els.sendButton.disabled = true;
+  els.recordButton.disabled = true;
+  els.fileButton.disabled = true;
+  els.typingLine.textContent = '';
+  els.messages.innerHTML = '<div class="empty-state"><strong>Bir sohbet seç</strong>DM aç, sunucu kanalı seç veya yeni sunucu oluştur.</div>';
+}
+
 function renderFriendsPanel() {
   state.view = 'home';
   state.currentServerId = null;
   renderRail();
   els.sidebarTitle.textContent = 'Arkadaşlar';
-  els.copyInviteButton.classList.add('hidden');
+  resetChat('Arkadaşlar', 'Arkadaş ekle, istek kabul et veya DM aç.');
 
   const incoming = state.friends.incomingRequests || [];
   const outgoing = state.friends.outgoingRequests || [];
@@ -171,22 +203,22 @@ function renderFriendsPanel() {
     <section class="stack">
       <div class="section-title">Arkadaş ekle</div>
       <input id="friendSearchInput" placeholder="Kullanıcı adı ara" autocomplete="off">
-      <button id="friendSearchButton" class="primary" type="button">Ara</button>
+      <button id="friendSearchButton" class="primary" type="button">Ara ve ekle</button>
       <div id="friendSearchResults" class="stack"></div>
     </section>
 
     <section class="stack">
-      <div class="section-title">Gelen istekler</div>
+      <div class="section-title-row"><div class="section-title">Gelen istekler</div><small>${incoming.length}</small></div>
       <div id="incomingRequests"></div>
     </section>
 
     <section class="stack">
-      <div class="section-title">Arkadaşlar</div>
+      <div class="section-title-row"><div class="section-title">Arkadaşlar</div><small>${friends.length}</small></div>
       <div id="friendList"></div>
     </section>
 
     <section class="stack">
-      <div class="section-title">Gönderilen istekler</div>
+      <div class="section-title-row"><div class="section-title">Bekleyen</div><small>${outgoing.length}</small></div>
       <div id="outgoingRequests"></div>
     </section>
   `;
@@ -195,42 +227,39 @@ function renderFriendsPanel() {
   const outgoingWrap = els.dynamicPanel.querySelector('#outgoingRequests');
   const friendList = els.dynamicPanel.querySelector('#friendList');
 
-  if (!incoming.length) incomingWrap.innerHTML = '<p>Gelen istek yok.</p>';
+  incomingWrap.innerHTML = incoming.length ? '' : '<p>Gelen istek yok.</p>';
   for (const request of incoming) {
     const row = document.createElement('div');
     row.className = 'user-row';
     row.innerHTML = `
-      <span class="avatar">${escapeHTML(initials(request.from.displayName))}</span>
-      <span class="row-grow truncate"><strong>${escapeHTML(request.from.displayName)}</strong><br><small>@${escapeHTML(request.from.username)}</small></span>
+      <span class="avatar">${escapeHTML(initials(request.from?.displayName))}</span>
+      <span class="row-grow truncate"><strong>${escapeHTML(request.from?.displayName)}</strong><br><small>@${escapeHTML(request.from?.username)}</small></span>
       <span class="row-actions">
         <button class="mini-button success" data-accept="${escapeHTML(request.id)}">Kabul</button>
         <button class="mini-button danger" data-reject="${escapeHTML(request.id)}">Sil</button>
-      </span>
-    `;
+      </span>`;
     incomingWrap.appendChild(row);
   }
 
-  if (!friends.length) friendList.innerHTML = '<p>Henüz arkadaşın yok. Kullanıcı adıyla birini ekle.</p>';
+  friendList.innerHTML = friends.length ? '' : '<p>Henüz arkadaşın yok. Kullanıcı adıyla birini ekle.</p>';
   for (const friend of friends) {
     const row = document.createElement('button');
     row.className = 'user-row';
     row.type = 'button';
     row.innerHTML = `
       <span class="avatar ${state.onlineIds.has(friend.id) ? 'online' : ''}">${escapeHTML(initials(friend.displayName))}</span>
-      <span class="row-grow truncate"><strong>${escapeHTML(friend.displayName)}</strong><br><small>@${escapeHTML(friend.username)} • ${state.onlineIds.has(friend.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span>
-    `;
+      <span class="row-grow truncate"><strong>${escapeHTML(friend.displayName)}</strong><br><small>@${escapeHTML(friend.username)} • ${state.onlineIds.has(friend.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
     row.addEventListener('click', () => openDm(friend));
     friendList.appendChild(row);
   }
 
-  if (!outgoing.length) outgoingWrap.innerHTML = '<p>Bekleyen istek yok.</p>';
+  outgoingWrap.innerHTML = outgoing.length ? '' : '<p>Bekleyen istek yok.</p>';
   for (const request of outgoing) {
     const row = document.createElement('div');
     row.className = 'user-row';
     row.innerHTML = `
-      <span class="avatar">${escapeHTML(initials(request.to.displayName))}</span>
-      <span class="row-grow truncate"><strong>${escapeHTML(request.to.displayName)}</strong><br><small>@${escapeHTML(request.to.username)} • bekliyor</small></span>
-    `;
+      <span class="avatar">${escapeHTML(initials(request.to?.displayName))}</span>
+      <span class="row-grow truncate"><strong>${escapeHTML(request.to?.displayName)}</strong><br><small>@${escapeHTML(request.to?.username)} • bekliyor</small></span>`;
     outgoingWrap.appendChild(row);
   }
 
@@ -272,8 +301,7 @@ function renderFriendsPanel() {
         row.innerHTML = `
           <span class="avatar">${escapeHTML(initials(user.displayName))}</span>
           <span class="row-grow truncate"><strong>${escapeHTML(user.displayName)}</strong><br><small>@${escapeHTML(user.username)}</small></span>
-          <button class="mini-button" ${user.friendship ? 'disabled' : ''}>${label}</button>
-        `;
+          <button class="mini-button" ${user.friendship ? 'disabled' : ''}>${label}</button>`;
         const addButton = row.querySelector('button');
         addButton.addEventListener('click', async () => {
           try {
@@ -284,15 +312,11 @@ function renderFriendsPanel() {
         });
         results.appendChild(row);
       }
-    } catch (error) {
-      toast(error.message);
-    }
+    } catch (error) { toast(error.message); }
   }
 
   searchButton.addEventListener('click', searchFriends);
-  searchInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') searchFriends();
-  });
+  searchInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') searchFriends(); });
 }
 
 function renderServerPanel(serverId) {
@@ -301,76 +325,165 @@ function renderServerPanel(serverId) {
 
   state.view = 'server';
   state.currentServerId = server.id;
+  const isOwner = server.ownerId === state.user?.id;
   els.sidebarTitle.textContent = server.name;
+  els.copyInviteButton.classList.remove('hidden');
+  state.currentInviteCode = server.inviteCode;
+
+  const textChannels = server.channels.filter((c) => c.kind !== 'voice');
+  const voiceChannels = server.channels.filter((c) => c.kind === 'voice');
+
   els.dynamicPanel.innerHTML = `
     <section class="stack">
       <div class="section-title">Sunucu</div>
-      <div class="user-row">
-        <span class="avatar">${escapeHTML(initials(server.name))}</span>
-        <span class="row-grow truncate"><strong>${escapeHTML(server.name)}</strong><br><small>Davet kodu: ${escapeHTML(server.inviteCode)}</small></span>
+      <div class="info-card">
+        <span class="avatar server">${escapeHTML(initials(server.name))}</span>
+        <span class="row-grow truncate"><strong>${escapeHTML(server.name)}</strong><br><small>${server.memberIds?.length || 0} üye • ${isOwner ? 'sahibi sensin' : 'üye'}</small></span>
       </div>
-      <button id="addChannelButton" class="ghost" type="button">Kanal ekle</button>
+      <div class="stack">
+        <button id="copyInvitePanelButton" class="ghost" type="button">Davet kodunu kopyala</button>
+        ${isOwner ? '<button id="renameServerButton" class="ghost" type="button">Sunucu adını değiştir</button>' : ''}
+        ${isOwner ? '<button id="addTextChannelButton" class="ghost" type="button">＋ Yazı kanalı</button>' : ''}
+        ${isOwner ? '<button id="addVoiceChannelButton" class="ghost" type="button">＋ Ses kanalı</button>' : ''}
+        ${isOwner ? '<button id="deleteServerButton" class="mini-button danger" type="button">Sunucuyu sil</button>' : '<button id="leaveServerButton" class="mini-button warn" type="button">Sunucudan çık</button>'}
+      </div>
     </section>
     <section class="stack">
-      <div class="section-title">Kanallar</div>
-      <div id="channelList"></div>
+      <div class="section-title-row"><div class="section-title">Yazı kanalları</div><small>${textChannels.length}</small></div>
+      <div id="textChannelList"></div>
     </section>
-  `;
+    <section class="stack">
+      <div class="section-title-row"><div class="section-title">Ses kanalları</div><small>${voiceChannels.length}</small></div>
+      <div id="voiceChannelList"></div>
+    </section>`;
 
-  const list = els.dynamicPanel.querySelector('#channelList');
-  for (const channel of server.channels) {
+  renderChannelGroup(els.dynamicPanel.querySelector('#textChannelList'), textChannels, server, isOwner);
+  renderChannelGroup(els.dynamicPanel.querySelector('#voiceChannelList'), voiceChannels, server, isOwner);
+
+  const copyButton = els.dynamicPanel.querySelector('#copyInvitePanelButton');
+  copyButton?.addEventListener('click', () => copyInvite(server.inviteCode));
+
+  els.dynamicPanel.querySelector('#renameServerButton')?.addEventListener('click', async () => {
+    const name = prompt('Yeni sunucu adı?', server.name);
+    if (!name || name.trim() === server.name) return;
+    try {
+      const data = await api(`/api/servers/${server.id}`, { method: 'PATCH', body: { name } });
+      const index = state.servers.findIndex((item) => item.id === server.id);
+      if (index >= 0) state.servers[index] = data.server;
+      renderRail();
+      renderServerPanel(data.server.id);
+      toast('Sunucu adı güncellendi.');
+    } catch (error) { toast(error.message); }
+  });
+
+  els.dynamicPanel.querySelector('#addTextChannelButton')?.addEventListener('click', () => createChannel(server, 'text'));
+  els.dynamicPanel.querySelector('#addVoiceChannelButton')?.addEventListener('click', () => createChannel(server, 'voice'));
+  els.dynamicPanel.querySelector('#deleteServerButton')?.addEventListener('click', () => deleteServer(server));
+  els.dynamicPanel.querySelector('#leaveServerButton')?.addEventListener('click', () => leaveServer(server));
+}
+
+function renderChannelGroup(container, channels, server, isOwner) {
+  container.innerHTML = channels.length ? '' : '<p>Henüz kanal yok.</p>';
+  for (const channel of channels) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = `channel-row ${state.currentChannelId === channel.id ? 'active' : ''}`;
-    row.innerHTML = `<span>#</span><span class="row-grow truncate">${escapeHTML(channel.name)}</span>`;
-    row.addEventListener('click', () => {
+    const icon = channel.kind === 'voice' ? '🔊' : '#';
+    row.innerHTML = `
+      <span class="avatar">${icon}</span>
+      <span class="row-grow truncate"><strong>${escapeHTML(channel.name)}</strong><br><small>${channel.kind === 'voice' ? 'ses kanalı' : 'yazı kanalı'}</small></span>
+      ${isOwner ? '<span class="row-actions"><span class="mini-button danger" data-delete-channel="1">Sil</span></span>' : ''}`;
+    row.addEventListener('click', (event) => {
+      if (event.target?.dataset?.deleteChannel) return;
       openChannel(channel, {
-        title: `# ${channel.name}`,
+        title: `${icon} ${channel.name}`,
         subtitle: `${server.name} • Davet kodu: ${server.inviteCode}`,
-        inviteCode: server.inviteCode
+        inviteCode: server.inviteCode,
+        serverId: server.id
       });
       renderServerPanel(server.id);
     });
-    list.appendChild(row);
+    row.querySelector('[data-delete-channel]')?.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      if (!confirm(`#${channel.name} kanalını silmek istediğine emin misin?`)) return;
+      try {
+        const data = await api(`/api/servers/${server.id}/channels/${channel.id}`, { method: 'DELETE', body: {} });
+        const index = state.servers.findIndex((item) => item.id === server.id);
+        if (index >= 0) state.servers[index] = data.server;
+        if (state.currentChannelId === channel.id) resetChat(server.name, 'Kanal silindi. Başka kanal seç.');
+        renderServerPanel(server.id);
+        toast('Kanal silindi.');
+      } catch (error) { toast(error.message); }
+    });
+    container.appendChild(row);
   }
+}
 
-  els.dynamicPanel.querySelector('#addChannelButton').addEventListener('click', async () => {
-    const name = prompt('Yeni kanal adı? Örn: oyun, ders, muhabbet');
-    if (!name) return;
-    try {
-      const data = await api(`/api/servers/${server.id}/channels`, { method: 'POST', body: { name } });
-      const index = state.servers.findIndex((item) => item.id === server.id);
-      state.servers[index] = data.server;
-      renderServerPanel(server.id);
-      openChannel(data.channel, {
-        title: `# ${data.channel.name}`,
-        subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`,
-        inviteCode: data.server.inviteCode
-      });
-    } catch (error) { toast(error.message); }
-  });
+async function createChannel(server, kind) {
+  const name = prompt(kind === 'voice' ? 'Yeni ses kanalı adı?' : 'Yeni yazı kanalı adı?', kind === 'voice' ? 'ses-odasi' : 'muhabbet');
+  if (!name) return;
+  try {
+    const data = await api(`/api/servers/${server.id}/channels`, { method: 'POST', body: { name, kind } });
+    const index = state.servers.findIndex((item) => item.id === server.id);
+    if (index >= 0) state.servers[index] = data.server;
+    renderServerPanel(server.id);
+    openChannel(data.channel, {
+      title: `${data.channel.kind === 'voice' ? '🔊' : '#'} ${data.channel.name}`,
+      subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`,
+      inviteCode: data.server.inviteCode,
+      serverId: data.server.id
+    });
+  } catch (error) { toast(error.message); }
+}
+
+async function deleteServer(server) {
+  const typed = prompt(`Sunucuyu tamamen silmek için adını yaz: ${server.name}`);
+  if (typed !== server.name) return toast('Sunucu silme iptal edildi.');
+  try {
+    await api(`/api/servers/${server.id}`, { method: 'DELETE', body: {} });
+    state.servers = state.servers.filter((item) => item.id !== server.id);
+    toast('Sunucu silindi.');
+    renderFriendsPanel();
+  } catch (error) { toast(error.message); }
+}
+
+async function leaveServer(server) {
+  if (!confirm(`${server.name} sunucusundan çıkmak istiyor musun?`)) return;
+  try {
+    await api(`/api/servers/${server.id}/leave`, { method: 'POST', body: {} });
+    state.servers = state.servers.filter((item) => item.id !== server.id);
+    toast('Sunucudan çıkıldı.');
+    renderFriendsPanel();
+  } catch (error) { toast(error.message); }
+}
+
+async function copyInvite(inviteCode = state.currentInviteCode) {
+  if (!inviteCode) return;
+  try {
+    await navigator.clipboard.writeText(inviteCode);
+    toast(`Davet kodu kopyalandı: ${inviteCode}`);
+  } catch {
+    toast(`Davet kodu: ${inviteCode}`);
+  }
 }
 
 async function openDm(friend) {
   try {
     const data = await api(`/api/dms/${friend.id}`);
+    state.view = 'dm';
+    state.currentServerId = null;
+    renderRail();
     openChannel(data.channel, {
       title: `@${friend.displayName}`,
       subtitle: `Özel mesaj • @${friend.username}`,
       inviteCode: ''
     });
-  } catch (error) {
-    toast(error.message);
-  }
+  } catch (error) { toast(error.message); }
 }
 
-function openChannel(channel, info) {
-  if (!state.socket?.connected) {
-    toast('Sunucu bağlantısı kurulunca tekrar dene.');
-    return;
-  }
-
+async function openChannel(channel, info) {
   state.currentChannelId = channel.id;
+  state.currentChannelKind = channel.kind || 'text';
   state.currentInviteCode = info.inviteCode || '';
   els.chatTitle.textContent = info.title;
   els.chatSubtitle.textContent = info.subtitle || '';
@@ -378,19 +491,28 @@ function openChannel(channel, info) {
   els.messageInput.disabled = false;
   els.sendButton.disabled = false;
   els.recordButton.disabled = false;
-  els.messages.innerHTML = '<div class="empty-state">Mesajlar yükleniyor...</div>';
+  els.fileButton.disabled = false;
+  els.messageInput.placeholder = channel.kind === 'voice' ? 'Ses kanalına not yaz veya sesli mesaj bırak...' : 'Mesaj yaz... Enter gönderir, Shift+Enter yeni satır.';
+  els.messages.innerHTML = '<div class="empty-state"><strong>Yükleniyor</strong>Mesajlar getiriliyor...</div>';
   els.typingLine.textContent = '';
 
-  state.socket.emit('channel:join', { channelId: channel.id }, (response) => {
-    if (response?.error) return toast(response.error);
-    renderMessages(response.messages || []);
-  });
+  if (state.socket?.connected) {
+    state.socket.emit('channel:join', { channelId: channel.id }, (response) => {
+      if (response?.error) return toast(response.error);
+      renderMessages(response.messages || []);
+    });
+  } else {
+    try {
+      const data = await api(`/api/channels/${channel.id}/messages`);
+      renderMessages(data.messages || []);
+    } catch (error) { toast(error.message); }
+  }
 }
 
 function renderMessages(messages) {
   els.messages.innerHTML = '';
   if (!messages.length) {
-    els.messages.innerHTML = '<div class="empty-state">Bu kanalda henüz mesaj yok. İlk mesajı sen gönder.</div>';
+    els.messages.innerHTML = '<div class="empty-state"><strong>Henüz mesaj yok</strong>İlk mesajı sen gönder.</div>';
     return;
   }
   for (const message of messages) appendMessage(message, { scroll: false });
@@ -398,10 +520,11 @@ function renderMessages(messages) {
 }
 
 function appendMessage(message, { scroll = true } = {}) {
+  if (!message || message.channelId !== state.currentChannelId) return;
   if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
 
   const article = document.createElement('article');
-  article.className = 'message';
+  article.className = `message ${message.user?.id === state.user?.id ? 'own' : ''}`;
 
   const avatar = document.createElement('div');
   avatar.className = `avatar ${state.onlineIds.has(message.user?.id) ? 'online' : ''}`;
@@ -421,14 +544,30 @@ function appendMessage(message, { scroll = true } = {}) {
 
   if (message.type === 'voice') {
     const label = document.createElement('div');
-    label.textContent = 'Sesli mesaj';
+    label.className = 'message-body';
+    label.textContent = '🎙️ Sesli mesaj';
     const audio = document.createElement('audio');
     audio.controls = true;
     audio.preload = 'metadata';
     audio.src = message.audioUrl;
     bubble.append(label, audio);
+  } else if (message.type === 'file') {
+    if (message.text) {
+      const text = document.createElement('div');
+      text.className = 'message-body';
+      text.textContent = message.text;
+      bubble.appendChild(text);
+    }
+    const link = document.createElement('a');
+    link.className = 'message-file';
+    link.href = message.fileUrl;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = `📎 ${message.fileName || 'dosya'} ${formatBytes(message.sizeBytes)}`;
+    bubble.appendChild(link);
   } else {
     const text = document.createElement('div');
+    text.className = 'message-body';
     text.textContent = message.text || '';
     bubble.appendChild(text);
   }
@@ -438,9 +577,7 @@ function appendMessage(message, { scroll = true } = {}) {
   if (scroll) scrollMessages();
 }
 
-function scrollMessages() {
-  els.messages.scrollTop = els.messages.scrollHeight;
-}
+function scrollMessages() { els.messages.scrollTop = els.messages.scrollHeight; }
 
 function connectSocket() {
   if (state.socket) state.socket.disconnect();
@@ -448,17 +585,20 @@ function connectSocket() {
 
   state.socket.on('connect', () => {
     els.connectionState.textContent = 'çevrimiçi';
-    els.connectionState.classList.add('online');
+    els.connectionState.classList.remove('offline');
+    if (state.currentChannelId) state.socket.emit('channel:join', { channelId: state.currentChannelId }, (response) => {
+      if (!response?.error) renderMessages(response.messages || []);
+    });
   });
 
   state.socket.on('disconnect', () => {
     els.connectionState.textContent = 'çevrimdışı';
-    els.connectionState.classList.remove('online');
+    els.connectionState.classList.add('offline');
   });
 
   state.socket.on('connect_error', (error) => {
     els.connectionState.textContent = 'hata';
-    els.connectionState.classList.remove('online');
+    els.connectionState.classList.add('offline');
     toast(error.message || 'Bağlantı hatası.');
   });
 
@@ -467,9 +607,7 @@ function connectSocket() {
     if (state.view === 'home') renderFriendsPanel();
   });
 
-  state.socket.on('message:new', (message) => {
-    if (message.channelId === state.currentChannelId) appendMessage(message);
-  });
+  state.socket.on('message:new', (message) => appendMessage(message));
 
   state.socket.on('typing', ({ channelId, user, isTyping }) => {
     if (channelId !== state.currentChannelId || !isTyping || user?.id === state.user?.id) return;
@@ -477,27 +615,58 @@ function connectSocket() {
     clearTimeout(state.remoteTypingTimeout);
     state.remoteTypingTimeout = setTimeout(() => { els.typingLine.textContent = ''; }, 1800);
   });
+
+  state.socket.on('server:deleted', ({ serverId, channelIds }) => {
+    state.servers = state.servers.filter((server) => server.id !== serverId);
+    if (state.currentServerId === serverId || channelIds?.includes(state.currentChannelId)) {
+      toast('Seçili sunucu silindi.');
+      renderFriendsPanel();
+    } else renderRail();
+  });
+
+  state.socket.on('server:updated', ({ server }) => {
+    const index = state.servers.findIndex((item) => item.id === server.id);
+    if (index >= 0) state.servers[index] = server;
+    renderRail();
+    if (state.currentServerId === server.id) renderServerPanel(server.id);
+  });
+
+  state.socket.on('channel:deleted', ({ channelId, serverId }) => {
+    const server = state.servers.find((item) => item.id === serverId);
+    if (server) server.channels = server.channels.filter((channel) => channel.id !== channelId);
+    if (state.currentChannelId === channelId) resetChat('Kanal silindi', 'Başka bir kanal seç.');
+    if (state.currentServerId === serverId) renderServerPanel(serverId);
+  });
 }
 
 async function sendTextMessage() {
   const text = els.messageInput.value.trim();
   if (!text || !state.currentChannelId) return;
   els.sendButton.disabled = true;
-  state.socket.emit('message:text', { channelId: state.currentChannelId, text }, (response) => {
+  try {
+    if (state.socket?.connected) {
+      state.socket.emit('message:text', { channelId: state.currentChannelId, text }, (response) => {
+        els.sendButton.disabled = false;
+        if (response?.error) return toast(response.error);
+        els.messageInput.value = '';
+        autoGrowTextarea();
+        state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false });
+      });
+    } else {
+      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', text } });
+      appendMessage(data.message);
+      els.messageInput.value = '';
+      autoGrowTextarea();
+      els.sendButton.disabled = false;
+    }
+  } catch (error) {
     els.sendButton.disabled = false;
-    if (response?.error) return toast(response.error);
-    els.messageInput.value = '';
-    state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false });
-  });
+    toast(error.message);
+  }
 }
 
 function chooseAudioMime() {
-  const options = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/mp4'
-  ];
+  const options = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
   return options.find((mime) => window.MediaRecorder?.isTypeSupported?.(mime)) || '';
 }
 
@@ -511,10 +680,8 @@ function blobToDataURL(blob) {
 }
 
 async function startRecording() {
-  if (!state.currentChannelId) return toast('Önce bir kanal veya DM seç.');
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-    return toast('Bu tarayıcı ses kaydını desteklemiyor. Chrome/Edge/Firefox deneyebilirsin.');
-  }
+  if (!state.currentChannelId) return toast('Önce kanal veya DM seç.');
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return toast('Tarayıcı ses kaydını desteklemiyor.');
 
   try {
     state.recordStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -523,27 +690,21 @@ async function startRecording() {
     state.recorder = new MediaRecorder(state.recordStream, mimeType ? { mimeType } : undefined);
     state.recordStartedAt = Date.now();
 
-    state.recorder.addEventListener('dataavailable', (event) => {
-      if (event.data?.size) state.recordChunks.push(event.data);
-    });
+    state.recorder.addEventListener('dataavailable', (event) => { if (event.data?.size) state.recordChunks.push(event.data); });
 
     state.recorder.addEventListener('stop', async () => {
       try {
         const blob = new Blob(state.recordChunks, { type: state.recorder.mimeType || mimeType || 'audio/webm' });
         const dataUrl = await blobToDataURL(blob);
         const durationMs = Date.now() - state.recordStartedAt;
-        state.socket.emit('message:voice', {
-          channelId: state.currentChannelId,
-          audioData: dataUrl,
-          mimeType: blob.type,
-          durationMs
-        }, (response) => {
-          if (response?.error) toast(response.error);
-          else toast('Sesli mesaj gönderildi.');
+        const response = await api(`/api/channels/${state.currentChannelId}/messages`, {
+          method: 'POST',
+          body: { type: 'voice', audioData: dataUrl, mimeType: blob.type, fileName: 'voice.webm', durationMs }
         });
-      } catch (error) {
-        toast('Sesli mesaj hazırlanamadı.');
-      } finally {
+        if (!state.socket?.connected) appendMessage(response.message);
+        toast('Sesli mesaj gönderildi.');
+      } catch (error) { toast(error.message || 'Sesli mesaj hazırlanamadı.'); }
+      finally {
         state.recordStream?.getTracks().forEach((track) => track.stop());
         state.recordStream = null;
         state.recorder = null;
@@ -557,13 +718,40 @@ async function startRecording() {
     els.recordButton.classList.add('recording');
     els.recordButton.textContent = '⏹️';
     toast('Kayıt başladı. Durdurmak için tekrar bas.');
-  } catch (error) {
-    toast('Mikrofon izni alınamadı.');
-  }
+  } catch { toast('Mikrofon izni alınamadı.'); }
 }
 
-function stopRecording() {
-  if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+function stopRecording() { if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop(); }
+
+function fileToDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function sendSelectedFile(file) {
+  if (!file || !state.currentChannelId || state.sendingFile) return;
+  if (file.size > 15 * 1024 * 1024) return toast('Dosya 15 MB sınırını aşıyor.');
+  state.sendingFile = true;
+  els.fileButton.disabled = true;
+  try {
+    const dataUrl = await fileToDataURL(file);
+    const caption = prompt('Dosya açıklaması? Boş bırakabilirsin.', '') || '';
+    const response = await api(`/api/channels/${state.currentChannelId}/messages`, {
+      method: 'POST',
+      body: { type: 'file', fileData: dataUrl, mimeType: file.type || 'application/octet-stream', fileName: file.name, text: caption }
+    });
+    if (!state.socket?.connected) appendMessage(response.message);
+    toast('Dosya gönderildi.');
+  } catch (error) { toast(error.message); }
+  finally {
+    state.sendingFile = false;
+    els.fileButton.disabled = !state.currentChannelId;
+    els.fileInput.value = '';
+  }
 }
 
 function wireEvents() {
@@ -577,20 +765,13 @@ function wireEvents() {
       const endpoint = state.mode === 'login' ? '/api/login' : '/api/register';
       await api(endpoint, {
         method: 'POST',
-        body: {
-          username: els.usernameInput.value,
-          displayName: els.displayNameInput.value,
-          password: els.passwordInput.value
-        }
+        body: { username: els.usernameInput.value, displayName: els.displayNameInput.value, password: els.passwordInput.value }
       });
       els.passwordInput.value = '';
       const data = await api('/api/me');
       enterApp(data);
-    } catch (error) {
-      toast(error.message);
-    } finally {
-      els.authSubmit.disabled = false;
-    }
+    } catch (error) { toast(error.message); }
+    finally { els.authSubmit.disabled = false; }
   });
 
   els.homeButton.addEventListener('click', renderFriendsPanel);
@@ -609,7 +790,8 @@ function wireEvents() {
         openChannel(data.server.channels[0], {
           title: `# ${data.server.channels[0].name}`,
           subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`,
-          inviteCode: data.server.inviteCode
+          inviteCode: data.server.inviteCode,
+          serverId: data.server.id
         });
       }
     } catch (error) { toast(error.message); }
@@ -639,40 +821,33 @@ function wireEvents() {
     showAuth();
   });
 
-  els.messageForm.addEventListener('submit', (event) => {
-    event.preventDefault();
-    sendTextMessage();
+  els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });
+
+  els.messageInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      sendTextMessage();
+    }
   });
 
   els.messageInput.addEventListener('input', () => {
+    autoGrowTextarea();
     if (!state.currentChannelId || !state.socket?.connected) return;
     state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: true });
     clearTimeout(state.typingTimeout);
-    state.typingTimeout = setTimeout(() => {
-      state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false });
-    }, 900);
+    state.typingTimeout = setTimeout(() => state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false }), 900);
   });
 
-  els.recordButton.addEventListener('click', () => {
-    if (state.recorder) stopRecording();
-    else startRecording();
-  });
-
-  els.copyInviteButton.addEventListener('click', async () => {
-    if (!state.currentInviteCode) return;
-    try {
-      await navigator.clipboard.writeText(state.currentInviteCode);
-      toast('Davet kodu kopyalandı.');
-    } catch {
-      toast(`Davet kodu: ${state.currentInviteCode}`);
-    }
-  });
+  els.recordButton.addEventListener('click', () => { if (state.recorder) stopRecording(); else startRecording(); });
+  els.fileButton.addEventListener('click', () => els.fileInput.click());
+  els.fileInput.addEventListener('change', () => sendSelectedFile(els.fileInput.files?.[0]));
+  els.copyInviteButton.addEventListener('click', () => copyInvite());
 }
 
 function enterApp(data) {
   state.user = data.user;
-  state.friends = data.friends;
-  state.servers = data.servers;
+  state.friends = data.friends || state.friends;
+  state.servers = data.servers || [];
   state.onlineIds = new Set(data.onlineIds || []);
   showApp();
   renderMe();
@@ -684,20 +859,14 @@ function enterApp(data) {
 async function bootstrap() {
   wireEvents();
   setAuthMode('login');
-  els.messageInput.disabled = true;
-  els.sendButton.disabled = true;
-  els.recordButton.disabled = true;
+  resetChat();
 
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
-  }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
   try {
     const data = await api('/api/me');
     enterApp(data);
-  } catch {
-    showAuth();
-  }
+  } catch { showAuth(); }
 }
 
 bootstrap();

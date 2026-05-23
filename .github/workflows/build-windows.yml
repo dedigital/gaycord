@@ -1,4 +1,4 @@
-name: Build Windows Native App
+name: Build Gaycord Windows App
 
 on:
   workflow_dispatch:
@@ -7,6 +7,9 @@ on:
     paths:
       - 'windows-native/**'
       - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -21,20 +24,20 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Restore
-        run: dotnet restore windows-native/ArkadasOdasi.Native.csproj
+        run: dotnet restore windows-native/Gaycord.Native.csproj
 
-      - name: Publish portable EXE
-        run: dotnet publish windows-native/ArkadasOdasi.Native.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/ArkadasOdasi-win-x64
+      - name: Publish Gaycord EXE
+        run: dotnet publish windows-native/Gaycord.Native.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/Gaycord-win-x64
 
       - name: Add server.txt placeholder
         shell: pwsh
         run: |
-          if (!(Test-Path publish/ArkadasOdasi-win-x64/server.txt)) {
-            Copy-Item windows-native/server.txt.example publish/ArkadasOdasi-win-x64/server.txt
+          if (!(Test-Path publish/Gaycord-win-x64/server.txt)) {
+            Copy-Item windows-native/server.txt.example publish/Gaycord-win-x64/server.txt
           }
 
       - name: Upload Windows app
         uses: actions/upload-artifact@v4
         with:
-          name: ArkadasOdasi-Windows-Native
-          path: publish/ArkadasOdasi-win-x64/**
+          name: Gaycord-Windows-Native
+          path: publish/Gaycord-win-x64/**

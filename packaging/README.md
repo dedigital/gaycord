@@ -1,11 +1,17 @@
-# Paketleme notu
+# Gaycord packaging
 
-Bu proje Windows için self-contained portable EXE üretir. Arkadaşların Node, npm veya PowerShell kullanmaz.
+V3 build artifact adı:
 
-GitHub Actions sonucu oluşan `ArkadasOdasi-Windows-Native` artifact'ının içinden şunları dağıt:
+```text
+Gaycord-Windows-Native
+```
 
-- `ArkadasOdasi.exe`
-- `server.txt`
-- publish klasöründe oluşan ek dosyalar varsa hepsi
+İçerik:
 
-`server.txt` içine kendi HTTPS sunucu adresini yazarsan uygulama ilk açılışta otomatik o adresi kullanır.
+```text
+Gaycord.exe
+server.txt
+*.dll / runtime dosyaları gerekirse
+```
+
+Arkadaşlara gönderirken klasörü komple zipleyin; sadece exe göndermeyin.

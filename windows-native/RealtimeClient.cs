@@ -3,7 +3,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public sealed class RealtimeClient : IAsyncDisposable
 {

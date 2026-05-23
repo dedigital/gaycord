@@ -1,13 +1,11 @@
-# Arkadaş Odası Native Windows
+# Gaycord Windows Native
 
-Bu istemci WPF ile yazılmış gerçek Windows uygulamasıdır; Electron değildir. Mesajlar ve sesli mesajlar sunucu API'sine gider. Canlı ses odası native istemciler arasında WebSocket üstünden PCM ses paketleriyle çalışır.
+WPF tabanlı native Windows istemcisi.
 
-## Build
+GitHub Actions build sonucu `Gaycord.exe` üretir. `server.txt` içine sunucu URL'i yazılmalıdır.
 
-Normalde GitHub Actions derler. Yerelde derlemek isteyen geliştirici Windows'ta şunu çalıştırabilir:
+Örnek:
 
-```powershell
-dotnet publish .\ArkadasOdasi.Native.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\publish
+```text
+https://gaycord.onrender.com
 ```
-
-Arkadaşların bunu çalıştırmaz; sadece çıkan EXE'yi açar.

@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.Windows;
 using System.Windows.Input;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public partial class MainWindow : Window
 {
@@ -140,6 +140,8 @@ public partial class MainWindow : Window
         ChatTitle.Text = "Arkadaşlar";
         ChatSubtitle.Text = "Arkadaş ekle, istek kabul et veya DM aç.";
         CopyInviteButton.Content = "Davet kodu";
+        DeleteServerButton.Visibility = Visibility.Collapsed;
+        LeaveServerButton.Visibility = Visibility.Collapsed;
         _messages.Clear();
     }
 
@@ -153,6 +155,9 @@ public partial class MainWindow : Window
         CopyInviteButton.Content = $"Davet: {server.InviteCode}";
         ChatTitle.Text = server.Name;
         ChatSubtitle.Text = "Bir kanal seç.";
+        var isOwner = server.OwnerId == _me?.User?.Id;
+        DeleteServerButton.Visibility = isOwner ? Visibility.Visible : Visibility.Collapsed;
+        LeaveServerButton.Visibility = isOwner ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private async void ChannelList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
@@ -365,6 +370,40 @@ public partial class MainWindow : Window
                 ChannelList.ItemsSource = fresh.Channels;
             }
             SetStatus("Kanal açıldı.");
+        }
+        catch (Exception ex) { SetStatus(ex.Message); }
+    }
+
+    private async void DeleteServerButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_currentServer is null) { SetStatus("Önce sunucu seç."); return; }
+            var answer = System.Windows.MessageBox.Show($"{_currentServer.Name} sunucusu tamamen silinsin mi?", "Gaycord", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.Yes) return;
+            await _api.DeleteServerAsync(_currentServer.Id);
+            _currentServer = null;
+            _currentChannel = null;
+            await LoadMeAsync();
+            HomeButton_Click(this, new RoutedEventArgs());
+            SetStatus("Sunucu silindi.");
+        }
+        catch (Exception ex) { SetStatus(ex.Message); }
+    }
+
+    private async void LeaveServerButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_currentServer is null) { SetStatus("Önce sunucu seç."); return; }
+            var answer = System.Windows.MessageBox.Show($"{_currentServer.Name} sunucusundan çıkılsın mı?", "Gaycord", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes) return;
+            await _api.LeaveServerAsync(_currentServer.Id);
+            _currentServer = null;
+            _currentChannel = null;
+            await LoadMeAsync();
+            HomeButton_Click(this, new RoutedEventArgs());
+            SetStatus("Sunucudan çıkıldı.");
         }
         catch (Exception ex) { SetStatus(ex.Message); }
     }

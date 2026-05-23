@@ -1,6 +1,6 @@
 using System.Windows;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public partial class App : Application
 {

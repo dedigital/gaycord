@@ -1,7 +1,7 @@
 using System.IO;
 using NAudio.Wave;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public sealed class AudioService : IDisposable
 {

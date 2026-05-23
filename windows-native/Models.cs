@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public sealed class UserDto
 {
@@ -177,7 +177,7 @@ public sealed class FriendListItem
 
 public sealed class LocalSettings
 {
-    public string ServerUrl { get; set; } = "https://senin-uygulaman.onrender.com";
+    public string ServerUrl { get; set; } = "https://gaycord.onrender.com";
     public string Token { get; set; } = "";
     public string Username { get; set; } = "";
 }

@@ -1,11 +1,12 @@
 services:
   - type: web
-    name: arkadas-odasi
+    name: gaycord
     env: node
     plan: free
     rootDir: server
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production

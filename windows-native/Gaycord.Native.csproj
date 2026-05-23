@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <AssemblyName>Gaycord</AssemblyName>
+    <Product>Gaycord</Product>
+    <ApplicationIcon>Assets\gaycord.ico</ApplicationIcon>
+    <RootNamespace>Gaycord.Native</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\gaycord.ico" />
+    <Resource Include="Assets\gaycord-logo.png" />
+    <Resource Include="Assets\icon-64.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="server.txt.example" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

@@ -282,7 +282,7 @@ app.use(express.json({ limit: `${Math.ceil(MAX_UPLOAD_BYTES / 1024 / 1024) + 2}m
 app.use('/uploads', express.static(UPLOAD_DIR, { setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800, immutable') }));
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'arkadas-odasi-v2', time: now() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'gaycord-v3', time: now() }));
 
 app.post('/api/register', (req, res) => {
   const username = normalizeUsername(req.body.username);
@@ -394,6 +394,7 @@ app.post('/api/servers/join', auth, (req, res) => {
 app.post('/api/servers/:serverId/channels', auth, (req, res) => {
   const serverObj = db.servers[req.params.serverId];
   if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal acabilir.' });
   const kind = req.body.kind === 'voice' ? 'voice' : 'text';
   const name = String(req.body.name || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   if (name.length < 2) return res.status(400).json({ error: 'Kanal adi en az 2 karakter olmali.' });
@@ -403,6 +404,62 @@ app.post('/api/servers/:serverId/channels', auth, (req, res) => {
   serverObj.channelIds.push(channelId);
   saveDbSoon();
   res.status(201).json({ server: ensureServerView(serverObj), channel: db.channels[channelId] });
+});
+
+app.patch('/api/servers/:serverId', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi duzenleyebilir.' });
+  const name = String(req.body.name || '').trim().slice(0, 40);
+  if (name.length < 2) return res.status(400).json({ error: 'Sunucu adi en az 2 karakter olmali.' });
+  serverObj.name = name;
+  serverObj.updatedAt = now();
+  saveDbSoon();
+  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  res.json({ server: ensureServerView(serverObj) });
+});
+
+app.delete('/api/servers/:serverId', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi sunucuyu silebilir.' });
+
+  const deletedChannelIds = [...serverObj.channelIds];
+  for (const channelId of deletedChannelIds) {
+    delete db.messages[channelId];
+    delete db.channels[channelId];
+  }
+  delete db.servers[serverObj.id];
+  saveDbSoon();
+  io.emit('server:deleted', { serverId: serverObj.id, channelIds: deletedChannelIds });
+  broadcastNative('server:deleted', { serverId: serverObj.id, channelIds: deletedChannelIds });
+  res.json({ ok: true, serverId: serverObj.id });
+});
+
+app.post('/api/servers/:serverId/leave', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
+  if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahip oldugun sunucudan cikamazsin; istersen silebilirsin.' });
+
+  serverObj.memberIds = serverObj.memberIds.filter((memberId) => memberId !== req.user.id);
+  saveDbSoon();
+  res.json({ ok: true, serverId: serverObj.id });
+});
+
+app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  const channel = db.channels[req.params.channelId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadi.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal silebilir.' });
+  if (serverObj.channelIds.length <= 1) return res.status(400).json({ error: 'Son kanali silemezsin.' });
+
+  serverObj.channelIds = serverObj.channelIds.filter((channelId) => channelId !== channel.id);
+  delete db.messages[channel.id];
+  delete db.channels[channel.id];
+  saveDbSoon();
+  io.to(channel.id).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
+  broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id }, (ws) => ws.joinedChannels?.has(channel.id));
+  res.json({ ok: true, server: ensureServerView(serverObj), channelId: channel.id });
 });
 
 app.get('/api/channels/:channelId/messages', auth, (req, res) => {
@@ -544,4 +601,4 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Arkadas Odasi V2 calisiyor: http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Gaycord V3 calisiyor: http://localhost:${PORT}`));

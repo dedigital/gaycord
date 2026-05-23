@@ -2,63 +2,79 @@
 <html lang="tr">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#5865f2">
-  <title>Arkadaş Odası</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f1025">
+  <meta name="description" content="Gaycord: arkadaşlarınla sunucu, kanal, DM, dosya ve sesli mesaj uygulaması.">
+  <title>Gaycord</title>
+  <link rel="icon" href="/brand/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/brand/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main id="auth" class="auth-shell hidden">
-    <section class="auth-card">
+  <section id="auth" class="auth-shell">
+    <div class="aurora aurora-one"></div>
+    <div class="aurora aurora-two"></div>
+    <article class="auth-card glass">
       <div class="brand-block">
-        <div class="logo">AO</div>
+        <img class="brand-logo" src="/brand/gaycord-logo.png" alt="Gaycord logo">
         <div>
-          <h1>Arkadaş Odası</h1>
-          <p>Arkadaşlarınla sunucularda, DM’de ve sesli mesajlarla konuş.</p>
+          <p class="eyebrow">private friend server</p>
+          <h1>Gaycord</h1>
+          <p class="muted">Sunucu kur, kanala gir, arkadaşlarınla mesajlaş.</p>
         </div>
       </div>
 
-      <div class="tabs" role="tablist" aria-label="Giriş seçenekleri">
+      <div class="tabs" role="tablist" aria-label="Giriş seçimi">
         <button id="loginTab" class="tab active" type="button">Giriş</button>
         <button id="registerTab" class="tab" type="button">Kayıt</button>
       </div>
 
-      <form id="authForm" class="stack">
+      <form id="authForm" class="stack auth-form">
         <label id="displayNameWrap" class="hidden">
           Görünen ad
-          <input id="displayNameInput" autocomplete="name" placeholder="Örn. Mete">
+          <input id="displayNameInput" maxlength="32" placeholder="Ege">
         </label>
         <label>
           Kullanıcı adı
-          <input id="usernameInput" autocomplete="username" required placeholder="ornek_kullanici">
+          <input id="usernameInput" autocomplete="username" maxlength="20" placeholder="egeko">
         </label>
         <label>
           Şifre
-          <input id="passwordInput" type="password" autocomplete="current-password" required placeholder="En az 6 karakter">
+          <input id="passwordInput" type="password" autocomplete="current-password" placeholder="en az 6 karakter">
         </label>
-        <button id="authSubmit" class="primary" type="submit">Giriş yap</button>
+        <button id="authSubmit" class="primary wide" type="submit">Giriş yap</button>
       </form>
-    </section>
-  </main>
+    </article>
+  </section>
 
   <main id="app" class="app hidden">
-    <aside class="rail" aria-label="Sunucular">
-      <button id="homeButton" class="rail-button active" type="button" title="Arkadaşlar">🏠</button>
-      <div id="serverDots" class="server-dots"></div>
-      <button id="createServerButton" class="rail-button" type="button" title="Sunucu oluştur">＋</button>
-      <button id="joinServerButton" class="rail-button" type="button" title="Sunucuya katıl">⌁</button>
+    <aside class="rail">
+      <button id="homeButton" class="rail-button brand-home active" type="button" title="Ana sayfa">
+        <img src="/brand/icon-64.png" alt="Gaycord">
+      </button>
+      <div class="rail-divider"></div>
+      <div id="serverDots" class="server-dots" aria-label="Sunucular"></div>
+      <div class="rail-spacer"></div>
+      <button id="createServerButton" class="rail-button action" type="button" title="Sunucu oluştur">＋</button>
+      <button id="joinServerButton" class="rail-button action" type="button" title="Davet koduyla katıl">⌁</button>
     </aside>
 
-    <aside class="sidebar">
+    <aside class="sidebar glass">
       <header class="sidebar-header">
-        <strong id="sidebarTitle">Arkadaşlar</strong>
+        <div class="sidebar-title-wrap">
+          <strong id="sidebarTitle">Arkadaşlar</strong>
+          <small>Gaycord V3</small>
+        </div>
         <span id="connectionState" class="pill">bağlanıyor</span>
       </header>
       <section id="dynamicPanel" class="panel-scroll"></section>
       <footer class="user-bar">
-        <div>
+        <div class="avatar mini" id="meAvatar">?</div>
+        <div class="user-meta">
           <strong id="meName">-</strong>
           <small id="meUsername">-</small>
         </div>
@@ -67,21 +83,25 @@
     </aside>
 
     <section class="chat">
-      <header class="chat-header">
-        <div>
+      <header class="chat-header glass">
+        <div class="chat-title-area">
           <h2 id="chatTitle">Hoş geldin</h2>
-          <p id="chatSubtitle">Bir kanal veya DM seç.</p>
+          <p id="chatSubtitle">Sol taraftan arkadaş, sunucu veya kanal seç.</p>
         </div>
-        <button id="copyInviteButton" class="ghost hidden" type="button">Davet kodu</button>
+        <div class="chat-actions">
+          <button id="copyInviteButton" class="ghost hidden" type="button">Davet kodu</button>
+        </div>
       </header>
 
       <div id="messages" class="messages" aria-live="polite"></div>
       <div id="typingLine" class="typing-line"></div>
 
-      <form id="messageForm" class="composer">
-        <button id="recordButton" class="voice" type="button" title="Sesli mesaj kaydet">🎙️</button>
-        <input id="messageInput" autocomplete="off" maxlength="2000" placeholder="Mesaj yaz..." disabled>
-        <button id="sendButton" class="primary" type="submit" disabled>Gönder</button>
+      <form id="messageForm" class="composer glass">
+        <button id="fileButton" class="icon-button" type="button" title="Dosya gönder">＋</button>
+        <input id="fileInput" class="hidden" type="file" aria-label="Dosya seç">
+        <button id="recordButton" class="icon-button voice" type="button" title="Sesli mesaj kaydet">🎙️</button>
+        <textarea id="messageInput" rows="1" maxlength="2000" placeholder="Mesaj yaz... Enter gönderir, Shift+Enter yeni satır." disabled></textarea>
+        <button id="sendButton" class="primary send" type="submit" disabled>Gönder</button>
       </form>
     </section>
   </main>

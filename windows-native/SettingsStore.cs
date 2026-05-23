@@ -1,13 +1,13 @@
 using System.IO;
 using System.Text.Json;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public static class SettingsStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public static string SettingsDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ArkadasOdasi");
+    public static string SettingsDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Gaycord");
     public static string SettingsPath => Path.Combine(SettingsDirectory, "settings.json");
 
     public static LocalSettings Load()

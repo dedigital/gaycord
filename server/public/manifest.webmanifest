@@ -1,17 +1,15 @@
 {
-  "name": "Arkadaş Odası",
-  "short_name": "Arkadaş",
-  "description": "Arkadaşlarla yazılı sohbet, DM, kanal, dosya ve sesli mesaj uygulaması.",
+  "name": "Gaycord",
+  "short_name": "Gaycord",
+  "description": "Arkadaşlarla sunucu, kanal, DM, dosya ve sesli mesaj uygulaması.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#15171f",
-  "theme_color": "#5865f2",
+  "background_color": "#080912",
+  "theme_color": "#0f1025",
   "icons": [
-    {
-      "src": "/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any maskable"
-    }
+    { "src": "/brand/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/brand/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/brand/icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "maskable" }
   ]
 }

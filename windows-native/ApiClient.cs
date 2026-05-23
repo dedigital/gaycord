@@ -3,7 +3,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
-namespace ArkadasOdasi.Native;
+namespace Gaycord.Native;
 
 public sealed class ApiClient
 {
@@ -39,6 +39,15 @@ public sealed class ApiClient
 
     public Task<ServerResponse> JoinServerAsync(string inviteCode) =>
         SendAsync<ServerResponse>(HttpMethod.Post, "/api/servers/join", new { inviteCode });
+
+    public Task DeleteServerAsync(string serverId) =>
+        SendAsync<object>(HttpMethod.Delete, $"/api/servers/{Uri.EscapeDataString(serverId)}", new { });
+
+    public Task LeaveServerAsync(string serverId) =>
+        SendAsync<object>(HttpMethod.Post, $"/api/servers/{Uri.EscapeDataString(serverId)}/leave", new { });
+
+    public Task<ServerResponse> RenameServerAsync(string serverId, string name) =>
+        SendAsync<ServerResponse>(HttpMethod.Patch, $"/api/servers/{Uri.EscapeDataString(serverId)}", new { name });
 
     public Task<ServerResponse> CreateChannelAsync(string serverId, string name, string kind = "text") =>
         SendAsync<ServerResponse>(HttpMethod.Post, $"/api/servers/{Uri.EscapeDataString(serverId)}/channels", new { name, kind });
