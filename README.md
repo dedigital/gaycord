@@ -1,61 +1,29 @@
-# Gaycord V3
+# Gaycord V4.1
 
-Gaycord; arkadaşlarla sunucu, kanal, DM, dosya ve sesli mesaj için hazırlanmış web/PWA + native Windows chat uygulamasıdır.
+Discord benzeri Web/PWA + Windows Native başlangıç projesi.
 
-## V3 yenilikleri
+## V4.1 yenilikleri
 
-- Uygulama adı ve marka tamamen **Gaycord** olarak güncellendi.
-- Kullanıcının verdiği Gaycord logosu web, PWA, favicon ve Windows app ikonlarına eklendi.
-- Web arayüzü baştan tasarlandı.
-- Sunucu silme eklendi.
-- Sunucudan çıkma eklendi.
-- Kanal silme eklendi.
-- Sunucu adını değiştirme eklendi.
-- Web dosya gönderme eklendi.
-- Sol menü / satır taşması düzeltildi.
-- Windows native uygulamasının başlığı, logosu ve exe adı Gaycord oldu.
-- GitHub Actions artifact adı `Gaycord-Windows-Native` oldu.
+- Sesli mesaj gönderme/dinleme düzeltildi; boş kayıt bugı için parça parça kayıt alıyor.
+- Canlı ses kanalı eklendi; ses kanalı ve DM içinde WebRTC ile konuşma.
+- Fotoğraf/video/ses/dosya gönderme ve önizleme.
+- Sunucu üyeleri sağ panelde görünür.
+- Ayarlar modalı: profil, tema, kompakt mod, mikrofon testi, veri/yedek alanı.
+- Veri kalıcılığı için `GAYCORD_DATA_DIR` ve `DATABASE_URL` desteği.
+- Admin yedek indir/yükle.
 
 ## Render ayarları
 
-Render Web Service ayarları:
-
 ```text
-Language: Node
 Root Directory: server
 Build Command: npm install
 Start Command: npm start
 Health Check Path: /api/health
 ```
 
-## Lokal çalıştırma
+Veri gitmesin diye önerilen iki yol:
 
-```bash
-cd server
-npm install
-npm run dev
-```
+1. **PostgreSQL/Neon/Supabase/Render Postgres** kullan: Render Environment içine `DATABASE_URL` ekle.
+2. **Render Disk** kullan: Disk mount path `/var/data`, Environment içine `GAYCORD_DATA_DIR=/var/data/gaycord` ekle.
 
-Sonra:
-
-```text
-http://localhost:3000
-```
-
-## Windows app build
-
-GitHub > Actions > **Build Gaycord Windows App** > Run workflow.
-
-Build bitince artifact:
-
-```text
-Gaycord-Windows-Native
-```
-
-Zip'i indir, çıkar, `server.txt` içine Render linkini yaz:
-
-```text
-https://gaycord.onrender.com
-```
-
-Sonra `Gaycord.exe` çalıştır.
+Free plan ve kalıcı disk/database yoksa deploy/restart sonrası veriler garanti değildir. V4.1 içinde Ayarlar > Yedek indir/yükle var.

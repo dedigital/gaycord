@@ -1,19 +1,26 @@
 {
   "name": "gaycord-server",
-  "version": "3.0.0",
-  "description": "Gaycord: web/PWA ve native Windows istemcisi için gerçek zamanlı chat + ses sunucusu.",
+  "version": "4.2.0",
+  "description": "Gaycord V4.2: web/PWA ve native Windows istemcisi için chat, DM, dosya/fotoğraf, sesli mesaj, canlı ses, üyeler, ayarlar ve kalıcı veri desteği.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "check": "node --check server.js"
+    "dev": "node --watch server.js"
   },
-  "keywords": ["chat", "websocket", "socket.io", "voice", "pwa", "gaycord"],
+  "keywords": [
+    "chat",
+    "websocket",
+    "socket.io",
+    "voice",
+    "pwa",
+    "gaycord"
+  ],
   "license": "MIT",
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "pg": "^8.12.0"
   },
   "engines": {
     "node": ">=20"

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -63,6 +64,36 @@ public sealed class ApiClient
 
     public Task<MessageResponse> SendVoiceAsync(string channelId, string audioData, int durationMs) =>
         SendAsync<MessageResponse>(HttpMethod.Post, $"/api/channels/{Uri.EscapeDataString(channelId)}/messages", new { type = "voice", audioData, mimeType = "audio/wav", fileName = "voice.wav", durationMs });
+
+    public Task<MessageResponse> SendFileAsync(string channelId, string filePath, string text = "")
+    {
+        var bytes = File.ReadAllBytes(filePath);
+        if (bytes.Length > 15 * 1024 * 1024) throw new InvalidOperationException("Dosya 15 MB sınırını aşıyor.");
+        var fileName = Path.GetFileName(filePath);
+        var mimeType = GuessMimeType(fileName);
+        var fileData = $"data:{mimeType};base64,{Convert.ToBase64String(bytes)}";
+        return SendAsync<MessageResponse>(HttpMethod.Post, $"/api/channels/{Uri.EscapeDataString(channelId)}/messages", new { type = "file", fileData, mimeType, fileName, text });
+    }
+
+    private static string GuessMimeType(string fileName)
+    {
+        var ext = Path.GetExtension(fileName).ToLowerInvariant();
+        return ext switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".mp4" => "video/mp4",
+            ".webm" => "video/webm",
+            ".wav" => "audio/wav",
+            ".mp3" => "audio/mpeg",
+            ".pdf" => "application/pdf",
+            ".txt" => "text/plain",
+            ".zip" => "application/zip",
+            _ => "application/octet-stream"
+        };
+    }
 
     public Task RequestFriendAsync(string username) =>
         SendAsync<object>(HttpMethod.Post, "/api/friends/request", new { username });

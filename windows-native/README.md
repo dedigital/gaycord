@@ -1,10 +1,8 @@
 # Gaycord Windows Native
 
-WPF tabanlı native Windows istemcisi.
+Bu klasör WPF tabanlı native Windows istemcisidir. V4 ile proje adı Gaycord olarak kalır. Web/PWA tarafı V4'te daha fazla özellik içerir: ayarlar, fotoğraf önizleme, web sesli arama ve üyeler paneli.
 
-GitHub Actions build sonucu `Gaycord.exe` üretir. `server.txt` içine sunucu URL'i yazılmalıdır.
-
-Örnek:
+Build için GitHub Actions kullanılır. Çıkan pakette `server.txt` içine Render linkini yaz:
 
 ```text
 https://gaycord.onrender.com

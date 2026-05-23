@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Input;
 
@@ -252,6 +253,26 @@ public partial class MainWindow : Window
             MessageBox.Clear();
             var result = await _api.SendTextAsync(_currentChannel.Id, text);
             if (!_rt.IsConnected && result.Message is not null) AddMessageIfCurrent(result.Message);
+        }
+        catch (Exception ex) { SetStatus(ex.Message); }
+    }
+
+
+    private async void FileButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_currentChannel is null) { SetStatus("Önce kanal veya DM seç."); return; }
+            var dialog = new OpenFileDialog
+            {
+                Title = "Gaycord dosya gönder",
+                Filter = "Desteklenen dosyalar|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.mp4;*.webm;*.wav;*.mp3;*.pdf;*.txt;*.zip|Tüm dosyalar|*.*"
+            };
+            if (dialog.ShowDialog() != true) return;
+            var result = await _api.SendFileAsync(_currentChannel.Id, dialog.FileName, MessageBox.Text.Trim());
+            MessageBox.Clear();
+            if (!_rt.IsConnected && result.Message is not null) AddMessageIfCurrent(result.Message);
+            SetStatus("Dosya gönderildi.");
         }
         catch (Exception ex) { SetStatus(ex.Message); }
     }

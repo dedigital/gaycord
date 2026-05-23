@@ -151,12 +151,14 @@
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
-                        <Button x:Name="VoiceMessageButton" Grid.Column="0" Content="🎙 Ses" Click="VoiceMessageButton_Click" MinWidth="88"/>
-                        <TextBox x:Name="MessageBox" Grid.Column="1" VerticalContentAlignment="Center" Margin="10,0" KeyDown="MessageBox_KeyDown" TextWrapping="Wrap" AcceptsReturn="True"/>
-                        <Button Grid.Column="2" Content="Gönder" Click="SendButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold" MinWidth="112"/>
+                        <Button x:Name="FileButton" Grid.Column="0" Content="＋ Dosya" Click="FileButton_Click" MinWidth="88"/>
+                        <Button x:Name="VoiceMessageButton" Grid.Column="1" Content="🎙 Ses" Click="VoiceMessageButton_Click" MinWidth="88"/>
+                        <TextBox x:Name="MessageBox" Grid.Column="2" VerticalContentAlignment="Center" Margin="10,0" KeyDown="MessageBox_KeyDown" TextWrapping="Wrap" AcceptsReturn="True"/>
+                        <Button Grid.Column="3" Content="Gönder" Click="SendButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold" MinWidth="112"/>
                     </Grid>
                 </Border>
             </Grid>

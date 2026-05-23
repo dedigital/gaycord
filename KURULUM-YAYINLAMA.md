@@ -1,47 +1,21 @@
-# Gaycord V3 kurulum / yayınlama
+# Gaycord V4.1 kurulum/yayınlama
 
-## 1. Dosyaları repoya kopyala
+## Mevcut GitHub repona güncelleme
 
-Bu paketin içindeki her şeyi mevcut `gaycord` GitHub repo klasörüne kopyala. Aynı dosyalar sorulursa **Değiştir / Replace** de.
-
-Repo kökünde şöyle görünmeli:
-
-```text
-.github
-packaging
-server
-windows-native
-.gitignore
-render.yaml
-README.md
-KURULUM-YAYINLAMA.md
-```
-
-GitHub Desktop'ta:
+1. Bu zip'i çıkar.
+2. İçindeki dosyaları mevcut `gaycord` repo klasörünün içine kopyala ve değiştir.
+3. GitHub Desktop:
 
 ```text
-Summary: Gaycord V3 update
+Summary: Gaycord V4.1 update
 Commit to main
 Push origin
 ```
 
-## 2. Render yeniden deploy
-
-Render genelde push sonrası otomatik deploy eder. Etmezse:
+4. Render otomatik deploy etmezse:
 
 ```text
 Render > gaycord > Manual Deploy > Deploy latest commit
-```
-
-Ayarlar:
-
-```text
-Language: Node
-Branch: main
-Root Directory: server
-Build Command: npm install
-Start Command: npm start
-Health Check Path: /api/health
 ```
 
 Deploy bitince kontrol:
@@ -50,32 +24,39 @@ Deploy bitince kontrol:
 https://gaycord.onrender.com/api/health
 ```
 
-`gaycord-v3` cevabı gelmeli.
+Cevapta `version: 4.1.0` görmelisin.
 
-## 3. Windows native app
+## Veriler gitmesin diye
 
-GitHub'da:
+En sağlam seçenek PostgreSQL kullanmak:
 
 ```text
-Actions > Build Gaycord Windows App
+Render > Environment > Add Environment Variable
+DATABASE_URL = postgresql://...
 ```
 
-Yeşil build'in en altında artifact indir:
+Alternatif Render Disk:
+
+```text
+Disk mount path: /var/data
+Environment Variable:
+GAYCORD_DATA_DIR = /var/data/gaycord
+```
+
+Kalıcı disk/database yoksa Render Free üzerinde deploy veya restart sonrası hesaplar/mesajlar garanti değildir. V4.1'de ilk kayıt olan yönetici Ayarlar'dan yedek indirip yükleyebilir.
+
+## Windows app
+
+GitHub Actions'ta build bitince artifact:
 
 ```text
 Gaycord-Windows-Native
 ```
 
-Zip'i çıkar. İçindeki `server.txt` içine kendi Render linkini yaz:
+İndir, `server.txt` içine şu linki yaz:
 
 ```text
 https://gaycord.onrender.com
 ```
 
-Klasörü tekrar zipleyip arkadaşlarına atabilirsin.
-
-## Notlar
-
-- Free Render instance kullanılmayınca uyuyabilir; ilk giriş 30-60 saniye sürebilir.
-- Daha hızlı ve sürekli açık olması için sonra Starter plana geçebilirsin.
-- Windows uyarısı normaldir; exe kod imzalı değilse Windows "bilinmeyen yayıncı" diyebilir.
+Sonra klasörü zipleyip arkadaşlarına gönderebilirsin.

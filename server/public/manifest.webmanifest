@@ -1,15 +1,15 @@
 {
   "name": "Gaycord",
   "short_name": "Gaycord",
-  "description": "Arkadaşlarla sunucu, kanal, DM, dosya ve sesli mesaj uygulaması.",
+  "description": "Arkadaşlarınla mesajlaş, DM aç, fotoğraf/dosya gönder, sesli mesaj bırak ve sesli aramaya katıl.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#080912",
-  "theme_color": "#0f1025",
+  "background_color": "#080a12",
+  "theme_color": "#111827",
+  "orientation": "any",
   "icons": [
-    { "src": "/brand/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "/brand/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "/brand/icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "maskable" }
+    { "src": "/brand/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/brand/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
   ]
 }

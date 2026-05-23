@@ -5,86 +5,230 @@ const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+let PgPool = null;
+try { ({ Pool: PgPool } = require('pg')); } catch { PgPool = null; }
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_TEXT_LENGTH = Number(process.env.MAX_TEXT_LENGTH || 2000);
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 15 * 1024 * 1024);
+const MAX_BACKUP_BYTES = Number(process.env.MAX_BACKUP_BYTES || 60 * 1024 * 1024);
 const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 140000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
+const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
+const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4');
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
+const LEGACY_DATA_DIR = path.join(ROOT, 'data');
+const DEFAULT_DATA_DIR = process.env.RENDER === 'true' && fs.existsSync('/var/data') ? '/var/data/gaycord' : LEGACY_DATA_DIR;
+const DATA_DIR = path.resolve(process.env.GAYCORD_DATA_DIR || process.env.DATA_DIR || DEFAULT_DATA_DIR);
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
+const LEGACY_DB_FILE = path.join(LEGACY_DATA_DIR, 'db.json');
+const LEGACY_UPLOAD_DIR = path.join(LEGACY_DATA_DIR, 'uploads');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// Kalıcı diske geçtiğinde V3/V4 eski data klasörü varsa otomatik taşır.
+if (DB_FILE !== LEGACY_DB_FILE && !fs.existsSync(DB_FILE) && fs.existsSync(LEGACY_DB_FILE)) {
+  try {
+    fs.copyFileSync(LEGACY_DB_FILE, DB_FILE);
+    if (fs.existsSync(LEGACY_UPLOAD_DIR)) {
+      for (const file of fs.readdirSync(LEGACY_UPLOAD_DIR)) {
+        const src = path.join(LEGACY_UPLOAD_DIR, file);
+        const dst = path.join(UPLOAD_DIR, file);
+        if (fs.statSync(src).isFile() && !fs.existsSync(dst)) fs.copyFileSync(src, dst);
+      }
+    }
+  } catch (error) {
+    console.warn('Eski veri otomatik taşınamadı:', error.message);
+  }
+}
+
+function now() { return new Date().toISOString(); }
+function id(prefix = '') { return `${prefix}${crypto.randomBytes(10).toString('hex')}`; }
+function inviteCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
+
 const emptyDb = () => ({
+  version: 4,
+  adminUserId: '',
   users: {},
   usernameIndex: {},
   sessions: {},
   friendships: {},
   servers: {},
   channels: {},
-  messages: {}
+  messages: {},
+  uploads: {},
+  uploadBlobs: {},
+  appSettings: { createdAt: now(), lastBackupHintAt: null }
 });
 
-let db = loadDb();
+let db = emptyDb();
+let pgPool = null;
+let storageMode = 'file';
 const onlineCounts = new Map();
 const nativeClients = new Set();
+const webVoiceClients = new Map();
 
-function loadDb() {
+function normalizeUsername(username) { return String(username || '').trim().toLowerCase(); }
+
+function normalizeDb(raw) {
+  const db = { ...emptyDb(), ...(raw || {}) };
+  db.version = 4;
+  db.users ||= {};
+  db.usernameIndex ||= {};
+  db.sessions ||= {};
+  db.friendships ||= {};
+  db.servers ||= {};
+  db.channels ||= {};
+  db.messages ||= {};
+  db.uploads ||= {};
+  db.uploadBlobs ||= {};
+  db.appSettings ||= { createdAt: now(), lastBackupHintAt: null };
+
+  db.usernameIndex = {};
+  for (const [userId, user] of Object.entries(db.users)) {
+    user.id ||= userId;
+    user.username = normalizeUsername(user.username || userId.slice(0, 10));
+    user.displayName ||= user.username;
+    user.status ||= '';
+    user.createdAt ||= now();
+    user.settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(user.settings || {}) };
+    db.usernameIndex[user.username] = user.id;
+  }
+
+  if (!db.adminUserId) {
+    const firstUser = Object.values(db.users).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))[0];
+    if (firstUser) db.adminUserId = firstUser.id;
+  }
+
+  for (const [serverId, server] of Object.entries(db.servers)) {
+    server.id ||= serverId;
+    server.name ||= 'Sunucu';
+    server.ownerId ||= server.memberIds?.[0] || db.adminUserId || '';
+    server.inviteCode ||= inviteCode();
+    server.memberIds ||= [];
+    server.channelIds ||= [];
+    server.createdAt ||= now();
+  }
+
+  for (const [channelId, channel] of Object.entries(db.channels)) {
+    channel.id ||= channelId;
+    channel.kind ||= 'text';
+    channel.type ||= channel.serverId ? 'server' : 'dm';
+    db.messages[channelId] ||= [];
+  }
+
+  return db;
+}
+
+async function loadDb() {
+  if (DATABASE_URL) {
+    if (!PgPool) throw new Error('DATABASE_URL ayarlı ama pg paketi kurulu değil.');
+    pgPool = new PgPool({
+      connectionString: DATABASE_URL,
+      ssl: /sslmode=require/i.test(DATABASE_URL) || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : undefined
+    });
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS gaycord_kv (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    const result = await pgPool.query('SELECT value FROM gaycord_kv WHERE key = $1', [DB_STATE_KEY]);
+    if (!result.rowCount) {
+      let initialSource = emptyDb();
+      // Veritabanına yeni geçerken aynı deploy içinde eski db.json bulunursa içeriği otomatik taşımayı dener.
+      const candidates = [
+        { dbFile: DB_FILE, uploadDir: UPLOAD_DIR },
+        { dbFile: LEGACY_DB_FILE, uploadDir: LEGACY_UPLOAD_DIR }
+      ];
+      for (const candidate of candidates) {
+        if (!fs.existsSync(candidate.dbFile)) continue;
+        try {
+          initialSource = JSON.parse(fs.readFileSync(candidate.dbFile, 'utf8'));
+          initialSource = hydrateUploadBlobsFromDir(initialSource, candidate.uploadDir);
+          break;
+        } catch (error) {
+          console.warn('Eski dosya verisi PostgreSQL içine taşınamadı:', error.message);
+        }
+      }
+      const initial = normalizeDb(initialSource);
+      await pgPool.query('INSERT INTO gaycord_kv(key, value) VALUES ($1, $2::jsonb)', [DB_STATE_KEY, JSON.stringify(initial)]);
+      storageMode = 'postgres';
+      return initial;
+    }
+    storageMode = 'postgres';
+    return normalizeDb(result.rows[0].value);
+  }
+
+  storageMode = 'file';
   if (!fs.existsSync(DB_FILE)) {
-    const initial = emptyDb();
+    const initial = normalizeDb(emptyDb());
     fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2));
     return initial;
   }
-
   try {
-    return { ...emptyDb(), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
+    const loaded = normalizeDb({ ...emptyDb(), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) });
+    hydrateUploadBlobsFromDir(loaded, UPLOAD_DIR);
+    return loaded;
   } catch (error) {
     console.error('Veritabani okunamadi:', error);
-    return emptyDb();
+    return normalizeDb(emptyDb());
   }
+}
+
+async function saveDbNowAsync() {
+  db.meta ||= { version: 4, createdAt: now(), ownerUserId: '' };
+  db.meta.version = 4;
+  db.meta.updatedAt = now();
+  if (pgPool) {
+    await pgPool.query(
+      `INSERT INTO gaycord_kv(key, value, updated_at)
+       VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [DB_STATE_KEY, JSON.stringify(db)]
+    );
+    return;
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
 let saveTimer = null;
 function saveDbSoon() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-  }, 80);
+    saveDbNowAsync().catch((error) => console.error('Veritabani kaydedilemedi:', error));
+  }, 120);
 }
-
 function saveDbNow() {
   clearTimeout(saveTimer);
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  if (pgPool) saveDbNowAsync().catch((error) => console.error('Veritabani kaydedilemedi:', error));
+  else {
+    db.meta ||= { version: 4, createdAt: now(), ownerUserId: '' };
+    db.meta.version = 4;
+    db.meta.updatedAt = now();
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  }
 }
-
-process.on('SIGINT', () => { saveDbNow(); process.exit(0); });
-process.on('SIGTERM', () => { saveDbNow(); process.exit(0); });
-
-function id(prefix = '') { return `${prefix}${crypto.randomBytes(10).toString('hex')}`; }
-function inviteCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
-function now() { return new Date().toISOString(); }
-
-function publicUser(user) {
-  if (!user) return null;
-  return { id: user.id, username: user.username, displayName: user.displayName || user.username, createdAt: user.createdAt };
+async function shutdown() {
+  try { await saveDbNowAsync(); } catch (error) { console.error('Kapanirken kayit hatasi:', error); }
+  try { await pgPool?.end(); } catch {}
+  process.exit(0);
 }
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, 32, 'sha256').toString('hex');
   return { salt, hash };
 }
-
 function verifyPassword(password, user) {
   const candidate = hashPassword(password, user.passwordSalt).hash;
   return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'));
 }
-
-function normalizeUsername(username) { return String(username || '').trim().toLowerCase(); }
 
 function parseCookies(cookieHeader = '') {
   return Object.fromEntries(cookieHeader.split(';').map((part) => part.trim()).filter(Boolean).map((part) => {
@@ -92,13 +236,11 @@ function parseCookies(cookieHeader = '') {
     return [decodeURIComponent(rawKey), decodeURIComponent(rawValue.join('='))];
   }));
 }
-
 function getTokenFromRequest(req) {
   const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
   if (bearer) return bearer[1].trim();
   return parseCookies(req.headers.cookie || '').sid || '';
 }
-
 function getUserByToken(token) {
   if (!token) return null;
   const session = db.sessions[token];
@@ -109,19 +251,41 @@ function getUserByToken(token) {
   saveDbSoon();
   return user;
 }
-
 function auth(req, res, next) {
   const user = getUserByToken(getTokenFromRequest(req));
-  if (!user) return res.status(401).json({ error: 'Giris gerekli.' });
+  if (!user) return res.status(401).json({ error: 'Giriş gerekli.' });
   req.user = user;
+  next();
+}
+function publicUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.displayName || user.username,
+    status: user.status || '',
+    online: onlineCounts.has(user.id),
+    createdAt: user.createdAt
+  };
+}
+
+function meUser(user) {
+  return { ...publicUser(user), settings: user?.settings || { theme: 'dark', compactMode: false, reduceMotion: false } };
+}
+
+function isAdminUser(user) {
+  return Boolean(user && db.adminUserId && user.id === db.adminUserId);
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminUser(req.user)) return res.status(403).json({ error: 'Bu işlem için Gaycord yöneticisi olmalısın.' });
   next();
 }
 
 function friendshipKey(a, b) { return [a, b].sort().join(':'); }
 function getFriendship(a, b) { return db.friendships[friendshipKey(a, b)] || null; }
-function areFriends(a, b) { const friendship = getFriendship(a, b); return Boolean(friendship && friendship.status === 'accepted'); }
+function areFriends(a, b) { const f = getFriendship(a, b); return Boolean(f && f.status === 'accepted'); }
 function dmChannelId(a, b) { return `dm_${[a, b].sort().join('_')}`; }
-
 function createOrGetDm(a, b) {
   if (!areFriends(a, b)) return null;
   const channelId = dmChannelId(a, b);
@@ -132,52 +296,64 @@ function createOrGetDm(a, b) {
   }
   return db.channels[channelId];
 }
-
 function canAccessChannel(userId, channelId) {
   const channel = db.channels[channelId];
   if (!channel) return false;
-  if (channel.type === 'dm') return channel.memberIds.includes(userId);
+  if (channel.type === 'dm') return channel.memberIds?.includes(userId);
   const server = db.servers[channel.serverId];
-  return Boolean(server && server.memberIds.includes(userId));
+  return Boolean(server && server.memberIds?.includes(userId));
+}
+function channelIsVoice(channelId) { const channel = db.channels[channelId]; return Boolean(channel && (channel.kind === 'voice' || channel.type === 'dm')); }
+function canUseLiveVoice(userId, channelId) {
+  const channel = db.channels[channelId];
+  if (!channel || !canAccessChannel(userId, channelId)) return false;
+  return channel.kind === 'voice' || channel.type === 'dm';
 }
 
-function ensureServerView(server) {
+function ensureServerView(server, viewerId = '') {
+  const members = (server.memberIds || []).map((memberId) => db.users[memberId]).filter(Boolean).map((user) => ({
+    ...publicUser(user),
+    owner: user.id === server.ownerId,
+    isOwner: user.id === server.ownerId
+  })).sort((a, b) => Number(b.online) - Number(a.online) || Number(b.owner) - Number(a.owner) || a.displayName.localeCompare(b.displayName, 'tr'));
   return {
     id: server.id,
     name: server.name,
     ownerId: server.ownerId,
     inviteCode: server.inviteCode,
-    memberIds: server.memberIds,
-    channels: server.channelIds.map((channelId) => db.channels[channelId]).filter(Boolean),
+    memberIds: server.memberIds || [],
+    memberCount: (server.memberIds || []).length,
+    members,
+    isOwner: Boolean(viewerId && server.ownerId === viewerId),
+    channels: (server.channelIds || []).map((channelId) => db.channels[channelId]).filter(Boolean),
     createdAt: server.createdAt
   };
 }
-
 function friendSummaryFor(userId) {
   const friends = [];
   const incomingRequests = [];
   const outgoingRequests = [];
-
   for (const friendship of Object.values(db.friendships)) {
-    if (!friendship.memberIds.includes(userId)) continue;
-    const otherId = friendship.memberIds.find((memberId) => memberId !== userId);
+    if (!friendship.memberIds?.includes(userId)) continue;
+    const otherId = friendship.memberIds.find((id) => id !== userId);
     const other = publicUser(db.users[otherId]);
     if (!other) continue;
-    if (friendship.status === 'accepted') friends.push({ ...other, online: onlineCounts.has(otherId), friendshipId: friendship.id });
+    if (friendship.status === 'accepted') friends.push({ ...other, friendshipId: friendship.id });
     else if (friendship.toId === userId) incomingRequests.push({ id: friendship.id, from: other, createdAt: friendship.createdAt });
     else outgoingRequests.push({ id: friendship.id, to: other, createdAt: friendship.createdAt });
   }
-
-  friends.sort((a, b) => a.displayName.localeCompare(b.displayName, 'tr'));
+  friends.sort((a, b) => Number(b.online) - Number(a.online) || a.displayName.localeCompare(b.displayName, 'tr'));
   return { friends, incomingRequests, outgoingRequests };
 }
-
 function serversFor(userId) {
-  return Object.values(db.servers).filter((server) => server.memberIds.includes(userId)).map(ensureServerView).sort((a, b) => a.name.localeCompare(b.name, 'tr'));
+  return Object.values(db.servers).filter((server) => server.memberIds?.includes(userId)).map((server) => ensureServerView(server, userId)).sort((a, b) => a.name.localeCompare(b.name, 'tr'));
 }
 
-function uploadUrl(fileName) { return `${PUBLIC_URL}/uploads/${fileName}`.replace(/^\/\//, '/'); }
-
+function uploadUrl(fileName) {
+  const encoded = encodeURIComponent(fileName);
+  if (PUBLIC_URL) return `${PUBLIC_URL}/uploads/${encoded}`;
+  return `/uploads/${encoded}`;
+}
 function sanitizeMessage(message) {
   const user = db.users[message.userId];
   return {
@@ -195,27 +371,25 @@ function sanitizeMessage(message) {
     createdAt: message.createdAt
   };
 }
-
 function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null }) {
   const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, createdAt: now() };
   db.messages[channelId] ||= [];
   db.messages[channelId].push(message);
-  if (db.messages[channelId].length > 700) db.messages[channelId] = db.messages[channelId].slice(-700);
+  if (db.messages[channelId].length > 1000) db.messages[channelId] = db.messages[channelId].slice(-1000);
   saveDbSoon();
   return sanitizeMessage(message);
 }
 
 function decodeBase64Upload(dataUrlOrBase64, fallbackMimeType) {
   const raw = String(dataUrlOrBase64 || '');
-  const match = raw.match(/^data:([^;]+);base64,(.+)$/);
-  const mimeType = String(match ? match[1] : fallbackMimeType || 'application/octet-stream').toLowerCase();
+  const match = raw.match(/^data:([^;]+(?:;[^,]+)?);base64,(.+)$/);
+  const mimeType = String(match ? match[1].split(';')[0] : fallbackMimeType || 'application/octet-stream').toLowerCase();
   const base64 = match ? match[2] : raw;
   const buffer = Buffer.from(base64, 'base64');
-  if (!buffer.length) throw new Error('Dosya bos gorunuyor.');
-  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error(`Dosya ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB sinirini asiyor.`);
+  if (!buffer.length) throw new Error('Dosya boş görünüyor.');
+  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error(`Dosya ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB sınırını aşıyor.`);
   return { buffer, mimeType };
 }
-
 function extensionFor(mimeType, originalName = '') {
   const safeOriginal = path.basename(String(originalName || '')).toLowerCase();
   const ext = path.extname(safeOriginal).replace(/[^a-z0-9.]/g, '').slice(0, 12);
@@ -228,38 +402,158 @@ function extensionFor(mimeType, originalName = '') {
   if (mimeType.includes('png')) return 'png';
   if (mimeType.includes('jpeg')) return 'jpg';
   if (mimeType.includes('gif')) return 'gif';
+  if (mimeType.includes('webp')) return 'webp';
   if (mimeType.includes('pdf')) return 'pdf';
   return 'bin';
 }
-
+function mimeForFileName(fileName) {
+  const ext = path.extname(String(fileName || '')).toLowerCase();
+  const map = {
+    '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav',
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8', '.zip': 'application/zip'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+function hydrateUploadBlobsFromDir(state, uploadDir) {
+  if (!state || !uploadDir || !fs.existsSync(uploadDir)) return state;
+  state.uploadBlobs ||= {};
+  state.uploads ||= {};
+  for (const fileName of fs.readdirSync(uploadDir)) {
+    const safeName = path.basename(fileName);
+    if (!/^[a-zA-Z0-9_.-]+$/.test(safeName)) continue;
+    const fullPath = path.join(uploadDir, safeName);
+    if (!fs.statSync(fullPath).isFile() || state.uploadBlobs[safeName]?.base64) continue;
+    const buffer = fs.readFileSync(fullPath);
+    if (!buffer.length || buffer.length > MAX_UPLOAD_BYTES) continue;
+    const mimeType = state.uploads[safeName]?.mimeType || mimeForFileName(safeName);
+    state.uploadBlobs[safeName] = { mimeType, base64: buffer.toString('base64'), sizeBytes: buffer.length, createdAt: now() };
+    state.uploads[safeName] ||= { storedName: safeName, mimeType, sizeBytes: buffer.length, originalName: safeName, createdAt: now() };
+  }
+  return state;
+}
 function persistUpload({ data, mimeType, fileName = '', prefix = 'file_' }) {
   const decoded = decodeBase64Upload(data, mimeType);
   const extension = extensionFor(decoded.mimeType, fileName);
   const storedName = `${id(prefix)}.${extension}`;
   fs.writeFileSync(path.join(UPLOAD_DIR, storedName), decoded.buffer);
+  db.uploads[storedName] = { storedName, mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: path.basename(String(fileName || storedName)), createdAt: now() };
+  // Upload'u DB içinde de tutuyoruz; Postgres kullanınca ses/fotoğraf deploy sonrası kaybolmaz.
+  db.uploadBlobs ||= {};
+  db.uploadBlobs[storedName] = { mimeType: decoded.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
+  saveDbSoon();
   return { storedName, url: uploadUrl(storedName), mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: fileName || storedName };
+}
+function sendUpload(req, res) {
+  const fileName = path.basename(String(req.params.fileName || ''));
+  if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) return res.status(404).end();
+  const filePath = path.join(UPLOAD_DIR, fileName);
+  const meta = db.uploads?.[fileName] || {};
+  const blob = db.uploadBlobs?.[fileName];
+  if (!fs.existsSync(filePath) && blob?.base64) {
+    try { fs.writeFileSync(filePath, Buffer.from(blob.base64, 'base64')); } catch {}
+  }
+  if (!fs.existsSync(filePath) && !blob?.base64) return res.status(404).json({ error: 'Dosya bulunamadı.' });
+  const contentType = meta.mimeType || blob?.mimeType || mimeForFileName(fileName);
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+  res.setHeader('Accept-Ranges', 'bytes');
+
+  if (!fs.existsSync(filePath) && blob?.base64) {
+    const buffer = Buffer.from(blob.base64, 'base64');
+    res.setHeader('Content-Length', buffer.length);
+    return res.end(buffer);
+  }
+
+  const stat = fs.statSync(filePath);
+  const range = req.headers.range;
+  if (range) {
+    const match = String(range).match(/bytes=(\d*)-(\d*)/);
+    if (match) {
+      const start = match[1] ? Number(match[1]) : 0;
+      const end = match[2] ? Math.min(Number(match[2]), stat.size - 1) : stat.size - 1;
+      if (Number.isFinite(start) && Number.isFinite(end) && start <= end) {
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Content-Length', end - start + 1);
+        return fs.createReadStream(filePath, { start, end }).pipe(res);
+      }
+    }
+  }
+  res.setHeader('Content-Length', stat.size);
+  fs.createReadStream(filePath).pipe(res);
+}
+function exportUploads() {
+  const uploads = {};
+  let total = 0;
+  const names = new Set([...Object.keys(db.uploadBlobs || {}), ...(fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR) : [])]);
+  for (const fileName of names) {
+    const safeName = path.basename(fileName);
+    const fullPath = path.join(UPLOAD_DIR, safeName);
+    let buffer = null;
+    let mimeType = db.uploads?.[safeName]?.mimeType || db.uploadBlobs?.[safeName]?.mimeType || mimeForFileName(safeName);
+    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) buffer = fs.readFileSync(fullPath);
+    else if (db.uploadBlobs?.[safeName]?.base64) buffer = Buffer.from(db.uploadBlobs[safeName].base64, 'base64');
+    if (!buffer || total + buffer.length > MAX_BACKUP_BYTES) continue;
+    uploads[safeName] = `data:${mimeType};base64,${buffer.toString('base64')}`;
+    total += buffer.length;
+  }
+  return uploads;
+}
+function importUploads(uploads = {}) {
+  if (!uploads || typeof uploads !== 'object') return 0;
+  let count = 0;
+  for (const [fileName, data] of Object.entries(uploads)) {
+    const safeName = path.basename(String(fileName || '')).replace(/[^a-zA-Z0-9_.-]/g, '_');
+    if (!safeName) continue;
+    const decoded = decodeBase64Upload(String(data || ''), mimeForFileName(safeName));
+    if (decoded.buffer.length > MAX_UPLOAD_BYTES) continue;
+    fs.writeFileSync(path.join(UPLOAD_DIR, safeName), decoded.buffer);
+    db.uploads[safeName] = { storedName: safeName, mimeType: decoded.mimeType, sizeBytes: decoded.buffer.length, originalName: safeName, createdAt: now() };
+    db.uploadBlobs ||= {};
+    db.uploadBlobs[safeName] = { mimeType: decoded.mimeType, base64: decoded.buffer.toString('base64'), sizeBytes: decoded.buffer.length, createdAt: now() };
+    count += 1;
+  }
+  return count;
 }
 
 function sendNative(ws, type, payload = {}) {
   if (ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({ type, ...payload }));
 }
-
 function broadcastNative(type, payload = {}, predicate = () => true) {
-  for (const ws of nativeClients) {
-    if (ws.readyState === ws.OPEN && predicate(ws)) sendNative(ws, type, payload);
-  }
+  for (const ws of nativeClients) if (ws.readyState === ws.OPEN && predicate(ws)) sendNative(ws, type, payload);
 }
-
 function broadcastMessage(channelId, message) {
   io.to(channelId).emit('message:new', message);
   broadcastNative('message:new', { message }, (ws) => ws.joinedChannels?.has(channelId));
 }
-
 function emitPresence() {
   const onlineIds = [...onlineCounts.keys()];
   io.emit('presence:update', { onlineIds });
   broadcastNative('presence:update', { onlineIds });
+}
+function voiceMembers(channelId) {
+  const members = new Map();
+  for (const item of webVoiceClients.values()) if (item.channelId === channelId) members.set(item.user.id, publicUser(db.users[item.user.id] || item.user));
+  for (const ws of nativeClients) if (ws.voiceChannelId === channelId && ws.user) members.set(ws.user.id, publicUser(ws.user));
+  return [...members.values()].filter(Boolean);
+}
+function emitVoiceMembers(channelId) {
+  if (!channelId) return;
+  const payload = { channelId, members: voiceMembers(channelId) };
+  io.to(`voice:${channelId}`).emit('voice:members', payload);
+  broadcastNative('voice:members', payload, (client) => client.voiceChannelId === channelId);
+}
+function leaveWebVoice(socket) {
+  const channelId = socket.voiceChannelId;
+  if (!channelId) return;
+  socket.leave(`voice:${channelId}`);
+  webVoiceClients.delete(socket.id);
+  socket.voiceChannelId = null;
+  socket.to(`voice:${channelId}`).emit('voice:user_left', { channelId, socketId: socket.id, user: publicUser(socket.user) });
+  broadcastNative('voice:user_left', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+  emitVoiceMembers(channelId);
 }
 
 function createSession(userId) {
@@ -268,51 +562,60 @@ function createSession(userId) {
   saveDbSoon();
   return sessionToken;
 }
-
 function setSessionCookie(res, token) {
   res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: Boolean(PUBLIC_URL.startsWith('https://')), maxAge: 1000 * 60 * 60 * 24 * 30 });
 }
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: MAX_UPLOAD_BYTES + 1024 * 1024, cors: { origin: false } });
+const io = new Server(server, { maxHttpBufferSize: Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP_BYTES) + 1024 * 1024, cors: { origin: false } });
 const wss = new WebSocketServer({ noServer: true });
 
-app.use(express.json({ limit: `${Math.ceil(MAX_UPLOAD_BYTES / 1024 / 1024) + 2}mb` }));
-app.use('/uploads', express.static(UPLOAD_DIR, { setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800, immutable') }));
+app.use(express.json({ limit: `${Math.ceil(Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP_BYTES) / 1024 / 1024) + 2}mb` }));
+app.get('/uploads/:fileName', sendUpload);
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'gaycord-v3', time: now() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'gaycord-v4', version: '4.2.0', storageMode, persistentData: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, time: now() }));
+
+app.get('/api/storage-info', auth, (_req, res) => {
+  const uploadCount = Object.keys(db.uploads || {}).length || (fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR).filter((name) => !name.startsWith('.')).length : 0);
+  res.json({
+    ok: true,
+    app: 'gaycord-v4',
+    storageMode,
+    dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR,
+    persistentDataDirConfigured: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR,
+    uploadCount,
+    dbFile: storageMode === 'postgres' ? DB_STATE_KEY : DB_FILE
+  });
+});
 
 app.post('/api/register', (req, res) => {
   const username = normalizeUsername(req.body.username);
   const displayName = String(req.body.displayName || username).trim().slice(0, 32);
   const password = String(req.body.password || '');
-  if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Kullanici adi 3-20 karakter olmali; harf, rakam ve _ kullan.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Sifre en az 6 karakter olmali.' });
-  if (db.usernameIndex[username]) return res.status(409).json({ error: 'Bu kullanici adi alinmis.' });
+  if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Kullanıcı adı 3-20 karakter olmalı; harf, rakam ve _ kullan.' });
+  if (password.length < 6) return res.status(400).json({ error: 'Şifre en az 6 karakter olmalı.' });
+  if (db.usernameIndex[username]) return res.status(409).json({ error: 'Bu kullanıcı adı alınmış.' });
 
   const userId = id('usr_');
   const { salt, hash } = hashPassword(password);
-  const user = { id: userId, username, displayName, passwordSalt: salt, passwordHash: hash, createdAt: now() };
+  const user = { id: userId, username, displayName, passwordSalt: salt, passwordHash: hash, status: '', settings: { theme: 'dark', compactMode: false, reduceMotion: false }, createdAt: now() };
   db.users[userId] = user;
   db.usernameIndex[username] = userId;
-  const sessionToken = createSession(userId);
-  setSessionCookie(res, sessionToken);
-  res.status(201).json({ user: publicUser(user), token: sessionToken });
+  if (!db.adminUserId) db.adminUserId = userId;
+  const token = createSession(userId);
+  setSessionCookie(res, token);
+  res.status(201).json({ user: meUser(user), token });
 });
-
 app.post('/api/login', (req, res) => {
   const username = normalizeUsername(req.body.username);
-  const password = String(req.body.password || '');
-  const userId = db.usernameIndex[username];
-  const user = db.users[userId];
-  if (!user || !verifyPassword(password, user)) return res.status(401).json({ error: 'Kullanici adi veya sifre hatali.' });
-  const sessionToken = createSession(user.id);
-  setSessionCookie(res, sessionToken);
-  res.json({ user: publicUser(user), token: sessionToken });
+  const user = db.users[db.usernameIndex[username]];
+  if (!user || !verifyPassword(String(req.body.password || ''), user)) return res.status(401).json({ error: 'Kullanıcı adı veya şifre hatalı.' });
+  const token = createSession(user.id);
+  setSessionCookie(res, token);
+  res.json({ user: meUser(user), token });
 });
-
 app.post('/api/logout', auth, (req, res) => {
   const token = getTokenFromRequest(req);
   if (token) delete db.sessions[token];
@@ -320,218 +623,270 @@ app.post('/api/logout', auth, (req, res) => {
   res.clearCookie('sid');
   res.json({ ok: true });
 });
-
 app.get('/api/me', auth, (req, res) => {
-  res.json({ user: publicUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()] });
+  const dataStatus = { storageMode, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, persistentData: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR, persistentDataDir: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR };
+  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) }, isAppOwner: isAdminUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()], dataStatus, appInfo: { version: '4.2.0', storageMode, dataStatus } });
+});
+app.patch('/api/me', auth, (req, res) => {
+  const displayName = String(req.body.displayName || req.user.displayName || req.user.username).trim().slice(0, 32);
+  if (displayName.length < 2) return res.status(400).json({ error: 'Görünen ad en az 2 karakter olmalı.' });
+  req.user.displayName = displayName;
+  req.user.status = String(req.body.status || req.user.status || '').trim().slice(0, 80);
+  const settings = req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
+  req.user.settings = {
+    ...(req.user.settings || {}),
+    theme: ['dark', 'midnight', 'rainbow'].includes(settings.theme) ? settings.theme : (req.user.settings?.theme || 'dark'),
+    compactMode: Boolean(settings.compactMode),
+    reduceMotion: Boolean(settings.reduceMotion)
+  };
+  saveDbSoon();
+  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
+});
+
+app.get('/api/admin/export', auth, requireAdmin, (_req, res) => {
+  saveDbNow();
+  res.json({ app: 'gaycord', version: '4.2.0', exportedAt: now(), db, uploads: exportUploads() });
+});
+app.post('/api/admin/import', auth, requireAdmin, (req, res) => {
+  const incoming = req.body?.db;
+  if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
+  db = normalizeDb({ ...emptyDb(), ...incoming });
+  if (!db.adminUserId || !db.users[db.adminUserId]) db.adminUserId = req.user.id;
+  const uploadCount = importUploads(req.body.uploads || {});
+  saveDbNow();
+  io.emit('data:imported', { ok: true });
+  broadcastNative('data:imported', { ok: true });
+  res.json({ ok: true, uploads: uploadCount });
 });
 
 app.get('/api/search-users', auth, (req, res) => {
   const q = normalizeUsername(req.query.q).slice(0, 32);
   if (q.length < 2) return res.json({ users: [] });
-  const users = Object.values(db.users).filter((user) => user.id !== req.user.id).filter((user) => user.username.includes(q) || (user.displayName || '').toLowerCase().includes(q)).slice(0, 10).map((user) => ({ ...publicUser(user), friendship: getFriendship(req.user.id, user.id)?.status || null }));
+  const users = Object.values(db.users).filter((user) => user.id !== req.user.id)
+    .filter((user) => user.username.includes(q) || (user.displayName || '').toLowerCase().includes(q))
+    .slice(0, 10).map((user) => ({ ...publicUser(user), friendship: getFriendship(req.user.id, user.id)?.status || null }));
   res.json({ users });
 });
-
 app.post('/api/friends/request', auth, (req, res) => {
   const username = normalizeUsername(req.body.username);
-  const otherId = db.usernameIndex[username];
-  const other = db.users[otherId];
-  if (!other || other.id === req.user.id) return res.status(404).json({ error: 'Kullanici bulunamadi.' });
+  const other = db.users[db.usernameIndex[username]];
+  if (!other || other.id === req.user.id) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
   const key = friendshipKey(req.user.id, other.id);
   const existing = db.friendships[key];
-  if (existing) {
-    if (existing.status === 'accepted') return res.status(409).json({ error: 'Zaten arkadassiniz.' });
-    return res.status(409).json({ error: 'Arkadaslik istegi zaten var.' });
-  }
+  if (existing) return res.status(409).json({ error: existing.status === 'accepted' ? 'Zaten arkadaşsınız.' : 'Arkadaşlık isteği zaten var.' });
   const friendship = { id: id('fr_'), memberIds: [req.user.id, other.id], fromId: req.user.id, toId: other.id, status: 'pending', createdAt: now() };
   db.friendships[key] = friendship;
   saveDbSoon();
   res.status(201).json({ friendship });
 });
-
 app.post('/api/friends/respond', auth, (req, res) => {
-  const requestId = String(req.body.requestId || '');
-  const accept = Boolean(req.body.accept);
-  const friendship = Object.values(db.friendships).find((item) => item.id === requestId);
-  if (!friendship || friendship.toId !== req.user.id || friendship.status !== 'pending') return res.status(404).json({ error: 'Istek bulunamadi.' });
-  if (accept) { friendship.status = 'accepted'; friendship.acceptedAt = now(); createOrGetDm(friendship.memberIds[0], friendship.memberIds[1]); }
-  else { delete db.friendships[friendshipKey(friendship.memberIds[0], friendship.memberIds[1])]; }
+  const friendship = Object.values(db.friendships).find((f) => f.id === String(req.body.requestId || ''));
+  if (!friendship || friendship.toId !== req.user.id || friendship.status !== 'pending') return res.status(404).json({ error: 'İstek bulunamadı.' });
+  if (req.body.accept) { friendship.status = 'accepted'; friendship.acceptedAt = now(); createOrGetDm(friendship.memberIds[0], friendship.memberIds[1]); }
+  else delete db.friendships[friendshipKey(friendship.memberIds[0], friendship.memberIds[1])];
   saveDbSoon();
   res.json({ ok: true });
 });
-
 app.get('/api/dms/:friendId', auth, (req, res) => {
   const channel = createOrGetDm(req.user.id, req.params.friendId);
-  if (!channel) return res.status(403).json({ error: 'DM icin once arkadas olmalisiniz.' });
+  if (!channel) return res.status(403).json({ error: 'DM için önce arkadaş olmalısınız.' });
   res.json({ channel });
 });
 
 app.post('/api/servers', auth, (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 40);
-  if (name.length < 2) return res.status(400).json({ error: 'Sunucu adi en az 2 karakter olmali.' });
+  if (name.length < 2) return res.status(400).json({ error: 'Sunucu adı en az 2 karakter olmalı.' });
   const serverId = id('srv_');
-  const channelId = id('chn_');
-  const voiceChannelId = id('chn_');
-  const serverObj = { id: serverId, name, ownerId: req.user.id, inviteCode: inviteCode(), memberIds: [req.user.id], channelIds: [channelId, voiceChannelId], createdAt: now() };
+  const textId = id('chn_');
+  const voiceId = id('chn_');
+  const serverObj = { id: serverId, name, ownerId: req.user.id, inviteCode: inviteCode(), memberIds: [req.user.id], channelIds: [textId, voiceId], createdAt: now() };
   db.servers[serverId] = serverObj;
-  db.channels[channelId] = { id: channelId, type: 'server', kind: 'text', serverId, name: 'genel', createdAt: now() };
-  db.channels[voiceChannelId] = { id: voiceChannelId, type: 'server', kind: 'voice', serverId, name: 'ses-odasi', createdAt: now() };
-  db.messages[channelId] = [];
-  db.messages[voiceChannelId] = [];
+  db.channels[textId] = { id: textId, type: 'server', kind: 'text', serverId, name: 'genel', createdAt: now() };
+  db.channels[voiceId] = { id: voiceId, type: 'server', kind: 'voice', serverId, name: 'ses-odasi', createdAt: now() };
+  db.messages[textId] = [];
+  db.messages[voiceId] = [];
   saveDbSoon();
-  res.status(201).json({ server: ensureServerView(serverObj) });
+  res.status(201).json({ server: ensureServerView(serverObj, req.user.id) });
 });
-
 app.post('/api/servers/join', auth, (req, res) => {
   const code = String(req.body.inviteCode || '').trim().toUpperCase();
   const serverObj = Object.values(db.servers).find((server) => server.inviteCode === code);
-  if (!serverObj) return res.status(404).json({ error: 'Davet kodu bulunamadi.' });
+  if (!serverObj) return res.status(404).json({ error: 'Davet kodu bulunamadı.' });
   if (!serverObj.memberIds.includes(req.user.id)) serverObj.memberIds.push(req.user.id);
   saveDbSoon();
-  res.json({ server: ensureServerView(serverObj) });
+  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  broadcastNative('server:updated', { server: ensureServerView(serverObj) });
+  res.json({ server: ensureServerView(serverObj, req.user.id) });
 });
-
+app.patch('/api/servers/:serverId', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi düzenleyebilir.' });
+  if (typeof req.body.name === 'string') {
+    const name = String(req.body.name || '').trim().slice(0, 40);
+    if (name.length < 2) return res.status(400).json({ error: 'Sunucu adı en az 2 karakter olmalı.' });
+    serverObj.name = name;
+  }
+  if (req.body.regenerateInvite) serverObj.inviteCode = inviteCode();
+  serverObj.updatedAt = now();
+  saveDbSoon();
+  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  res.json({ server: ensureServerView(serverObj, req.user.id) });
+});
+app.delete('/api/servers/:serverId', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi silebilir.' });
+  const channelIds = [...serverObj.channelIds];
+  for (const channelId of channelIds) { delete db.messages[channelId]; delete db.channels[channelId]; }
+  delete db.servers[serverObj.id];
+  saveDbSoon();
+  io.emit('server:deleted', { serverId: serverObj.id, channelIds });
+  broadcastNative('server:deleted', { serverId: serverObj.id, channelIds });
+  res.json({ ok: true });
+});
+app.post('/api/servers/:serverId/leave', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
+  if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahibi olduğun sunucudan çıkamazsın; silebilirsin.' });
+  serverObj.memberIds = serverObj.memberIds.filter((id) => id !== req.user.id);
+  saveDbSoon();
+  io.emit('server:updated', { server: ensureServerView(serverObj) });
+  broadcastNative('server:updated', { server: ensureServerView(serverObj) });
+  res.json({ ok: true });
+});
 app.post('/api/servers/:serverId/channels', auth, (req, res) => {
   const serverObj = db.servers[req.params.serverId];
-  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal acabilir.' });
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
+  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal açabilir.' });
   const kind = req.body.kind === 'voice' ? 'voice' : 'text';
   const name = String(req.body.name || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, '').slice(0, 24);
-  if (name.length < 2) return res.status(400).json({ error: 'Kanal adi en az 2 karakter olmali.' });
+  if (name.length < 2) return res.status(400).json({ error: 'Kanal adı en az 2 karakter olmalı.' });
   const channelId = id('chn_');
   db.channels[channelId] = { id: channelId, type: 'server', kind, serverId: serverObj.id, name, createdAt: now() };
   db.messages[channelId] = [];
   serverObj.channelIds.push(channelId);
   saveDbSoon();
-  res.status(201).json({ server: ensureServerView(serverObj), channel: db.channels[channelId] });
-});
-
-app.patch('/api/servers/:serverId', auth, (req, res) => {
-  const serverObj = db.servers[req.params.serverId];
-  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi duzenleyebilir.' });
-  const name = String(req.body.name || '').trim().slice(0, 40);
-  if (name.length < 2) return res.status(400).json({ error: 'Sunucu adi en az 2 karakter olmali.' });
-  serverObj.name = name;
-  serverObj.updatedAt = now();
-  saveDbSoon();
+  const view = ensureServerView(serverObj, req.user.id);
   io.emit('server:updated', { server: ensureServerView(serverObj) });
-  res.json({ server: ensureServerView(serverObj) });
+  res.status(201).json({ server: view, channel: db.channels[channelId] });
 });
-
-app.delete('/api/servers/:serverId', auth, (req, res) => {
-  const serverObj = db.servers[req.params.serverId];
-  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi sunucuyu silebilir.' });
-
-  const deletedChannelIds = [...serverObj.channelIds];
-  for (const channelId of deletedChannelIds) {
-    delete db.messages[channelId];
-    delete db.channels[channelId];
-  }
-  delete db.servers[serverObj.id];
-  saveDbSoon();
-  io.emit('server:deleted', { serverId: serverObj.id, channelIds: deletedChannelIds });
-  broadcastNative('server:deleted', { serverId: serverObj.id, channelIds: deletedChannelIds });
-  res.json({ ok: true, serverId: serverObj.id });
-});
-
-app.post('/api/servers/:serverId/leave', auth, (req, res) => {
-  const serverObj = db.servers[req.params.serverId];
-  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadi.' });
-  if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahip oldugun sunucudan cikamazsin; istersen silebilirsin.' });
-
-  serverObj.memberIds = serverObj.memberIds.filter((memberId) => memberId !== req.user.id);
-  saveDbSoon();
-  res.json({ ok: true, serverId: serverObj.id });
-});
-
 app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
   const serverObj = db.servers[req.params.serverId];
   const channel = db.channels[req.params.channelId];
-  if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadi.' });
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadı.' });
   if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal silebilir.' });
-  if (serverObj.channelIds.length <= 1) return res.status(400).json({ error: 'Son kanali silemezsin.' });
-
-  serverObj.channelIds = serverObj.channelIds.filter((channelId) => channelId !== channel.id);
+  if (serverObj.channelIds.length <= 1) return res.status(400).json({ error: 'Son kanalı silemezsin.' });
+  serverObj.channelIds = serverObj.channelIds.filter((id) => id !== channel.id);
   delete db.messages[channel.id];
   delete db.channels[channel.id];
   saveDbSoon();
   io.to(channel.id).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
-  broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id }, (ws) => ws.joinedChannels?.has(channel.id));
-  res.json({ ok: true, server: ensureServerView(serverObj), channelId: channel.id });
+  io.to(`voice:${channel.id}`).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
+  broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
+  res.json({ ok: true, server: ensureServerView(serverObj, req.user.id), channelId: channel.id });
 });
 
 app.get('/api/channels/:channelId/messages', auth, (req, res) => {
-  const channelId = req.params.channelId;
-  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erisimin yok.' });
-  const messages = (db.messages[channelId] || []).slice(-150).map(sanitizeMessage);
-  res.json({ messages });
+  if (!canAccessChannel(req.user.id, req.params.channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  res.json({ messages: (db.messages[req.params.channelId] || []).slice(-200).map(sanitizeMessage) });
 });
-
 app.post('/api/channels/:channelId/messages', auth, (req, res) => {
   try {
     const channelId = req.params.channelId;
-    if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erisimin yok.' });
+    if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
     const type = String(req.body.type || 'text').toLowerCase();
     let message;
     if (type === 'text') {
       const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
-      if (!text) return res.status(400).json({ error: 'Bos mesaj gonderilemez.' });
+      if (!text) return res.status(400).json({ error: 'Boş mesaj gönderilemez.' });
       message = createMessage({ channelId, userId: req.user.id, type: 'text', text });
     } else if (type === 'voice') {
-      const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/wav', fileName: req.body.fileName || 'voice.wav', prefix: 'voice_' });
-      if (!upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formati desteklenmiyor.' });
+      const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/webm', fileName: req.body.fileName || 'voice.webm', prefix: 'voice_' });
+      if (!upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formatı desteklenmiyor.' });
       message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null });
     } else if (type === 'file') {
       const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'application/octet-stream', fileName: req.body.fileName || 'dosya', prefix: 'file_' });
       message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: String(req.body.text || '').slice(0, 300) });
-    } else return res.status(400).json({ error: 'Bilinmeyen mesaj turu.' });
+    } else return res.status(400).json({ error: 'Bilinmeyen mesaj türü.' });
     broadcastMessage(channelId, message);
     res.status(201).json({ message });
-  } catch (error) { res.status(400).json({ error: error.message || 'Mesaj gonderilemedi.' }); }
+  } catch (error) { res.status(400).json({ error: error.message || 'Mesaj gönderilemedi.' }); }
 });
 
 io.use((socket, next) => {
   const user = getUserByToken(parseCookies(socket.handshake.headers.cookie || '').sid);
-  if (!user) return next(new Error('Giris gerekli.'));
+  if (!user) return next(new Error('Giriş gerekli.'));
   socket.user = user;
   next();
 });
-
 io.on('connection', (socket) => {
   const userId = socket.user.id;
   onlineCounts.set(userId, (onlineCounts.get(userId) || 0) + 1);
   emitPresence();
   socket.emit('session', { user: publicUser(socket.user), onlineIds: [...onlineCounts.keys()] });
+
   socket.on('channel:join', ({ channelId } = {}, callback = () => {}) => {
-    if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erisimin yok.' });
+    if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
     socket.join(channelId);
-    callback({ ok: true, messages: (db.messages[channelId] || []).slice(-150).map(sanitizeMessage) });
+    callback({ ok: true, messages: (db.messages[channelId] || []).slice(-200).map(sanitizeMessage) });
   });
   socket.on('message:text', ({ channelId, text } = {}, callback = () => {}) => {
-    if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erisimin yok.' });
+    if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
     const clean = String(text || '').trim().slice(0, MAX_TEXT_LENGTH);
-    if (!clean) return callback({ error: 'Bos mesaj gonderilemez.' });
+    if (!clean) return callback({ error: 'Boş mesaj gönderilemez.' });
     const message = createMessage({ channelId, userId, type: 'text', text: clean });
     broadcastMessage(channelId, message);
     callback({ ok: true, message });
   });
   socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs } = {}, callback = () => {}) => {
     try {
-      if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erisimin yok.' });
+      if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
       const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: 'voice.webm', prefix: 'voice_' });
-      if (!upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formati desteklenmiyor.' });
+      if (!upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formatı desteklenmiyor.' });
       const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null });
       broadcastMessage(channelId, message);
       callback({ ok: true, message });
-    } catch (error) { callback({ error: error.message || 'Sesli mesaj gonderilemedi.' }); }
+    } catch (error) { callback({ error: error.message || 'Sesli mesaj gönderilemedi.' }); }
   });
   socket.on('typing', ({ channelId, isTyping } = {}) => {
     if (!canAccessChannel(userId, channelId)) return;
     socket.to(channelId).emit('typing', { channelId, user: publicUser(socket.user), isTyping: Boolean(isTyping) });
   });
+
+  socket.on('voice:join', ({ channelId } = {}, callback = () => {}) => {
+    if (!canUseLiveVoice(userId, channelId)) return callback({ error: 'Ses kanalına erişimin yok.' });
+    leaveWebVoice(socket);
+    socket.voiceChannelId = channelId;
+    webVoiceClients.set(socket.id, { channelId, user: publicUser(socket.user) });
+    socket.join(`voice:${channelId}`);
+    const peers = [...webVoiceClients.entries()].filter(([socketId, item]) => socketId !== socket.id && item.channelId === channelId).map(([socketId, item]) => ({ socketId, user: item.user }));
+    callback({ ok: true, selfId: socket.id, peers, members: voiceMembers(channelId) });
+    socket.to(`voice:${channelId}`).emit('voice:user_joined', { channelId, peer: { socketId: socket.id, user: publicUser(socket.user) } });
+    broadcastNative('voice:user_joined', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+    emitVoiceMembers(channelId);
+  });
+  socket.on('voice:leave', (_data = {}, callback = () => {}) => { leaveWebVoice(socket); callback({ ok: true }); });
+  socket.on('voice:frame', ({ channelId, pcmBase64 } = {}) => {
+    const targetChannelId = String(channelId || socket.voiceChannelId || '');
+    const frame = String(pcmBase64 || '');
+    if (!targetChannelId || socket.voiceChannelId !== targetChannelId) return;
+    if (!canAccessChannel(userId, targetChannelId) || !channelIsVoice(targetChannelId)) return;
+    if (!frame || frame.length > 120000) return;
+    socket.to(`voice:${targetChannelId}`).emit('voice:frame', { channelId: targetChannelId, from: publicUser(socket.user), pcmBase64: frame });
+    broadcastNative('voice:frame', { channelId: targetChannelId, from: publicUser(socket.user), pcmBase64: frame }, (client) => client.voiceChannelId === targetChannelId);
+  });
+  socket.on('voice:signal', ({ to, signal } = {}) => {
+    const target = String(to || '');
+    if (!target || !socket.voiceChannelId) return;
+    const peer = webVoiceClients.get(target);
+    if (!peer || peer.channelId !== socket.voiceChannelId) return;
+    io.to(target).emit('voice:signal', { from: socket.id, user: publicUser(socket.user), signal });
+  });
+
+
   socket.on('disconnect', () => {
+    leaveWebVoice(socket);
     const nextCount = (onlineCounts.get(userId) || 1) - 1;
     if (nextCount <= 0) onlineCounts.delete(userId); else onlineCounts.set(userId, nextCount);
     emitPresence();
@@ -551,7 +906,6 @@ server.on('upgrade', (req, socket, head) => {
     wss.emit('connection', ws, req);
   });
 });
-
 wss.on('connection', (ws) => {
   const userId = ws.user.id;
   nativeClients.add(ws);
@@ -560,45 +914,61 @@ wss.on('connection', (ws) => {
   sendNative(ws, 'session', { user: publicUser(ws.user), onlineIds: [...onlineCounts.keys()] });
   ws.on('message', (raw) => {
     let data;
-    try { data = JSON.parse(raw.toString('utf8')); } catch { return sendNative(ws, 'error', { error: 'Gecersiz veri.' }); }
+    try { data = JSON.parse(raw.toString('utf8')); } catch { return sendNative(ws, 'error', { error: 'Geçersiz veri.' }); }
     if (data.type === 'join_channel') {
       const channelId = String(data.channelId || '');
-      if (!canAccessChannel(userId, channelId)) return sendNative(ws, 'error', { error: 'Bu kanala erisimin yok.' });
+      if (!canAccessChannel(userId, channelId)) return sendNative(ws, 'error', { error: 'Bu kanala erişimin yok.' });
       ws.joinedChannels.add(channelId);
-      sendNative(ws, 'joined_channel', { channelId, messages: (db.messages[channelId] || []).slice(-150).map(sanitizeMessage) });
-      return;
+      return sendNative(ws, 'joined_channel', { channelId, messages: (db.messages[channelId] || []).slice(-200).map(sanitizeMessage) });
     }
     if (data.type === 'leave_channel') { ws.joinedChannels.delete(String(data.channelId || '')); return; }
     if (data.type === 'voice_join') {
       const channelId = String(data.channelId || '');
-      if (!canAccessChannel(userId, channelId)) return sendNative(ws, 'error', { error: 'Ses kanalina erisimin yok.' });
+      if (!canUseLiveVoice(userId, channelId)) return sendNative(ws, 'error', { error: 'Ses kanalına erişimin yok.' });
+      const old = ws.voiceChannelId;
       ws.voiceChannelId = channelId;
+      if (old && old !== channelId) emitVoiceMembers(old);
       broadcastNative('voice:user_joined', { channelId, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === channelId);
-      sendNative(ws, 'voice:joined', { channelId });
+      sendNative(ws, 'voice:joined', { channelId, members: voiceMembers(channelId) });
+      emitVoiceMembers(channelId);
       return;
     }
     if (data.type === 'voice_leave') {
-      const oldChannel = ws.voiceChannelId;
+      const old = ws.voiceChannelId;
       ws.voiceChannelId = null;
-      if (oldChannel) broadcastNative('voice:user_left', { channelId: oldChannel, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === oldChannel);
+      if (old) {
+        broadcastNative('voice:user_left', { channelId: old, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === old);
+        emitVoiceMembers(old);
+      }
       return;
     }
     if (data.type === 'voice_frame') {
       const channelId = String(data.channelId || ws.voiceChannelId || '');
       const pcmBase64 = String(data.pcmBase64 || '');
-      if (!channelId || ws.voiceChannelId !== channelId || !canAccessChannel(userId, channelId)) return;
-      if (pcmBase64.length > 90000) return;
+      if (!channelId || ws.voiceChannelId !== channelId || !canAccessChannel(userId, channelId) || pcmBase64.length > 90000) return;
       broadcastNative('voice:frame', { channelId, from: publicUser(ws.user), pcmBase64 }, (client) => client !== ws && client.voiceChannelId === channelId);
     }
   });
   ws.on('close', () => {
-    const oldChannel = ws.voiceChannelId;
+    const old = ws.voiceChannelId;
     nativeClients.delete(ws);
-    if (oldChannel) broadcastNative('voice:user_left', { channelId: oldChannel, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === oldChannel);
+    if (old) {
+      broadcastNative('voice:user_left', { channelId: old, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === old);
+      emitVoiceMembers(old);
+    }
     const nextCount = (onlineCounts.get(userId) || 1) - 1;
     if (nextCount <= 0) onlineCounts.delete(userId); else onlineCounts.set(userId, nextCount);
     emitPresence();
   });
 });
 
-server.listen(PORT, () => console.log(`Gaycord V3 calisiyor: http://localhost:${PORT}`));
+async function start() {
+  db = await loadDb();
+  console.log(`Gaycord V4 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}`);
+  server.listen(PORT, () => console.log(`Gaycord V4 çalışıyor: http://localhost:${PORT}`));
+}
+
+start().catch((error) => {
+  console.error('Gaycord başlatılamadı:', error);
+  process.exit(1);
+});
