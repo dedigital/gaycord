@@ -8,7 +8,8 @@ const els = {
   meAvatar: $('meAvatar'), meName: $('meName'), meUsername: $('meUsername'), settingsButton: $('settingsButton'), logoutButton: $('logoutButton'),
   chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
   messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'),
-  membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast')
+  membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast'),
+  publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput')
 };
 
 const state = {
@@ -36,7 +37,9 @@ const state = {
   recordChannelId: '',
   recordMaxTimer: null,
   sendingFile: false,
-  voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null }
+  voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null },
+  publicStatus: null,
+  autoBackupTimer: null
 };
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
@@ -86,6 +89,75 @@ async function api(path, options = {}) {
   return data;
 }
 
+const LOCAL_BACKUP_KEY = 'gaycord:last-light-backup:v1';
+const LOCAL_BACKUP_TIME_KEY = 'gaycord:last-light-backup-time:v1';
+function getLocalBackup() {
+  try {
+    const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function setLocalBackup(backup) {
+  try {
+    localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(backup));
+    localStorage.setItem(LOCAL_BACKUP_TIME_KEY, new Date().toISOString());
+    return true;
+  } catch { return false; }
+}
+function localBackupLabel() {
+  const iso = localStorage.getItem(LOCAL_BACKUP_TIME_KEY);
+  if (!iso) return 'Tarayıcıdaki son yedeği geri yükle';
+  try {
+    return `Tarayıcıdaki son yedeği geri yükle (${new Intl.DateTimeFormat('tr-TR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }).format(new Date(iso))})`;
+  } catch { return 'Tarayıcıdaki son yedeği geri yükle'; }
+}
+async function refreshPublicStatus() {
+  try {
+    const info = await api('/api/public-status');
+    state.publicStatus = info;
+    const hasLocal = Boolean(getLocalBackup());
+    if (els.publicDataStatus) {
+      const persistent = info.persistentData;
+      els.publicDataStatus.classList.remove('hidden', 'good');
+      els.publicDataStatus.classList.toggle('good', persistent);
+      els.publicDataStatus.innerHTML = persistent
+        ? `Kalıcı veri aktif: <strong>${escapeHTML(info.storageMode)}</strong>. Güncellemelerde hesaplar/sunucular korunur.`
+        : `Uyarı: Bu servis şu an <strong>geçici dosya</strong> modunda. Render deploy edince hesaplar/sunucular silinebilir. Ayarlar > Yedek indir ve PostgreSQL kullan.`;
+      if (info.userCount === 0) {
+        els.bootstrapRestoreWrap?.classList.remove('hidden');
+        els.restoreLocalBackupButton?.classList.toggle('hidden', !hasLocal);
+        if (els.restoreLocalBackupButton) els.restoreLocalBackupButton.textContent = localBackupLabel();
+      } else {
+        els.bootstrapRestoreWrap?.classList.add('hidden');
+      }
+    }
+  } catch {
+    if (els.publicDataStatus) {
+      els.publicDataStatus.classList.remove('hidden');
+      els.publicDataStatus.textContent = 'Veri durumu alınamadı.';
+    }
+  }
+}
+async function restoreBackupObject(backup) {
+  if (!backup?.db) throw new Error('Geçersiz yedek.');
+  await api('/api/bootstrap-import', { method: 'POST', body: backup });
+  toast('Yedek geri yüklendi. Artık eski hesabınla giriş yapabilirsin.');
+  await refreshPublicStatus();
+}
+async function autoSaveLightBackup() {
+  if (!state.isAppOwner) return;
+  try {
+    const backup = await api('/api/admin/export?light=1');
+    setLocalBackup(backup);
+  } catch {}
+}
+function startAutoBackup() {
+  clearInterval(state.autoBackupTimer);
+  if (!state.isAppOwner) return;
+  autoSaveLightBackup();
+  state.autoBackupTimer = setInterval(autoSaveLightBackup, 60000);
+}
+
 function setAuthMode(mode) {
   state.authMode = mode;
   els.loginTab.classList.toggle('active', mode === 'login');
@@ -94,13 +166,26 @@ function setAuthMode(mode) {
   els.authSubmit.textContent = mode === 'login' ? 'Giriş yap' : 'Hesap oluştur';
   els.passwordInput.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
 }
-function showAuth() { els.auth.classList.remove('hidden'); els.app.classList.add('hidden'); setTimeout(() => els.usernameInput.focus(), 0); }
+function showAuth() { els.auth.classList.remove('hidden'); els.app.classList.add('hidden'); refreshPublicStatus(); setTimeout(() => els.usernameInput.focus(), 0); }
 function showApp() { els.auth.classList.add('hidden'); els.app.classList.remove('hidden'); }
 function applySettings() {
   const settings = state.settings || {};
   document.body.dataset.theme = settings.theme || 'dark';
   document.body.classList.toggle('compact-mode', Boolean(settings.compactMode));
   document.body.classList.toggle('reduce-motion', Boolean(settings.reduceMotion));
+}
+function hasPersistentData() {
+  const status = state.dataStatus || {};
+  return Boolean(status.persistentData || status.persistentDataDir || status.persistentDataDirConfigured || status.storageMode === 'postgres');
+}
+function persistenceCardHTML() {
+  if (hasPersistentData()) return '';
+  return `<section class="warning-card"><strong>Kalıcı veri henüz açık değil</strong><span>Render yeniden deploy/restart yapınca hesaplar, sunucular ve mesajlar sıfırlanabilir. Kalıcı olması için Render Environment içine <code>DATABASE_URL</code> ekle veya disk bağla. Ayarlar → Veri kalıcılığı bölümünden kontrol edebilirsin.</span></section>`;
+}
+function warnTemporaryStorageOnce() {
+  if (hasPersistentData() || sessionStorage.getItem('gaycord-persistence-warning-seen')) return;
+  sessionStorage.setItem('gaycord-persistence-warning-seen', '1');
+  setTimeout(() => toast('Uyarı: Kalıcı veri kapalı. Güncellemede hesap/sunucu silinebilir; DATABASE_URL ekle.'), 700);
 }
 function ingestMe(data) {
   state.user = data.user || state.user;
@@ -127,7 +212,10 @@ function enterApp(data) {
   renderRail();
   renderFriendsPanel();
   connectSocket();
+  warnTemporaryStorageOnce();
+  startAutoBackup();
 }
+
 
 function renderMe() {
   els.meAvatar.textContent = initials(state.user?.displayName || state.user?.username);
@@ -249,6 +337,7 @@ function renderFriendsPanel() {
   els.sidebarMode.textContent = 'DM ve arkadaşlar'; els.sidebarTitle.textContent = 'Arkadaşlar';
   const incoming = state.friends.incomingRequests || [], outgoing = state.friends.outgoingRequests || [], friends = state.friends.friends || [];
   els.dynamicPanel.innerHTML = `
+    ${persistenceCardHTML()}
     <section class="stack"><div class="section-title">Arkadaş ekle</div><input id="friendSearchInput" placeholder="Kullanıcı adı ara" autocomplete="off"><button id="friendSearchButton" class="primary" type="button">Ara</button><div id="friendSearchResults" class="stack"></div></section>
     <section class="stack"><div class="section-title-row"><div class="section-title">Gelen istekler</div><small>${incoming.length}</small></div><div id="incomingRequests"></div></section>
     <section class="stack"><div class="section-title-row"><div class="section-title">Arkadaşlar</div><small>${friends.length}</small></div><div id="friendList"></div></section>
@@ -307,6 +396,7 @@ function renderServerPanel(serverId) {
   els.sidebarMode.textContent = 'Sunucu'; els.sidebarTitle.textContent = server.name;
   const isOwner = server.isOwner || server.ownerId === state.user?.id;
   els.dynamicPanel.innerHTML = `
+    ${persistenceCardHTML()}
     <section class="stack panel-card"><div class="section-title">Sunucu</div><div class="info-card"><span class="avatar server">${escapeHTML(initials(server.name))}</span><span class="row-grow"><strong>${escapeHTML(server.name)}</strong><br><small>${server.memberCount || server.memberIds?.length || 0} üye • Davet: <code>${escapeHTML(server.inviteCode)}</code></small></span></div><div class="server-actions"><button id="copyInvitePanelButton" class="ghost" type="button">Davet kodunu kopyala</button>${isOwner ? '<button id="renameServerButton" class="ghost" type="button">Ad değiştir</button><button id="renewInviteButton" class="ghost" type="button">Davet kodunu yenile</button><button id="deleteServerButton" class="ghost danger" type="button">Sunucuyu sil</button>' : '<button id="leaveServerButton" class="ghost danger" type="button">Sunucudan çık</button>'}</div></section>
     <section class="stack"><div class="section-title-row"><div class="section-title">Metin kanalları</div>${isOwner ? '<button id="addTextChannelButton" class="mini-button">＋</button>' : ''}</div><div id="textChannelList"></div></section>
     <section class="stack"><div class="section-title-row"><div class="section-title">Ses kanalları</div>${isOwner ? '<button id="addVoiceChannelButton" class="mini-button">＋</button>' : ''}</div><div id="voiceChannelList"></div></section>`;
@@ -585,7 +675,7 @@ async function showSettings() {
     <section class="settings-section"><h3>Profil</h3><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
-    <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Free hosting dosya sistemi kalıcı olmayabilir. Gerçek kullanım için Render Disk veya PostgreSQL kullan; ayrıca düzenli yedek al.</p></section>
+    <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
     <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
   theme.value = settings.theme || 'dark'; compact.checked = Boolean(settings.compactMode); reduce.checked = Boolean(settings.reduceMotion);
@@ -601,8 +691,8 @@ async function showSettings() {
     catch { target.innerHTML = '<span class="avatar">!</span><span class="row-grow"><strong>Mikrofon izni alınamadı</strong><br><small>Tarayıcı adres çubuğundan mikrofon iznini kontrol et.</small></span>'; }
   });
   try {
-    const info = await api('/api/storage-info'); const ok = info.persistentDataDirConfigured || info.storageMode === 'postgres';
-    $('storageInfo').innerHTML = `<span class="avatar ${ok ? 'online' : ''}">${ok ? '✓' : '!'}</span><span class="row-grow"><strong>${ok ? 'Kalıcı veri aktif' : 'Kalıcı veri garanti değil'}</strong><br><small>${escapeHTML(info.storageMode || 'file')} • ${escapeHTML(info.dataDir || '')} • ${info.uploadCount || 0} dosya</small></span>`;
+    const info = await api('/api/storage-info'); const ok = Boolean(info.persistentData);
+    $('storageInfo').innerHTML = `<span class="avatar ${ok ? 'online' : ''}">${ok ? '✓' : '!'}</span><span class="row-grow"><strong>${ok ? 'Kalıcı veri aktif' : 'Kalıcı veri garanti değil'}</strong><br><small>${escapeHTML(info.storageMode || 'file')} • ${escapeHTML(info.dataDir || '')} • ${info.uploadCount || 0} dosya • ${escapeHTML(info.warning || '')}</small></span>`;
   } catch { $('storageInfo').innerHTML = '<span class="row-grow"><strong>Veri bilgisi alınamadı</strong><br><small>/api/storage-info yanıt vermedi.</small></span>'; }
   $('downloadBackupButton')?.addEventListener('click', async () => {
     try { const response = await fetch('/api/admin/export', { credentials: 'same-origin' }); if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Yedek indirilemedi.'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `gaycord-backup-${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(url); } catch (e) { toast(e.message); }
@@ -622,6 +712,23 @@ function wireEvents() {
     try { const endpoint = state.authMode === 'login' ? '/api/login' : '/api/register'; await api(endpoint, { method: 'POST', body: { username: els.usernameInput.value, displayName: els.displayNameInput.value, password: els.passwordInput.value } }); els.passwordInput.value = ''; enterApp(await api('/api/me')); }
     catch (e) { toast(e.message); } finally { els.authSubmit.disabled = false; }
   });
+  els.restoreBackupFileButton?.addEventListener('click', () => els.bootstrapFileInput?.click());
+  els.bootstrapFileInput?.addEventListener('change', async () => {
+    const file = els.bootstrapFileInput.files?.[0];
+    if (!file) return;
+    try {
+      await restoreBackupObject(JSON.parse(await file.text()));
+      els.bootstrapFileInput.value = '';
+    } catch (e) { toast(e.message); }
+  });
+  els.restoreLocalBackupButton?.addEventListener('click', async () => {
+    try {
+      const backup = getLocalBackup();
+      if (!backup) return toast('Tarayıcıda yedek bulunamadı.');
+      if (!confirm('Tarayıcıdaki son yedek geri yüklensin mi?')) return;
+      await restoreBackupObject(backup);
+    } catch (e) { toast(e.message); }
+  });
   els.homeButton.addEventListener('click', renderFriendsPanel);
   els.settingsButton.addEventListener('click', showSettings);
   els.createServerButton.addEventListener('click', async () => { const name = prompt('Sunucu adı?', 'Bizim Ekip'); if (!name) return; try { const data = await api('/api/servers', { method: 'POST', body: { name } }); replaceServer(data.server); renderServerPanel(data.server.id); const first = data.server.channels?.find((c) => c.kind !== 'voice') || data.server.channels?.[0]; if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`, inviteCode: data.server.inviteCode, serverId: data.server.id }); } catch (e) { toast(e.message); } });
@@ -640,7 +747,7 @@ function wireEvents() {
   document.addEventListener('paste', (event) => { const files = [...(event.clipboardData?.files || [])]; if (files.length && state.currentChannelId) sendFiles(files); });
 }
 async function bootstrap() {
-  wireEvents(); setAuthMode('login'); resetChat();
+  wireEvents(); setAuthMode('login'); resetChat(); refreshPublicStatus();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   try { enterApp(await api('/api/me')); } catch { showAuth(); }
 }

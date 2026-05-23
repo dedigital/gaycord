@@ -1,7 +1,7 @@
 {
   "name": "gaycord-server",
-  "version": "4.2.0",
-  "description": "Gaycord V4.2: web/PWA ve native Windows istemcisi için chat, DM, dosya/fotoğraf, sesli mesaj, canlı ses, üyeler, ayarlar ve kalıcı veri desteği.",
+  "version": "5.0.0",
+  "description": "Gaycord V5: web/PWA ve native Windows istemcisi için chat, DM, dosya/fotoğraf, sesli mesaj, canlı ses, üyeler, ayarlar ve kalıcı veri desteği.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

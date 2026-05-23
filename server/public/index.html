@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#111827">
-  <meta name="description" content="Gaycord - arkadaşlarınla mesajlaş, dosya/fotoğraf gönder, sesli mesaj bırak ve sesli aramaya katıl.">
+  <meta name="description" content="Gaycord - arkadaşlarınla mesajlaş, fotoğraf/dosya gönder, sesli mesaj bırak ve ses odalarına katıl.">
   <title>Gaycord</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/brand/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/brand/icon-192.png">
-  <link rel="stylesheet" href="/styles.css?v=4.5">
+  <link rel="stylesheet" href="/styles.css?v=5.0">
 </head>
 <body>
   <main id="auth" class="auth-shell hidden">
@@ -17,7 +17,7 @@
       <div class="auth-glow"></div>
       <div class="brand-block hero-brand">
         <img class="brand-logo" src="/brand/gaycord-logo.png" alt="Gaycord logosu">
-        <div><p class="eyebrow">V4 Web + Native</p><h1>Gaycord</h1><p>Sunucu kur, DM aç, fotoğraf/dosya gönder, sesli mesaj bırak ve ses odasına katıl.</p></div>
+        <div><p class="eyebrow">V5 Web + Native</p><h1>Gaycord</h1><p>Sunucu kur, DM aç, fotoğraf/dosya gönder, sesli mesaj bırak ve ses odasına katıl.</p></div>
       </div>
       <div class="tabs" role="tablist" aria-label="Giriş seçenekleri">
         <button id="loginTab" class="tab active" type="button">Giriş</button>
@@ -29,12 +29,18 @@
         <label>Şifre<input id="passwordInput" type="password" autocomplete="current-password" required placeholder="En az 6 karakter"></label>
         <button id="authSubmit" class="primary full" type="submit">Giriş yap</button>
       </form>
+      <div id="publicDataStatus" class="auth-note hidden"></div>
+      <div id="bootstrapRestoreWrap" class="auth-restore hidden">
+        <button id="restoreLocalBackupButton" class="ghost full hidden" type="button">Tarayıcıdaki son yedeği geri yükle</button>
+        <button id="restoreBackupFileButton" class="ghost full" type="button">Yedek dosyası yükle</button>
+        <input id="bootstrapFileInput" class="hidden" type="file" accept="application/json,.json">
+      </div>
     </section>
   </main>
 
   <main id="app" class="app hidden">
     <aside class="rail" aria-label="Sunucular">
-      <div class="rail-logo" title="Gaycord"><img src="/brand/icon-64.png" alt=""></div>
+      <div class="rail-logo" title="Gaycord"><img src="/brand/app-mark.png" alt=""></div>
       <button id="homeButton" class="rail-button active" type="button" title="Arkadaşlar">⌂</button>
       <div id="serverDots" class="server-dots"></div>
       <div class="rail-spacer"></div>
@@ -88,6 +94,6 @@
   <div id="remoteAudio" class="remote-audio" aria-hidden="true"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/app.js?v=4.5" defer></script>
+  <script src="/app.js?v=5.0" defer></script>
 </body>
 </html>

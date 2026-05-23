@@ -1,6 +1,6 @@
 # Gaycord packaging
 
-V4 build artifact adı:
+V5 build artifact adı:
 
 ```text
 Gaycord-Windows-Native

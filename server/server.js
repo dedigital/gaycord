@@ -15,7 +15,9 @@ const MAX_BACKUP_BYTES = Number(process.env.MAX_BACKUP_BYTES || 60 * 1024 * 1024
 const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 140000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
-const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4');
+const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4'); // bilerek sabit: güncellemelerde PostgreSQL verisi aynı anahtarda kalır
+const APP_VERSION = '5.0.0';
+const APP_NAME = 'gaycord-v5';
 
 const ROOT = __dirname;
 const LEGACY_DATA_DIR = path.join(ROOT, 'data');
@@ -50,7 +52,7 @@ function id(prefix = '') { return `${prefix}${crypto.randomBytes(10).toString('h
 function inviteCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
 
 const emptyDb = () => ({
-  version: 4,
+  version: 5,
   adminUserId: '',
   users: {},
   usernameIndex: {},
@@ -75,7 +77,7 @@ function normalizeUsername(username) { return String(username || '').trim().toLo
 
 function normalizeDb(raw) {
   const db = { ...emptyDb(), ...(raw || {}) };
-  db.version = 4;
+  db.version = 5;
   db.users ||= {};
   db.usernameIndex ||= {};
   db.sessions ||= {};
@@ -179,8 +181,8 @@ async function loadDb() {
 }
 
 async function saveDbNowAsync() {
-  db.meta ||= { version: 4, createdAt: now(), ownerUserId: '' };
-  db.meta.version = 4;
+  db.meta ||= { version: 5, createdAt: now(), ownerUserId: '' };
+  db.meta.version = 5;
   db.meta.updatedAt = now();
   if (pgPool) {
     await pgPool.query(
@@ -206,8 +208,8 @@ function saveDbNow() {
   clearTimeout(saveTimer);
   if (pgPool) saveDbNowAsync().catch((error) => console.error('Veritabani kaydedilemedi:', error));
   else {
-    db.meta ||= { version: 4, createdAt: now(), ownerUserId: '' };
-    db.meta.version = 4;
+    db.meta ||= { version: 5, createdAt: now(), ownerUserId: '' };
+    db.meta.version = 5;
     db.meta.updatedAt = now();
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -347,6 +349,19 @@ function friendSummaryFor(userId) {
 }
 function serversFor(userId) {
   return Object.values(db.servers).filter((server) => server.memberIds?.includes(userId)).map((server) => ensureServerView(server, userId)).sort((a, b) => a.name.localeCompare(b.name, 'tr'));
+}
+
+
+function isPersistentDataEnabled() {
+  // PostgreSQL veya /var/data gibi explicit kalıcı disk kullanılıyorsa true.
+  if (storageMode === 'postgres') return true;
+  if (process.env.GAYCORD_DATA_DIR || process.env.DATA_DIR) return true;
+  if (process.env.RENDER === 'true' && DATA_DIR.startsWith('/var/data')) return true;
+  return false;
+}
+function needsPersistentSetup() {
+  // Render'ın varsayılan dosya sistemi ephemeral; deploy/restart sonrası yerel dosya verisi silinebilir.
+  return process.env.RENDER === 'true' && !isPersistentDataEnabled();
 }
 
 function uploadUrl(fileName) {
@@ -575,19 +590,39 @@ app.use(express.json({ limit: `${Math.ceil(Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP
 app.get('/uploads/:fileName', sendUpload);
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'gaycord-v4', version: '4.2.0', storageMode, persistentData: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, time: now() }));
-
-app.get('/api/storage-info', auth, (_req, res) => {
+function dataStatusPayload() {
   const uploadCount = Object.keys(db.uploads || {}).length || (fs.existsSync(UPLOAD_DIR) ? fs.readdirSync(UPLOAD_DIR).filter((name) => !name.startsWith('.')).length : 0);
-  res.json({
+  const persistentData = isPersistentDataEnabled();
+  return {
     ok: true,
-    app: 'gaycord-v4',
+    app: APP_NAME,
+    version: APP_VERSION,
     storageMode,
     dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR,
-    persistentDataDirConfigured: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR,
+    persistentData,
+    persistentDataDirConfigured: persistentData,
+    needsPersistentSetup: needsPersistentSetup(),
     uploadCount,
-    dbFile: storageMode === 'postgres' ? DB_STATE_KEY : DB_FILE
-  });
+    userCount: Object.keys(db.users || {}).length,
+    serverCount: Object.keys(db.servers || {}).length,
+    messageCount: Object.values(db.messages || {}).reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0),
+    dbFile: storageMode === 'postgres' ? DB_STATE_KEY : DB_FILE,
+    dbStateKey: DB_STATE_KEY,
+    warning: persistentData ? '' : 'Render Free dosya sistemi deploy/restart sonrası sıfırlanabilir; DATABASE_URL ile PostgreSQL bağla.'
+  };
+}
+app.get('/api/health', (_req, res) => res.json({ ...dataStatusPayload(), time: now() }));
+app.get('/api/public-status', (_req, res) => res.json({ ...dataStatusPayload(), hasUsers: Object.keys(db.users || {}).length > 0 }));
+app.get('/api/storage-info', auth, (_req, res) => res.json(dataStatusPayload()));
+
+app.post('/api/bootstrap-import', (req, res) => {
+  if (Object.keys(db.users || {}).length > 0) return res.status(409).json({ error: 'Yedek yükleme sadece veritabanı boşken giriş ekranından yapılabilir. Hesabın varsa Ayarlar > Yedek yükle kullan.' });
+  const incoming = req.body?.db;
+  if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
+  db = normalizeDb({ ...emptyDb(), ...incoming });
+  const uploadCount = importUploads(req.body.uploads || {});
+  saveDbNow();
+  res.json({ ok: true, uploads: uploadCount, userCount: Object.keys(db.users || {}).length });
 });
 
 app.post('/api/register', (req, res) => {
@@ -624,8 +659,8 @@ app.post('/api/logout', auth, (req, res) => {
   res.json({ ok: true });
 });
 app.get('/api/me', auth, (req, res) => {
-  const dataStatus = { storageMode, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, persistentData: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR, persistentDataDir: storageMode === 'postgres' || DATA_DIR !== LEGACY_DATA_DIR };
-  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) }, isAppOwner: isAdminUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()], dataStatus, appInfo: { version: '4.2.0', storageMode, dataStatus } });
+  const dataStatus = { storageMode, dataDir: storageMode === 'postgres' ? 'postgres' : DATA_DIR, persistentData: isPersistentDataEnabled(), persistentDataDir: isPersistentDataEnabled(), needsPersistentSetup: needsPersistentSetup(), dbStateKey: DB_STATE_KEY };
+  res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) }, isAppOwner: isAdminUser(req.user), friends: friendSummaryFor(req.user.id), servers: serversFor(req.user.id), onlineIds: [...onlineCounts.keys()], dataStatus, appInfo: { version: APP_VERSION, storageMode, dataStatus } });
 });
 app.patch('/api/me', auth, (req, res) => {
   const displayName = String(req.body.displayName || req.user.displayName || req.user.username).trim().slice(0, 32);
@@ -643,9 +678,11 @@ app.patch('/api/me', auth, (req, res) => {
   res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
 });
 
-app.get('/api/admin/export', auth, requireAdmin, (_req, res) => {
+app.get('/api/admin/export', auth, requireAdmin, (req, res) => {
   saveDbNow();
-  res.json({ app: 'gaycord', version: '4.2.0', exportedAt: now(), db, uploads: exportUploads() });
+  const light = String(req.query.light || '') === '1';
+  const outDb = light ? { ...db, uploadBlobs: {} } : db;
+  res.json({ app: 'gaycord', version: APP_VERSION, exportedAt: now(), light, db: outDb, uploads: light ? {} : exportUploads() });
 });
 app.post('/api/admin/import', auth, requireAdmin, (req, res) => {
   const incoming = req.body?.db;
@@ -964,8 +1001,8 @@ wss.on('connection', (ws) => {
 
 async function start() {
   db = await loadDb();
-  console.log(`Gaycord V4 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}`);
-  server.listen(PORT, () => console.log(`Gaycord V4 çalışıyor: http://localhost:${PORT}`));
+  console.log(`Gaycord V5 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}${needsPersistentSetup() ? ' | UYARI: Render dosya sistemi geçici; DATABASE_URL veya disk ekle.' : ''}`);
+  server.listen(PORT, () => console.log(`Gaycord V5 çalışıyor: http://localhost:${PORT}`));
 }
 
 start().catch((error) => {
