@@ -1,7 +1,7 @@
 # Gaycord V6 Security kurulum/yayınlama
 
-1. `gaycord-v6.zip` dosyasını çıkar.
-2. Zip içindeki `gaycord-v6` klasörünün içindeki dosya/klasörleri mevcut `gaycord` repo klasörüne kopyala.
+1. `gaycord-v6.1.zip` dosyasını çıkar.
+2. Zip içindeki `gaycord-v6.1` klasörünün içindeki dosya/klasörleri mevcut `gaycord` repo klasörüne kopyala.
 3. GitHub Desktop:
 
 ```txt
@@ -25,8 +25,8 @@ https://gaycord.onrender.com/api/health
 Şu alanları görmelisin:
 
 ```txt
-app: gaycord-v6
-version: 6.0.0
+app: gaycord-v6.1
+version: 6.1.0
 storageMode: postgres
 persistentData: true
 ```

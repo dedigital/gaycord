@@ -38,9 +38,9 @@ https://gaycord.onrender.com/api/health
 Beklenen önemli alanlar:
 
 ```json
-{ "app": "gaycord-v6", "version": "6.0.0", "storageMode": "postgres", "persistentData": true }
+{ "app": "gaycord-v6.1", "version": "6.1.0", "storageMode": "postgres", "persistentData": true }
 ```
 
 ## Güncelleme
 
-Zip içindeki `gaycord-v6` klasörünün içindekileri repo köküne kopyala, GitHub Desktop ile commit/push yap. Render otomatik deploy eder.
+Zip içindeki `gaycord-v6.1` klasörünün içindekileri repo köküne kopyala, GitHub Desktop ile commit/push yap. Render otomatik deploy eder.

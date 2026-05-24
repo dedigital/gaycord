@@ -16,11 +16,18 @@ const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 310000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
 const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4'); // bilerek sabit: güncellemelerde PostgreSQL verisi aynı anahtarda kalır
-const APP_VERSION = '6.0.0';
-const APP_NAME = 'gaycord-v6';
+const APP_VERSION = '6.1.0';
+const APP_NAME = 'gaycord-v6.1';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
 const CSRF_HEADER = 'x-gaycord-csrf';
-const MAX_E2EE_PAYLOAD_LENGTH = Number(process.env.MAX_E2EE_PAYLOAD_LENGTH || Math.ceil(MAX_BACKUP_BYTES * 1.35));
+const MAX_E2EE_TEXT_BYTES = Number(process.env.MAX_E2EE_TEXT_BYTES || process.env.MAX_E2EE_PAYLOAD_LENGTH || 16 * 1024);
+const MAX_E2EE_METADATA_BYTES = Number(process.env.MAX_E2EE_METADATA_BYTES || 32 * 1024);
+const MAX_SOCKET_EVENT_BYTES = Number(process.env.MAX_SOCKET_EVENT_BYTES || 256 * 1024);
+const MAX_STORED_MESSAGE_BYTES = Number(process.env.MAX_STORED_MESSAGE_BYTES || 48 * 1024);
+const MAX_CHANNEL_MESSAGE_BYTES = Number(process.env.MAX_CHANNEL_MESSAGE_BYTES || 2 * 1024 * 1024);
+const SOCKET_MESSAGE_LIMIT = Number(process.env.SOCKET_MESSAGE_LIMIT || 120);
+const SOCKET_MESSAGE_WINDOW_MS = Number(process.env.SOCKET_MESSAGE_WINDOW_MS || 60 * 1000);
+const MAX_E2EE_PAYLOAD_LENGTH = MAX_E2EE_TEXT_BYTES;
 const SECURITY_LOG_LIMIT = Number(process.env.SECURITY_LOG_LIMIT || 500);
 const TRUSTED_ORIGINS = String(process.env.TRUSTED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
 const REQUIRE_HTTPS = String(process.env.REQUIRE_HTTPS || (process.env.RENDER === 'true' ? '1' : '0')) === '1';
@@ -418,11 +425,27 @@ function sanitizeMessage(message) {
     createdAt: message.createdAt
   };
 }
+function approxStoredBytes(value) {
+  try { return Buffer.byteLength(JSON.stringify(value || {}), 'utf8'); } catch { return MAX_STORED_MESSAGE_BYTES + 1; }
+}
+function trimChannelMessages(channelId) {
+  const list = db.messages[channelId] || [];
+  let total = 0;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    total += approxStoredBytes(list[i]);
+    if (list.length - i > 1000 || total > MAX_CHANNEL_MESSAGE_BYTES) {
+      db.messages[channelId] = list.slice(i + 1);
+      return;
+    }
+  }
+  if (list.length > 1000) db.messages[channelId] = list.slice(-1000);
+}
 function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null, encrypted = false, e2ee = null }) {
   const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, encrypted: Boolean(encrypted), e2ee: e2ee || null, createdAt: now() };
+  if (approxStoredBytes(message) > MAX_STORED_MESSAGE_BYTES) throw new Error('Mesaj güvenlik sınırını aşıyor. Büyük dosyaları mesaj gövdesinde değil upload olarak gönder.');
   db.messages[channelId] ||= [];
   db.messages[channelId].push(message);
-  if (db.messages[channelId].length > 1000) db.messages[channelId] = db.messages[channelId].slice(-1000);
+  trimChannelMessages(channelId);
   saveDbSoon();
   return sanitizeMessage(message);
 }
@@ -509,19 +532,35 @@ function validateUploadBuffer(buffer, mimeType, originalName = '', encrypted = f
   if (effectiveMime === 'text/plain' && !isProbablyText(buffer)) throw new Error('Metin dosyası güvenli görünmüyor.');
   return { mimeType: effectiveMime, originalName: safeName, extension: extensionFor(effectiveMime, safeName).toLowerCase() };
 }
-function cleanE2eePayload(e2ee) {
+function cleanLimitedBase64(value, label, maxChars, required = true) {
+  const out = String(value || '').trim();
+  if (!out && !required) return '';
+  if (!out) throw new Error(`${label} eksik.`);
+  if (out.length > maxChars) throw new Error(`${label} çok büyük.`);
+  if (!/^[a-zA-Z0-9+/=_-]+$/.test(out)) throw new Error(`${label} geçersiz.`);
+  return out;
+}
+function cleanE2eePayload(e2ee, options = {}) {
   if (!e2ee || typeof e2ee !== 'object') return null;
+  const mode = String(e2ee.mode || 'message').slice(0, 32);
+  const isAttachment = mode === 'attachment';
+  if (isAttachment && !options.allowAttachment) throw new Error('Bu kanaldan şifreli ek gönderilemez.');
   const payload = {
-    v: Number(e2ee.v || 1),
-    alg: String(e2ee.alg || 'AES-GCM'),
-    kdf: String(e2ee.kdf || 'PBKDF2-SHA256'),
-    iterations: Number(e2ee.iterations || 250000),
-    salt: String(e2ee.salt || ''),
-    iv: String(e2ee.iv || ''),
-    ciphertext: String(e2ee.ciphertext || '')
+    v: Number(e2ee.v || (isAttachment ? 2 : 1)),
+    alg: String(e2ee.alg || 'AES-GCM').slice(0, 32),
+    kdf: String(e2ee.kdf || 'PBKDF2-SHA256').slice(0, 32),
+    iterations: Math.min(Math.max(Number(e2ee.iterations || 250000), 100000), 1000000),
+    mode,
+    salt: cleanLimitedBase64(e2ee.salt, 'Şifreli mesaj salt', 128),
+    iv: cleanLimitedBase64(e2ee.iv, 'Şifreli mesaj IV', 128),
+    ciphertext: cleanLimitedBase64(e2ee.ciphertext, 'Şifreli mesaj verisi', options.maxCiphertextChars || MAX_E2EE_TEXT_BYTES, true)
   };
-  if (!payload.salt || !payload.iv || !payload.ciphertext) throw new Error('Şifreli mesaj verisi eksik.');
-  if (payload.ciphertext.length > MAX_E2EE_PAYLOAD_LENGTH) throw new Error('Şifreli veri çok büyük.');
+  if (payload.alg !== 'AES-GCM' || payload.kdf !== 'PBKDF2-SHA256') throw new Error('Şifreleme biçimi desteklenmiyor.');
+  if (isAttachment) {
+    payload.fileIv = cleanLimitedBase64(e2ee.fileIv, 'Şifreli dosya IV', 128);
+    payload.attachment = true;
+  }
+  if (approxStoredBytes(payload) > (options.maxStoredBytes || MAX_E2EE_METADATA_BYTES)) throw new Error('Şifreli mesaj meta verisi çok büyük.');
   return payload;
 }
 function hydrateUploadBlobsFromDir(state, uploadDir) {
@@ -725,6 +764,15 @@ function rateLimit(name, max, windowMs, keyFn = (req) => clientIp(req)) {
     next();
   };
 }
+function socketRateLimit(socket, name, max = SOCKET_MESSAGE_LIMIT, windowMs = SOCKET_MESSAGE_WINDOW_MS) {
+  const key = socket?.user?.id || socket?.id || 'unknown';
+  const checked = checkRateLimit(`socket_${name}`, key, max, windowMs);
+  if (!checked.ok) {
+    recordSecurityEvent('socket_rate_limit', { name, userId: socket?.user?.id || '', socketId: socket?.id || '', retryAfter: checked.retryAfter });
+    return { ok: false, error: 'Çok hızlı mesaj gönderiyorsun. Biraz bekle.' };
+  }
+  return { ok: true };
+}
 function originAllowed(req) {
   const origin = String(req.headers.origin || '').replace(/\/$/, '');
   const referer = String(req.headers.referer || '');
@@ -776,7 +824,7 @@ function securityHeaders(req, res, next) {
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: Math.max(MAX_UPLOAD_BYTES, MAX_BACKUP_BYTES) + 1024 * 1024, cors: { origin: false } });
+const io = new Server(server, { maxHttpBufferSize: MAX_SOCKET_EVENT_BYTES, cors: { origin: false } });
 const wss = new WebSocketServer({ noServer: true });
 
 app.use(securityHeaders);
@@ -815,10 +863,12 @@ app.get('/api/security/status', auth, (req, res) => res.json({
   securityHeaders: true,
   csrf: true,
   rateLimit: true,
+  socketRateLimit: true,
   uploadAuthorization: true,
   sessionStorage: 'sha256-token-hash',
   passwordKdf: `PBKDF2-SHA256/${PBKDF2_ITERATIONS}`,
-  e2ee: { available: true, mode: 'optional per-channel client-side passphrase; AES-GCM via Web Crypto; server stores ciphertext only', liveVoiceContentE2EE: false, metadataVisible: true },
+  e2ee: { available: true, mode: 'optional per-channel client-side passphrase; AES-GCM via Web Crypto; text ciphertext capped, attachments stored as encrypted uploads', maxTextCiphertextBytes: MAX_E2EE_TEXT_BYTES, maxSocketEventBytes: MAX_SOCKET_EVENT_BYTES, liveVoiceContentE2EE: false, metadataVisible: true },
+  adminAutoLocalBackup: false,
   recentSecurityEvents: isAdminUser(req.user) ? (db.securityEvents || []).slice(-25).reverse() : undefined
 }));
 app.get('/api/csrf', auth, (req, res) => res.json({ csrfToken: getSessionByToken(getTokenFromRequest(req))?.csrfToken || '' }));
@@ -828,12 +878,33 @@ app.post('/api/security/logout-all', auth, (req, res) => {
   res.clearCookie('sid');
   res.json({ ok: true });
 });
+app.post('/api/admin/security/invalidate-sessions', auth, requireAdmin, rateLimit('admin_invalidate_sessions', 3, 15 * 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
+  const count = Object.keys(db.sessions || {}).length;
+  db.sessions = {};
+  recordSecurityEvent('admin_invalidated_sessions', { adminUserId: req.user.id, count });
+  saveDbNow();
+  res.clearCookie('sid');
+  res.json({ ok: true, invalidated: count });
+  setTimeout(() => { for (const s of io.sockets.sockets.values()) s.disconnect(true); }, 150);
+});
 
+function normalizeImportedDb(incoming) {
+  const next = normalizeDb({ ...emptyDb(), ...(incoming || {}) });
+  // Yedek dosyaları aktif oturum taşıyamaz. Böylece eski export veya ele geçirilmiş backup session reuse yapamaz.
+  next.sessions = {};
+  next.securityEvents = [];
+  for (const user of Object.values(next.users || {})) {
+    delete user.failedLoginCount;
+    delete user.lastFailedLoginAt;
+    delete user.lastLoginAt;
+  }
+  return next;
+}
 app.post('/api/bootstrap-import', rateLimit('bootstrap_import', 3, 15 * 60 * 1000), (req, res) => {
   if (Object.keys(db.users || {}).length > 0) return res.status(409).json({ error: 'Yedek yükleme sadece veritabanı boşken giriş ekranından yapılabilir. Hesabın varsa Ayarlar > Yedek yükle kullan.' });
   const incoming = req.body?.db;
   if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
-  db = normalizeDb({ ...emptyDb(), ...incoming });
+  db = normalizeImportedDb(incoming);
   const uploadCount = importUploads(req.body.uploads || {});
   saveDbNow();
   res.json({ ok: true, uploads: uploadCount, userCount: Object.keys(db.users || {}).length });
@@ -905,16 +976,49 @@ app.patch('/api/me', auth, (req, res) => {
   res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
 });
 
-app.get('/api/admin/export', auth, requireAdmin, (req, res) => {
+function publicBackupUser(user) {
+  const out = publicUser(user) || {};
+  out.createdAt = user?.createdAt || '';
+  return out;
+}
+function makeAdminExport(light = false) {
+  if (light) {
+    return {
+      version: db.version,
+      adminUserId: db.adminUserId,
+      users: Object.fromEntries(Object.entries(db.users || {}).map(([id, user]) => [id, publicBackupUser(user)])),
+      usernameIndex: { ...(db.usernameIndex || {}) },
+      servers: Object.fromEntries(Object.entries(db.servers || {}).map(([id, server]) => [id, { id, name: server.name, ownerId: server.ownerId, memberIds: server.memberIds || [], channelIds: server.channelIds || [], createdAt: server.createdAt || '' }])),
+      channels: { ...(db.channels || {}) },
+      messages: {},
+      friendships: {},
+      uploads: {},
+      uploadBlobs: {},
+      sessions: {},
+      securityEvents: [],
+      appSettings: { ...(db.appSettings || {}) }
+    };
+  }
+  const copy = JSON.parse(JSON.stringify(db));
+  copy.sessions = {};
+  copy.securityEvents = [];
+  copy.uploadBlobs = {};
+  for (const user of Object.values(copy.users || {})) {
+    delete user.failedLoginCount;
+    delete user.lastFailedLoginAt;
+  }
+  return copy;
+}
+app.get('/api/admin/export', auth, requireAdmin, rateLimit('admin_export', 12, 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
   saveDbNow();
   const light = String(req.query.light || '') === '1';
-  const outDb = light ? { ...db, sessions: {}, securityEvents: [], uploadBlobs: {} } : { ...db, sessions: {}, securityEvents: [] };
+  const outDb = makeAdminExport(light);
   res.json({ app: 'gaycord', version: APP_VERSION, exportedAt: now(), light, db: outDb, uploads: light ? {} : exportUploads() });
 });
 app.post('/api/admin/import', auth, requireAdmin, (req, res) => {
   const incoming = req.body?.db;
   if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
-  db = normalizeDb({ ...emptyDb(), ...incoming });
+  db = normalizeImportedDb(incoming);
   if (!db.adminUserId || !db.users[db.adminUserId]) db.adminUserId = req.user.id;
   const uploadCount = importUploads(req.body.uploads || {});
   saveDbNow();
@@ -1060,7 +1164,7 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', 120, 6
     let message;
     if (type === 'text') {
       if (req.body.encrypted) {
-        const e2ee = cleanE2eePayload(req.body.e2ee);
+        const e2ee = cleanE2eePayload(req.body.e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES });
         message = createMessage({ channelId, userId: req.user.id, type: 'text', text: '', encrypted: true, e2ee });
       } else {
         const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
@@ -1069,13 +1173,15 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', 120, 6
       }
     } else if (type === 'voice') {
       const encrypted = Boolean(req.body.encrypted);
-      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee) : null;
+      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
+      if (encrypted) { const uploadRate = checkRateLimit('encrypted_uploads', req.user.id, 30, 60 * 1000); if (!uploadRate.ok) return res.status(429).json({ error: 'Çok hızlı dosya/ses gönderiyorsun. Biraz bekle.' }); }
       const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/webm', fileName: req.body.fileName || 'voice.webm', prefix: 'voice_', channelId, userId: req.user.id, encrypted });
       if (!encrypted && !upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formatı desteklenmiyor.' });
       message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null, encrypted, e2ee });
     } else if (type === 'file') {
       const encrypted = Boolean(req.body.encrypted);
-      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee) : null;
+      const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
+      if (encrypted) { const uploadRate = checkRateLimit('encrypted_uploads', req.user.id, 30, 60 * 1000); if (!uploadRate.ok) return res.status(429).json({ error: 'Çok hızlı dosya/ses gönderiyorsun. Biraz bekle.' }); }
       const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'application/octet-stream', fileName: req.body.fileName || 'dosya', prefix: 'file_', channelId, userId: req.user.id, encrypted });
       message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: encrypted ? 'encrypted.gce' : upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: encrypted ? '' : String(req.body.text || '').slice(0, 300), encrypted, e2ee });
     } else return res.status(400).json({ error: 'Bilinmeyen mesaj türü.' });
@@ -1103,28 +1209,37 @@ io.on('connection', (socket) => {
     callback({ ok: true, messages: (db.messages[channelId] || []).slice(-200).map(sanitizeMessage) });
   });
   socket.on('message:text', ({ channelId, text } = {}, callback = () => {}) => {
-    if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
-    const clean = String(text || '').trim().slice(0, MAX_TEXT_LENGTH);
-    if (!clean) return callback({ error: 'Boş mesaj gönderilemez.' });
-    const message = createMessage({ channelId, userId, type: 'text', text: clean });
-    broadcastMessage(channelId, message);
-    callback({ ok: true, message });
+    try {
+      const limited = socketRateLimit(socket, 'messages');
+      if (!limited.ok) return callback({ error: limited.error });
+      if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
+      const clean = String(text || '').trim().slice(0, MAX_TEXT_LENGTH);
+      if (!clean) return callback({ error: 'Boş mesaj gönderilemez.' });
+      const message = createMessage({ channelId, userId, type: 'text', text: clean });
+      broadcastMessage(channelId, message);
+      callback({ ok: true, message });
+    } catch (error) { callback({ error: error.message || 'Mesaj gönderilemedi.' }); }
   });
   socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs, encrypted, e2ee } = {}, callback = () => {}) => {
     try {
+      const limited = socketRateLimit(socket, 'messages');
+      if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
       const secure = Boolean(encrypted);
+      const secureMeta = secure ? cleanE2eePayload(e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
       const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: secure ? 'encrypted-voice.gce' : 'voice.webm', prefix: 'voice_', channelId, userId, encrypted: secure });
       if (!secure && !upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formatı desteklenmiyor.' });
-      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null, encrypted: secure, e2ee: secure ? cleanE2eePayload(e2ee) : null });
+      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null, encrypted: secure, e2ee: secureMeta });
       broadcastMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Sesli mesaj gönderilemedi.' }); }
   });
   socket.on('message:secure', ({ channelId, e2ee } = {}, callback = () => {}) => {
     try {
+      const limited = socketRateLimit(socket, 'messages');
+      if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
-      const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee) });
+      const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) });
       broadcastMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Şifreli mesaj gönderilemedi.' }); }

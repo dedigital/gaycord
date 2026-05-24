@@ -103,6 +103,7 @@ function bytesToBase64(bytes) {
   for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   return btoa(binary);
 }
+function dataUrlFromBytes(mimeType, bytes) { return `data:${mimeType || 'application/octet-stream'};base64,${bytesToBase64(bytes)}`; }
 function base64ToBytes(base64) {
   const binary = atob(String(base64 || ''));
   const bytes = new Uint8Array(binary.length);
@@ -145,6 +146,39 @@ async function decryptPayload(channelId, e2ee) {
   const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ciphertext);
   return JSON.parse(E2EE_DECODER.decode(plaintext));
 }
+function attachmentAad(channelId, part) { return E2EE_ENCODER.encode(`gaycord-v6.1:${channelId}:attachment:${part}`); }
+async function encryptAttachmentForUpload(channelId, blob, meta = {}) {
+  if (!crypto.subtle) throw new Error('Tarayıcı Web Crypto desteklemiyor.');
+  const passphrase = e2eePassphrase(channelId);
+  if (!passphrase) throw new Error('Bu kanal için E2EE anahtarı yok.');
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const metaIv = crypto.getRandomValues(new Uint8Array(12));
+  const fileIv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveE2eeKey(passphrase, salt);
+  const metadata = E2EE_ENCODER.encode(JSON.stringify(meta));
+  const encryptedMeta = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: metaIv, additionalData: attachmentAad(channelId, 'meta') }, key, metadata));
+  const encryptedFile = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: fileIv, additionalData: attachmentAad(channelId, 'file') }, key, await blob.arrayBuffer()));
+  return {
+    fileData: dataUrlFromBytes('application/octet-stream', encryptedFile),
+    e2ee: { v: 2, mode: 'attachment', alg: 'AES-GCM', kdf: 'PBKDF2-SHA256', iterations: E2EE_ITERATIONS, salt: bytesToBase64(salt), iv: bytesToBase64(metaIv), fileIv: bytesToBase64(fileIv), ciphertext: bytesToBase64(encryptedMeta) }
+  };
+}
+async function decryptAttachmentPayload(message) {
+  const passphrase = e2eePassphrase(message.channelId);
+  if (!passphrase) throw new Error('Anahtar yok');
+  const e2ee = message.e2ee || {};
+  const key = await deriveE2eeKey(passphrase, base64ToBytes(e2ee.salt));
+  const metaBytes = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(e2ee.iv), additionalData: attachmentAad(message.channelId, 'meta') }, key, base64ToBytes(e2ee.ciphertext));
+  const meta = JSON.parse(E2EE_DECODER.decode(metaBytes));
+  const url = message.fileUrl || message.audioUrl;
+  if (!url) throw new Error('Şifreli dosya yolu yok');
+  const response = await fetch(url, { credentials: 'same-origin' });
+  if (!response.ok) throw new Error('Şifreli dosya alınamadı');
+  const encryptedBytes = new Uint8Array(await response.arrayBuffer());
+  const clearBytes = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(e2ee.fileIv), additionalData: attachmentAad(message.channelId, 'file') }, key, encryptedBytes));
+  const mimeType = meta.mimeType || (meta.kind === 'voice' ? 'audio/wav' : 'application/octet-stream');
+  return { ...meta, fileData: dataUrlFromBytes(mimeType, clearBytes), audioData: dataUrlFromBytes(mimeType, clearBytes), mimeType, sizeBytes: clearBytes.length };
+}
 function dataUrlToBlob(dataUrl) {
   const [head, body] = String(dataUrl || '').split(',');
   const mime = (head.match(/^data:([^;]+)/) || [])[1] || 'application/octet-stream';
@@ -186,33 +220,19 @@ async function decryptVisibleMessages() {
   }
 }
 
-const LOCAL_BACKUP_KEY = 'gaycord:last-light-backup:v1';
-const LOCAL_BACKUP_TIME_KEY = 'gaycord:last-light-backup-time:v1';
-function getLocalBackup() {
-  try {
-    const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; }
+const LEGACY_LOCAL_BACKUP_KEYS = ['gaycord:last-light-backup:v1', 'gaycord:last-light-backup-time:v1'];
+function purgeLegacySensitiveLocalBackups() {
+  try { for (const key of LEGACY_LOCAL_BACKUP_KEYS) localStorage.removeItem(key); } catch {}
 }
-function setLocalBackup(backup) {
-  try {
-    localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(backup));
-    localStorage.setItem(LOCAL_BACKUP_TIME_KEY, new Date().toISOString());
-    return true;
-  } catch { return false; }
-}
-function localBackupLabel() {
-  const iso = localStorage.getItem(LOCAL_BACKUP_TIME_KEY);
-  if (!iso) return 'Tarayıcıdaki son yedeği geri yükle';
-  try {
-    return `Tarayıcıdaki son yedeği geri yükle (${new Intl.DateTimeFormat('tr-TR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }).format(new Date(iso))})`;
-  } catch { return 'Tarayıcıdaki son yedeği geri yükle'; }
-}
+function getLocalBackup() { purgeLegacySensitiveLocalBackups(); return null; }
+function setLocalBackup() { purgeLegacySensitiveLocalBackups(); return false; }
+function localBackupLabel() { return 'Güvenlik nedeniyle tarayıcı içi otomatik yedek kapatıldı'; }
+purgeLegacySensitiveLocalBackups();
 async function refreshPublicStatus() {
   try {
     const info = await api('/api/public-status');
     state.publicStatus = info;
-    const hasLocal = Boolean(getLocalBackup());
+    const hasLocal = false;
     if (els.publicDataStatus) {
       const persistent = info.persistentData;
       els.publicDataStatus.classList.remove('hidden', 'good');
@@ -241,18 +261,11 @@ async function restoreBackupObject(backup) {
   toast('Yedek geri yüklendi. Artık eski hesabınla giriş yapabilirsin.');
   await refreshPublicStatus();
 }
-async function autoSaveLightBackup() {
-  if (!state.isAppOwner) return;
-  try {
-    const backup = await api('/api/admin/export?light=1');
-    setLocalBackup(backup);
-  } catch {}
-}
+async function autoSaveLightBackup() { purgeLegacySensitiveLocalBackups(); }
 function startAutoBackup() {
   clearInterval(state.autoBackupTimer);
-  if (!state.isAppOwner) return;
-  autoSaveLightBackup();
-  state.autoBackupTimer = setInterval(autoSaveLightBackup, 60000);
+  state.autoBackupTimer = null;
+  purgeLegacySensitiveLocalBackups();
 }
 
 function setAuthMode(mode) {
@@ -415,7 +428,7 @@ async function renderDecryptedMessage(message, article) {
   const bubble = article.querySelector('.message-bubble');
   if (!bubble) return;
   try {
-    const payload = await decryptPayload(message.channelId, message.e2ee);
+    const payload = message.e2ee?.mode === 'attachment' ? await decryptAttachmentPayload(message) : await decryptPayload(message.channelId, message.e2ee);
     renderDecryptedPayloadInto(bubble, message, payload);
     article.classList.remove('secure-locked'); article.classList.add('secure-unlocked');
   } catch {
@@ -753,10 +766,9 @@ async function stopRecording() {
     if (!blob.size) throw new Error('Ses kaydı boş geldi.');
     const dataUrl = await blobToDataURL(blob);
     if (e2eeEnabled(channelId)) {
-      const oldChannel = state.currentChannelId;
-      state.currentChannelId = channelId;
-      await sendSecurePayload({ kind: 'voice', audioData: dataUrl, mimeType: 'audio/wav', durationMs });
-      state.currentChannelId = oldChannel;
+      const encrypted = await encryptAttachmentForUpload(channelId, blob, { kind: 'voice', mimeType: 'audio/wav', fileName: 'voice.wav', durationMs });
+      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: encrypted.fileData, mimeType: 'application/octet-stream', fileName: 'encrypted-voice.gce', durationMs, encrypted: true, e2ee: encrypted.e2ee } });
+      if (!state.socket?.connected) appendMessage(response.message);
       toast('Şifreli sesli mesaj gönderildi.');
     } else {
       const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs } });
@@ -773,8 +785,10 @@ async function sendFile(file) {
   try {
     const fileData = await fileToDataURL(file); const caption = els.messageInput.value.trim();
     if (e2eeEnabled(state.currentChannelId)) {
-      await sendSecurePayload({ kind: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', sizeBytes: file.size || 0, text: caption });
+      const encrypted = await encryptAttachmentForUpload(state.currentChannelId, file, { kind: 'file', fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', sizeBytes: file.size || 0, text: caption });
+      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData: encrypted.fileData, fileName: 'encrypted-file.gce', mimeType: 'application/octet-stream', encrypted: true, e2ee: encrypted.e2ee } });
       if (caption) { els.messageInput.value = ''; autoGrowInput(); }
+      if (!state.socket?.connected) appendMessage(data.message);
       toast('Şifreli dosya gönderildi.');
     } else {
       const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption } });
@@ -860,7 +874,7 @@ async function showSettings() {
     <section class="settings-section"><h3>Profil</h3><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
-    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Tüm oturumları kapat</button></section>
+    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V6.1 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button>${state.isAppOwner ? '<button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm kullanıcı oturumlarını sıfırla</button>' : ''}</section>
     <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
     <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
@@ -884,7 +898,8 @@ async function showSettings() {
     const sec = await api('/api/security/status');
     $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V6 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
   } catch { $('securityInfo').innerHTML = '<span class="row-grow"><strong>Güvenlik durumu alınamadı</strong><br><small>/api/security/status yanıt vermedi.</small></span>'; }
-  $('logoutAllButton')?.addEventListener('click', async () => { if (!confirm('Tüm cihazlardaki oturumların kapatılsın mı?')) return; try { await api('/api/security/logout-all', { method: 'POST', body: {} }); toast('Oturumlar kapatıldı.'); setTimeout(() => location.reload(), 500); } catch (e) { toast(e.message); } });
+  $('logoutAllButton')?.addEventListener('click', async () => { if (!confirm('Tüm cihazlardaki oturumların kapatılsın mı?')) return; try { await api('/api/security/logout-all', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Oturumlar kapatıldı.'); setTimeout(() => location.reload(), 500); } catch (e) { toast(e.message); } });
+  $('invalidateAllSessionsButton')?.addEventListener('click', async () => { if (!confirm('Tüm kullanıcıların tüm oturumları kapatılsın mı? Herkes yeniden giriş yapmak zorunda kalır.')) return; try { await api('/api/admin/security/invalidate-sessions', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Tüm oturumlar sıfırlandı. Yeniden giriş yapman gerekecek.'); setTimeout(() => location.reload(), 700); } catch (e) { toast(e.message); } });
   $('downloadBackupButton')?.addEventListener('click', async () => {
     try { const response = await fetch('/api/admin/export', { credentials: 'same-origin' }); if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Yedek indirilemedi.'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `gaycord-backup-${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(url); } catch (e) { toast(e.message); }
   });
@@ -924,7 +939,7 @@ function wireEvents() {
   els.settingsButton.addEventListener('click', showSettings);
   els.createServerButton.addEventListener('click', async () => { const name = prompt('Sunucu adı?', 'Bizim Ekip'); if (!name) return; try { const data = await api('/api/servers', { method: 'POST', body: { name } }); replaceServer(data.server); renderServerPanel(data.server.id); const first = data.server.channels?.find((c) => c.kind !== 'voice') || data.server.channels?.[0]; if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`, inviteCode: data.server.inviteCode, serverId: data.server.id }); } catch (e) { toast(e.message); } });
   els.joinServerButton.addEventListener('click', async () => { const inviteCode = prompt('Davet kodu?'); if (!inviteCode) return; try { const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode } }); replaceServer(data.server); renderServerPanel(data.server.id); toast('Sunucuya katıldın.'); } catch (e) { toast(e.message); } });
-  els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); state.socket?.disconnect(); cleanupVoice(false); state.user = null; showAuth(); });
+  els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); state.socket?.disconnect(); cleanupVoice(false); purgeLegacySensitiveLocalBackups(); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
   els.e2eeButton?.addEventListener('click', promptE2eeKey);
   els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });

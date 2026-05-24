@@ -1,7 +1,7 @@
 {
   "name": "gaycord-server",
-  "version": "6.0.0",
-  "description": "Gaycord V6 Security: kalıcı veri, güvenlik başlıkları, CSRF, rate limit, korumalı upload ve opsiyonel E2EE.",
+  "version": "6.1.0",
+  "description": "Gaycord V6.1 Security Hotfix: kalıcı veri, güvenlik başlıkları, CSRF, rate limit, korumalı upload ve opsiyonel E2EE.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
