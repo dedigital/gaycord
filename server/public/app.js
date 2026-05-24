@@ -6,7 +6,7 @@ const els = {
   homeButton: $('homeButton'), serverDots: $('serverDots'), createServerButton: $('createServerButton'), joinServerButton: $('joinServerButton'),
   sidebarMode: $('sidebarMode'), sidebarTitle: $('sidebarTitle'), connectionState: $('connectionState'), dynamicPanel: $('dynamicPanel'),
   meAvatar: $('meAvatar'), meName: $('meName'), meUsername: $('meUsername'), settingsButton: $('settingsButton'), logoutButton: $('logoutButton'),
-  chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), e2eeButton: $('e2eeButton'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
+  chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), e2eeButton: $('e2eeButton'), e2eeWarning: $('e2eeWarning'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
   messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'),
   membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast'),
   publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput')
@@ -195,11 +195,18 @@ function renderE2eeButton() {
   if (!els.e2eeButton) return;
   const hasChannel = Boolean(state.currentChannelId);
   els.e2eeButton.classList.toggle('hidden', !hasChannel);
+  els.e2eeWarning?.classList.toggle('hidden', !hasChannel);
   if (!hasChannel) return;
   const on = e2eeEnabled(state.currentChannelId);
   els.e2eeButton.classList.toggle('e2ee-on', on);
   els.e2eeButton.textContent = on ? '🔒 E2EE açık' : '🔓 E2EE';
   els.messageInput.placeholder = on ? 'Şifreli mesaj yaz... Server sadece ciphertext görür.' : 'Mesaj yaz, fotoğraf yapıştır veya dosya sürükle...';
+  if (els.e2eeWarning) {
+    els.e2eeWarning.classList.toggle('e2ee-warning-on', on);
+    els.e2eeWarning.innerHTML = on
+      ? '<strong>🔒 E2EE açık</strong><span>Yeni mesaj, dosya ve sesli mesajlar bu sekmedeki anahtarla şifrelenir.</span>'
+      : '<strong>🔓 E2EE kapalı</strong><span>Yeni mesajlar sunucuda okunabilir biçimde saklanır. Hassas içerik için kilit düğmesinden E2EE aç.</span>';
+  }
 }
 function promptE2eeKey() {
   if (!state.currentChannelId) return;
@@ -385,6 +392,7 @@ function resetChat(title = 'Hoş geldin', subtitle = 'Bir kanal veya DM seç.') 
   els.chatSubtitle.textContent = subtitle;
   els.copyInviteButton.classList.add('hidden');
   els.e2eeButton?.classList.add('hidden');
+  els.e2eeWarning?.classList.add('hidden');
   els.messageInput.value = '';
   autoGrowInput();
   els.messageInput.disabled = true;
@@ -874,7 +882,7 @@ async function showSettings() {
     <section class="settings-section"><h3>Profil</h3><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
-    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V6.1 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button>${state.isAppOwner ? '<button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm kullanıcı oturumlarını sıfırla</button>' : ''}</section>
+    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>E2EE kapalıyken yeni mesajlar sunucuda okunabilir biçimde saklanır; kanal üstünde ayrıca uyarı görünür.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V7 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button>${state.isAppOwner ? '<button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm kullanıcı oturumlarını sıfırla</button>' : ''}</section>
     <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
     <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
@@ -896,7 +904,7 @@ async function showSettings() {
   } catch { $('storageInfo').innerHTML = '<span class="row-grow"><strong>Veri bilgisi alınamadı</strong><br><small>/api/storage-info yanıt vermedi.</small></span>'; }
   try {
     const sec = await api('/api/security/status');
-    $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V6 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
+    $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V7 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
   } catch { $('securityInfo').innerHTML = '<span class="row-grow"><strong>Güvenlik durumu alınamadı</strong><br><small>/api/security/status yanıt vermedi.</small></span>'; }
   $('logoutAllButton')?.addEventListener('click', async () => { if (!confirm('Tüm cihazlardaki oturumların kapatılsın mı?')) return; try { await api('/api/security/logout-all', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Oturumlar kapatıldı.'); setTimeout(() => location.reload(), 500); } catch (e) { toast(e.message); } });
   $('invalidateAllSessionsButton')?.addEventListener('click', async () => { if (!confirm('Tüm kullanıcıların tüm oturumları kapatılsın mı? Herkes yeniden giriş yapmak zorunda kalır.')) return; try { await api('/api/admin/security/invalidate-sessions', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Tüm oturumlar sıfırlandı. Yeniden giriş yapman gerekecek.'); setTimeout(() => location.reload(), 700); } catch (e) { toast(e.message); } });

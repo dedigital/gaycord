@@ -1,19 +1,20 @@
-# Gaycord V6 Security
+# Gaycord V7 Security
 
 Gaycord; arkadaşlarla sunucu/DM tabanlı mesajlaşma, sesli mesaj, fotoğraf/dosya gönderme ve ses odası için hazırlanmış web/PWA + Windows native istemcili küçük Discord benzeri projedir.
 
-## V6 Security güncellemesi
+## V7 güvenlik güncellemesi
 
-- Uygulama adı ve logo Gaycord olarak kalır.
-- PostgreSQL bağlıysa hesaplar, sunucular, mesajlar ve uploadlar güncellemelerde silinmez.
-- Security headers ve CSP eklendi.
-- CSRF koruması eklendi.
-- Login/register/message rate-limit eklendi.
-- Session tokenları veritabanında düz token olarak değil SHA-256 hash olarak tutulur.
-- Upload dosyaları artık herkese açık değil; aynı kanala erişimi olan giriş yapmış kullanıcılar görebilir.
-- SVG/HTML/JS/EXE gibi tehlikeli upload türleri engellenir.
-- Ayarlar > Güvenlik bölümü eklendi.
-- Kanal/DM başlığındaki kilit butonuyla opsiyonel E2EE açılabilir.
+- PostgreSQL veri anahtarı aynı kalır: `gaycord_state_v4`. Mevcut kullanıcılar, sunucular, kanallar, mesajlar ve upload kayıtları V7 ile uyumludur.
+- Render `DATABASE_URL` davranışı değiştirilmedi. `DATABASE_URL` veya `POSTGRES_URL` varsa PostgreSQL, yoksa dosya modu kullanılır.
+- Aktif yeni davet kodları 128-bit rastgele hex olarak üretilir. Eski zayıf davet kodları açılışta yeni güçlü kodla değiştirilir.
+- `/api/servers/join` sıkı rate-limit altındadır.
+- REST mesaj oluşturma ve Socket.IO `message:text`, `message:voice`, `message:secure` aynı kullanıcı bazlı rate-limit kovasını paylaşır.
+- Mesaj saklama boyutu mesaj başına, kanal başına ve kullanıcı başına sınırlandırılır.
+- `/api/security/status` admin olmayan kullanıcılara redakte yanıt döndürür.
+- Oturum tokenları veritabanında düz token olarak değil SHA-256 hash olarak tutulur.
+- Upload dosyaları herkese açık değildir; aynı kanala erişimi olan giriş yapmış kullanıcılar görebilir.
+- Tarayıcı `localStorage` içine session token, password hash, backup veya secret yazılmaz. Eski `gaycord:last-light-backup:*` anahtarları temizlenir.
+- E2EE kaldırılmadı. Kanal/DM başlığındaki kilit butonuyla opsiyonel E2EE açılabilir; kapalıyken arayüz net uyarı gösterir.
 
 ## E2EE nasıl çalışır?
 
@@ -23,7 +24,7 @@ Not: E2EE anahtarını unutursan eski şifreli mesajlar açılamaz. Canlı ses o
 
 ## Render ayarı
 
-Kalıcı veri için web service Environment kısmında şu zorunlu:
+Kalıcı veri için web service Environment kısmında şu önerilir:
 
 ```txt
 DATABASE_URL=postgresql://...
@@ -38,9 +39,15 @@ https://gaycord.onrender.com/api/health
 Beklenen önemli alanlar:
 
 ```json
-{ "app": "gaycord-v6.1", "version": "6.1.0", "storageMode": "postgres", "persistentData": true }
+{ "app": "gaycord-v7", "version": "7.0.0", "storageMode": "postgres", "persistentData": true }
 ```
 
-## Güncelleme
+## Testler
 
-Zip içindeki `gaycord-v6.1` klasörünün içindekileri repo köküne kopyala, GitHub Desktop ile commit/push yap. Render otomatik deploy eder.
+```bash
+cd server
+npm ci
+npm run test:security
+```
+
+`test:security` geçici bir dosya veritabanı ile sunucuyu başlatır ve localStorage backup kapalı mı, light export hassas veri sızdırıyor mu, import session restore ediyor mu, `message:secure` rate-limit yiyor mu, büyük E2EE payload reddediliyor mu ve korumalı upload URL'leri auth istiyor mu diye kontrol eder.
