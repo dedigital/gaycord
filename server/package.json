@@ -1,11 +1,12 @@
 {
   "name": "gaycord-server",
-  "version": "6.1.0",
-  "description": "Gaycord V6.1 Security Hotfix: kalıcı veri, güvenlik başlıkları, CSRF, rate limit, korumalı upload ve opsiyonel E2EE.",
+  "version": "7.0.0",
+  "description": "Gaycord V7 Security Hardening: 128-bit invites, shared message limits, protected uploads and optional E2EE.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test:security": "node scripts/security-v7-checks.js"
   },
   "keywords": [
     "chat",

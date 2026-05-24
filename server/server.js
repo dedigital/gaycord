@@ -16,8 +16,8 @@ const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 310000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
 const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4'); // bilerek sabit: güncellemelerde PostgreSQL verisi aynı anahtarda kalır
-const APP_VERSION = '6.1.0';
-const APP_NAME = 'gaycord-v6.1';
+const APP_VERSION = '7.0.0';
+const APP_NAME = 'gaycord-v7';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
 const CSRF_HEADER = 'x-gaycord-csrf';
 const MAX_E2EE_TEXT_BYTES = Number(process.env.MAX_E2EE_TEXT_BYTES || process.env.MAX_E2EE_PAYLOAD_LENGTH || 16 * 1024);
@@ -25,8 +25,14 @@ const MAX_E2EE_METADATA_BYTES = Number(process.env.MAX_E2EE_METADATA_BYTES || 32
 const MAX_SOCKET_EVENT_BYTES = Number(process.env.MAX_SOCKET_EVENT_BYTES || 256 * 1024);
 const MAX_STORED_MESSAGE_BYTES = Number(process.env.MAX_STORED_MESSAGE_BYTES || 48 * 1024);
 const MAX_CHANNEL_MESSAGE_BYTES = Number(process.env.MAX_CHANNEL_MESSAGE_BYTES || 2 * 1024 * 1024);
-const SOCKET_MESSAGE_LIMIT = Number(process.env.SOCKET_MESSAGE_LIMIT || 120);
-const SOCKET_MESSAGE_WINDOW_MS = Number(process.env.SOCKET_MESSAGE_WINDOW_MS || 60 * 1000);
+const MAX_USER_MESSAGE_BYTES = Number(process.env.MAX_USER_MESSAGE_BYTES || 8 * 1024 * 1024);
+const MAX_CHANNEL_MESSAGE_COUNT = Number(process.env.MAX_CHANNEL_MESSAGE_COUNT || 1000);
+const MESSAGE_RATE_LIMIT = Number(process.env.MESSAGE_RATE_LIMIT || process.env.SOCKET_MESSAGE_LIMIT || 120);
+const MESSAGE_RATE_WINDOW_MS = Number(process.env.MESSAGE_RATE_WINDOW_MS || process.env.SOCKET_MESSAGE_WINDOW_MS || 60 * 1000);
+const SOCKET_MESSAGE_LIMIT = MESSAGE_RATE_LIMIT;
+const SOCKET_MESSAGE_WINDOW_MS = MESSAGE_RATE_WINDOW_MS;
+const SERVER_JOIN_RATE_LIMIT = Number(process.env.SERVER_JOIN_RATE_LIMIT || 5);
+const SERVER_JOIN_RATE_WINDOW_MS = Number(process.env.SERVER_JOIN_RATE_WINDOW_MS || 15 * 60 * 1000);
 const MAX_E2EE_PAYLOAD_LENGTH = MAX_E2EE_TEXT_BYTES;
 const SECURITY_LOG_LIMIT = Number(process.env.SECURITY_LOG_LIMIT || 500);
 const TRUSTED_ORIGINS = String(process.env.TRUSTED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
@@ -62,10 +68,20 @@ if (DB_FILE !== LEGACY_DB_FILE && !fs.existsSync(DB_FILE) && fs.existsSync(LEGAC
 
 function now() { return new Date().toISOString(); }
 function id(prefix = '') { return `${prefix}${crypto.randomBytes(10).toString('hex')}`; }
-function inviteCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
+function inviteCode() { return crypto.randomBytes(16).toString('hex').toUpperCase(); }
+function normalizeInviteCode(value) { return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 96); }
+function isStrongInviteCode(value) { return /^[A-F0-9]{32,}$/.test(String(value || '')); }
+function inviteCodeInUse(state, code, exceptServerId = '') {
+  return Object.entries(state.servers || {}).some(([id, server]) => id !== exceptServerId && normalizeInviteCode(server.inviteCode) === code);
+}
+function createUniqueInviteCode(state, exceptServerId = '') {
+  let code = inviteCode();
+  while (inviteCodeInUse(state, code, exceptServerId)) code = inviteCode();
+  return code;
+}
 
 const emptyDb = () => ({
-  version: 6,
+  version: 7,
   adminUserId: '',
   users: {},
   usernameIndex: {},
@@ -91,7 +107,7 @@ function normalizeUsername(username) { return String(username || '').trim().toLo
 
 function normalizeDb(raw) {
   const db = { ...emptyDb(), ...(raw || {}) };
-  db.version = 6;
+  db.version = 7;
   db.users ||= {};
   db.usernameIndex ||= {};
   db.sessions ||= {};
@@ -126,7 +142,14 @@ function normalizeDb(raw) {
     server.id ||= serverId;
     server.name ||= 'Sunucu';
     server.ownerId ||= server.memberIds?.[0] || db.adminUserId || '';
-    server.inviteCode ||= inviteCode();
+    const currentInvite = normalizeInviteCode(server.inviteCode);
+    if (isStrongInviteCode(currentInvite) && !inviteCodeInUse(db, currentInvite, serverId)) {
+      server.inviteCode = currentInvite;
+    } else {
+      if (currentInvite && !server.legacyInviteCode) server.legacyInviteCode = currentInvite;
+      server.inviteCode = createUniqueInviteCode(db, serverId);
+      server.inviteRotatedAt ||= now();
+    }
     server.memberIds ||= [];
     server.channelIds ||= [];
     server.createdAt ||= now();
@@ -198,8 +221,8 @@ async function loadDb() {
 }
 
 async function saveDbNowAsync() {
-  db.meta ||= { version: 6, createdAt: now(), ownerUserId: '' };
-  db.meta.version = 6;
+  db.meta ||= { version: 7, createdAt: now(), ownerUserId: '' };
+  db.meta.version = 7;
   db.meta.updatedAt = now();
   if (pgPool) {
     await pgPool.query(
@@ -225,8 +248,8 @@ function saveDbNow() {
   clearTimeout(saveTimer);
   if (pgPool) saveDbNowAsync().catch((error) => console.error('Veritabani kaydedilemedi:', error));
   else {
-    db.meta ||= { version: 6, createdAt: now(), ownerUserId: '' };
-    db.meta.version = 6;
+    db.meta ||= { version: 7, createdAt: now(), ownerUserId: '' };
+    db.meta.version = 7;
     db.meta.updatedAt = now();
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -428,24 +451,57 @@ function sanitizeMessage(message) {
 function approxStoredBytes(value) {
   try { return Buffer.byteLength(JSON.stringify(value || {}), 'utf8'); } catch { return MAX_STORED_MESSAGE_BYTES + 1; }
 }
+function channelMessageBytes(channelId) {
+  return (db.messages[channelId] || []).reduce((sum, message) => sum + approxStoredBytes(message), 0);
+}
+function userMessageBytes(userId) {
+  let total = 0;
+  for (const list of Object.values(db.messages || {})) {
+    if (!Array.isArray(list)) continue;
+    for (const message of list) if (message?.userId === userId) total += approxStoredBytes(message);
+  }
+  return total;
+}
 function trimChannelMessages(channelId) {
   const list = db.messages[channelId] || [];
-  let total = 0;
-  for (let i = list.length - 1; i >= 0; i -= 1) {
-    total += approxStoredBytes(list[i]);
-    if (list.length - i > 1000 || total > MAX_CHANNEL_MESSAGE_BYTES) {
-      db.messages[channelId] = list.slice(i + 1);
-      return;
+  let total = channelMessageBytes(channelId);
+  while (list.length && (list.length > MAX_CHANNEL_MESSAGE_COUNT || total > MAX_CHANNEL_MESSAGE_BYTES)) {
+    total -= approxStoredBytes(list.shift());
+  }
+  db.messages[channelId] = list;
+}
+function trimUserMessages(userId) {
+  if (!userId) return;
+  let total = userMessageBytes(userId);
+  if (total <= MAX_USER_MESSAGE_BYTES) return;
+  const rows = [];
+  for (const [channelId, list] of Object.entries(db.messages || {})) {
+    if (!Array.isArray(list)) continue;
+    for (const message of list) {
+      if (message?.userId === userId) rows.push({ channelId, id: message.id, createdAt: message.createdAt || '', bytes: approxStoredBytes(message) });
     }
   }
-  if (list.length > 1000) db.messages[channelId] = list.slice(-1000);
+  rows.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || String(a.id).localeCompare(String(b.id)));
+  for (const row of rows) {
+    if (total <= MAX_USER_MESSAGE_BYTES) break;
+    const list = db.messages[row.channelId] || [];
+    const index = list.findIndex((message) => message.id === row.id);
+    if (index < 0) continue;
+    total -= approxStoredBytes(list[index]);
+    list.splice(index, 1);
+  }
+}
+function enforceMessageAggregateLimits(channelId, userId) {
+  trimChannelMessages(channelId);
+  trimUserMessages(userId);
 }
 function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null, encrypted = false, e2ee = null }) {
   const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, encrypted: Boolean(encrypted), e2ee: e2ee || null, createdAt: now() };
-  if (approxStoredBytes(message) > MAX_STORED_MESSAGE_BYTES) throw new Error('Mesaj güvenlik sınırını aşıyor. Büyük dosyaları mesaj gövdesinde değil upload olarak gönder.');
+  const messageBytes = approxStoredBytes(message);
+  if (messageBytes > Math.min(MAX_STORED_MESSAGE_BYTES, MAX_CHANNEL_MESSAGE_BYTES, MAX_USER_MESSAGE_BYTES)) throw new Error('Mesaj güvenlik sınırını aşıyor. Büyük dosyaları mesaj gövdesinde değil upload olarak gönder.');
   db.messages[channelId] ||= [];
   db.messages[channelId].push(message);
-  trimChannelMessages(channelId);
+  enforceMessageAggregateLimits(channelId, userId);
   saveDbSoon();
   return sanitizeMessage(message);
 }
@@ -536,7 +592,7 @@ function cleanLimitedBase64(value, label, maxChars, required = true) {
   const out = String(value || '').trim();
   if (!out && !required) return '';
   if (!out) throw new Error(`${label} eksik.`);
-  if (out.length > maxChars) throw new Error(`${label} çok büyük.`);
+  if (Buffer.byteLength(out, 'utf8') > maxChars) throw new Error(`${label} çok büyük.`);
   if (!/^[a-zA-Z0-9+/=_-]+$/.test(out)) throw new Error(`${label} geçersiz.`);
   return out;
 }
@@ -766,7 +822,7 @@ function rateLimit(name, max, windowMs, keyFn = (req) => clientIp(req)) {
 }
 function socketRateLimit(socket, name, max = SOCKET_MESSAGE_LIMIT, windowMs = SOCKET_MESSAGE_WINDOW_MS) {
   const key = socket?.user?.id || socket?.id || 'unknown';
-  const checked = checkRateLimit(`socket_${name}`, key, max, windowMs);
+  const checked = checkRateLimit(name, key, max, windowMs);
   if (!checked.ok) {
     recordSecurityEvent('socket_rate_limit', { name, userId: socket?.user?.id || '', socketId: socket?.id || '', retryAfter: checked.retryAfter });
     return { ok: false, error: 'Çok hızlı mesaj gönderiyorsun. Biraz bekle.' };
@@ -864,11 +920,23 @@ app.get('/api/security/status', auth, (req, res) => res.json({
   csrf: true,
   rateLimit: true,
   socketRateLimit: true,
+  socketSharesRestMessageRateLimit: true,
   uploadAuthorization: true,
   sessionStorage: 'sha256-token-hash',
-  passwordKdf: `PBKDF2-SHA256/${PBKDF2_ITERATIONS}`,
-  e2ee: { available: true, mode: 'optional per-channel client-side passphrase; AES-GCM via Web Crypto; text ciphertext capped, attachments stored as encrypted uploads', maxTextCiphertextBytes: MAX_E2EE_TEXT_BYTES, maxSocketEventBytes: MAX_SOCKET_EVENT_BYTES, liveVoiceContentE2EE: false, metadataVisible: true },
+  passwordKdf: isAdminUser(req.user) ? `PBKDF2-SHA256/${PBKDF2_ITERATIONS}` : 'redacted',
+  e2ee: {
+    available: true,
+    optional: true,
+    mode: isAdminUser(req.user) ? 'optional per-channel client-side passphrase; AES-GCM via Web Crypto; text ciphertext capped, attachments stored as encrypted uploads' : 'optional client-side encryption',
+    maxTextCiphertextBytes: isAdminUser(req.user) ? MAX_E2EE_TEXT_BYTES : undefined,
+    maxSocketEventBytes: isAdminUser(req.user) ? MAX_SOCKET_EVENT_BYTES : undefined,
+    liveVoiceContentE2EE: false,
+    metadataVisible: true
+  },
   adminAutoLocalBackup: false,
+  inviteCodes: isAdminUser(req.user) ? { activeBits: 128, format: 'hex', joinRateLimit: `${SERVER_JOIN_RATE_LIMIT}/${Math.round(SERVER_JOIN_RATE_WINDOW_MS / 1000)}s` } : 'redacted',
+  aggregateMessageByteLimits: isAdminUser(req.user) ? { perChannel: MAX_CHANNEL_MESSAGE_BYTES, perUser: MAX_USER_MESSAGE_BYTES, perMessage: MAX_STORED_MESSAGE_BYTES } : 'redacted',
+  redacted: !isAdminUser(req.user),
   recentSecurityEvents: isAdminUser(req.user) ? (db.securityEvents || []).slice(-25).reverse() : undefined
 }));
 app.get('/api/csrf', auth, (req, res) => res.json({ csrfToken: getSessionByToken(getTokenFromRequest(req))?.csrfToken || '' }));
@@ -1076,8 +1144,8 @@ app.post('/api/servers', auth, (req, res) => {
   saveDbSoon();
   res.status(201).json({ server: ensureServerView(serverObj, req.user.id) });
 });
-app.post('/api/servers/join', auth, (req, res) => {
-  const code = String(req.body.inviteCode || '').trim().toUpperCase();
+app.post('/api/servers/join', auth, rateLimit('server_join', SERVER_JOIN_RATE_LIMIT, SERVER_JOIN_RATE_WINDOW_MS, (req) => `${req.user?.id || 'anon'}:${clientIp(req)}`), (req, res) => {
+  const code = normalizeInviteCode(req.body.inviteCode);
   const serverObj = Object.values(db.servers).find((server) => server.inviteCode === code);
   if (!serverObj) return res.status(404).json({ error: 'Davet kodu bulunamadı.' });
   if (!serverObj.memberIds.includes(req.user.id)) serverObj.memberIds.push(req.user.id);
@@ -1156,7 +1224,7 @@ app.get('/api/channels/:channelId/messages', auth, (req, res) => {
   if (!canAccessChannel(req.user.id, req.params.channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   res.json({ messages: (db.messages[req.params.channelId] || []).slice(-200).map(sanitizeMessage) });
 });
-app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', 120, 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
+app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', MESSAGE_RATE_LIMIT, MESSAGE_RATE_WINDOW_MS, (req) => req.user?.id || clientIp(req)), (req, res) => {
   try {
     const channelId = req.params.channelId;
     if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
@@ -1290,6 +1358,7 @@ io.on('connection', (socket) => {
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname.startsWith('/socket.io/')) return;
   if (url.pathname !== '/native') return socket.destroy();
   const token = url.searchParams.get('token') || '';
   const user = getUserByToken(token);
@@ -1359,8 +1428,9 @@ wss.on('connection', (ws) => {
 
 async function start() {
   db = await loadDb();
-  console.log(`Gaycord V6 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}${needsPersistentSetup() ? ' | UYARI: Render dosya sistemi geçici; DATABASE_URL veya disk ekle.' : ''}`);
-  server.listen(PORT, () => console.log(`Gaycord V6 çalışıyor: http://localhost:${PORT}`));
+  saveDbSoon();
+  console.log(`Gaycord V7 veri modu: ${storageMode}${storageMode === 'file' ? ` | data=${DATA_DIR}` : ''}${needsPersistentSetup() ? ' | UYARI: Render dosya sistemi geçici; DATABASE_URL veya disk ekle.' : ''}`);
+  server.listen(PORT, () => console.log(`Gaycord V7 çalışıyor: http://localhost:${PORT}`));
 }
 
 start().catch((error) => {

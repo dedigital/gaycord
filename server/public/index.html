@@ -9,7 +9,7 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/brand/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/brand/icon-192.png">
-  <link rel="stylesheet" href="/styles.css?v=6.0">
+  <link rel="stylesheet" href="/styles.css?v=7.0.1">
 </head>
 <body>
   <main id="auth" class="auth-shell hidden">
@@ -17,7 +17,7 @@
       <div class="auth-glow"></div>
       <div class="brand-block hero-brand">
         <img class="brand-logo" src="/brand/gaycord-logo.png" alt="Gaycord logosu">
-        <div><p class="eyebrow">V6 Security</p><h1>Gaycord</h1><p>Sunucu kur, DM aç, fotoğraf/dosya gönder, sesli mesaj bırak ve ses odasına katıl.</p></div>
+        <div><p class="eyebrow">V7 Security</p><h1>Gaycord</h1><p>Sunucu kur, DM aç, fotoğraf/dosya gönder, sesli mesaj bırak ve ses odasına katıl.</p></div>
       </div>
       <div class="tabs" role="tablist" aria-label="Giriş seçenekleri">
         <button id="loginTab" class="tab active" type="button">Giriş</button>
@@ -68,6 +68,7 @@
         <div class="chat-actions"><button id="e2eeButton" class="ghost hidden" type="button" title="Uçtan uca şifreleme">🔓 E2EE</button><button id="copyInviteButton" class="ghost hidden" type="button">Davet kodu</button></div>
       </header>
       <section id="voicePanel" class="voice-panel hidden" aria-live="polite"></section>
+      <section id="e2eeWarning" class="e2ee-warning hidden" aria-live="polite"></section>
       <div id="messages" class="messages" aria-live="polite"></div>
       <div id="typingLine" class="typing-line"></div>
       <form id="messageForm" class="composer">
@@ -94,6 +95,6 @@
   <div id="remoteAudio" class="remote-audio" aria-hidden="true"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/app.js?v=6.0" defer></script>
+  <script src="/app.js?v=7.0.1" defer></script>
 </body>
 </html>
