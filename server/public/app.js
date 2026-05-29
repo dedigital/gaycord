@@ -38,13 +38,16 @@ const state = {
   recordChannelId: '',
   recordMaxTimer: null,
   sendingFile: false,
-  voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null },
+  voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null, keepaliveTimer: null, reconnectGraceTimer: null, reconnecting: false, manualLeave: false, peerRestartTimers: new Map() },
   publicStatus: null,
   autoBackupTimer: null,
   e2ee: { passphrases: new Map(), enabled: new Set(), objectUrls: new Map() }
 };
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+const VOICE_KEEPALIVE_MS = 27000;
+const VOICE_RECONNECT_GRACE_MS = 90000;
+const VOICE_ICE_RESTART_DELAY_MS = 5000;
 
 function toast(message) {
   els.toast.textContent = String(message || '');
@@ -639,15 +642,23 @@ async function openChannel(channel, context = {}) {
 function connectSocket() {
   if (state.socket) state.socket.disconnect();
   state.socket = io();
-  state.socket.on('connect', () => { els.connectionState.textContent = 'çevrimiçi'; els.connectionState.classList.remove('offline'); });
-  state.socket.on('disconnect', () => { els.connectionState.textContent = 'çevrimdışı'; els.connectionState.classList.add('offline'); cleanupVoice(false); });
+  state.socket.on('connect', () => {
+    els.connectionState.textContent = 'çevrimiçi';
+    els.connectionState.classList.remove('offline');
+    rejoinVoiceAfterReconnect().catch((error) => console.warn('voice rejoin error', error));
+  });
+  state.socket.on('disconnect', () => {
+    els.connectionState.textContent = 'çevrimdışı';
+    els.connectionState.classList.add('offline');
+    startVoiceReconnectGrace();
+  });
   state.socket.on('connect_error', (error) => { els.connectionState.textContent = 'hata'; els.connectionState.classList.add('offline'); toast(error.message || 'Bağlantı hatası.'); });
   state.socket.on('presence:update', ({ onlineIds }) => { state.onlineIds = new Set(onlineIds || []); renderMe(); if (state.view === 'home') renderFriendsPanel(); else if (state.currentServerId) refreshMe({ keepPanel: true }).catch(() => {}); });
   state.socket.on('message:new', (message) => appendMessage(message));
   state.socket.on('typing', ({ channelId, user, isTyping }) => { if (channelId !== state.currentChannelId || !isTyping || user?.id === state.user?.id) return; els.typingLine.textContent = `${user.displayName || user.username} yazıyor...`; clearTimeout(state.remoteTypingTimeout); state.remoteTypingTimeout = setTimeout(() => { els.typingLine.textContent = ''; }, 1500); });
   state.socket.on('server:updated', ({ server } = {}) => { if (!server) return; replaceServer(server); renderRail(); if (state.currentServerId === server.id) renderServerPanel(server.id); });
-  state.socket.on('server:deleted', ({ serverId } = {}) => { state.servers = state.servers.filter((server) => server.id !== serverId); if (state.currentServerId === serverId) { cleanupVoice(false); renderFriendsPanel(); resetChat('Sunucu silindi', 'Başka bir sunucu seç.'); } else renderRail(); });
-  state.socket.on('channel:deleted', ({ channelId, serverId } = {}) => { if (state.voice.channelId === channelId) cleanupVoice(false); if (state.currentChannelId === channelId) resetChat('Kanal silindi', 'Başka bir kanal seç.'); const server = state.servers.find((s) => s.id === serverId); if (server) server.channels = server.channels.filter((c) => c.id !== channelId); if (state.currentServerId === serverId) renderServerPanel(serverId); });
+  state.socket.on('server:deleted', ({ serverId } = {}) => { state.servers = state.servers.filter((server) => server.id !== serverId); if (state.currentServerId === serverId) { cleanupVoice({ manual: true }); renderFriendsPanel(); resetChat('Sunucu silindi', 'Başka bir sunucu seç.'); } else renderRail(); });
+  state.socket.on('channel:deleted', ({ channelId, serverId } = {}) => { if (state.voice.channelId === channelId) cleanupVoice({ manual: true }); if (state.currentChannelId === channelId) resetChat('Kanal silindi', 'Başka bir kanal seç.'); const server = state.servers.find((s) => s.id === serverId); if (server) server.channels = server.channels.filter((c) => c.id !== channelId); if (state.currentServerId === serverId) renderServerPanel(serverId); });
   state.socket.on('data:imported', () => { toast('Yedek yüklendi; sayfa yenileniyor.'); setTimeout(() => location.reload(), 900); });
   state.socket.on('voice:user_joined', ({ channelId, peer } = {}) => { if (channelId !== state.voice.channelId || !peer?.socketId || peer.socketId === state.voice.selfId) return; createPeer(peer.socketId, peer.user); renderVoicePanel(); });
   state.socket.on('voice:user_left', ({ socketId } = {}) => { if (socketId) closePeer(socketId); });
@@ -811,6 +822,105 @@ async function sendFiles(files) { for (const file of [...(files || [])]) await s
 
 function canCallCurrentChannel() { return Boolean(state.currentChannelId && (state.currentChannel?.kind === 'voice' || state.currentChannel?.type === 'dm')); }
 function callLabel() { return state.currentChannel?.type === 'dm' ? 'DM araması' : `🔊 ${state.currentChannel?.name || 'Sesli oda'}`; }
+function freshVoiceState(overrides = {}) {
+  return {
+    channelId: null,
+    stream: null,
+    peers: new Map(),
+    participants: new Map(),
+    muted: false,
+    selfId: state.socket?.id || null,
+    keepaliveTimer: null,
+    reconnectGraceTimer: null,
+    reconnecting: false,
+    manualLeave: false,
+    peerRestartTimers: new Map(),
+    ...overrides
+  };
+}
+function clearVoiceKeepalive() {
+  if (state.voice.keepaliveTimer) clearInterval(state.voice.keepaliveTimer);
+  state.voice.keepaliveTimer = null;
+}
+function clearVoiceReconnectGrace() {
+  if (state.voice.reconnectGraceTimer) clearTimeout(state.voice.reconnectGraceTimer);
+  state.voice.reconnectGraceTimer = null;
+}
+function clearPeerRestartTimer(socketId) {
+  const timer = state.voice.peerRestartTimers?.get(socketId);
+  if (timer) clearTimeout(timer);
+  state.voice.peerRestartTimers?.delete(socketId);
+}
+async function sendVoiceKeepalive() {
+  const channelId = state.voice.channelId;
+  if (!channelId || !state.voice.stream) return;
+  try { await api('/api/voice/keepalive', { method: 'POST', body: { channelId } }); } catch (e) { console.warn('voice keepalive error', e); }
+  if (state.socket?.connected) state.socket.emit('voice:ping', { channelId }, () => {});
+}
+function startVoiceKeepalive() {
+  clearVoiceKeepalive();
+  if (!state.voice.channelId || !state.voice.stream) return;
+  state.voice.keepaliveTimer = setInterval(() => { sendVoiceKeepalive().catch(() => {}); }, VOICE_KEEPALIVE_MS);
+  sendVoiceKeepalive().catch(() => {});
+}
+function startVoiceReconnectGrace() {
+  if (!state.voice.channelId || !state.voice.stream || state.voice.manualLeave) return;
+  const alreadyReconnecting = state.voice.reconnecting;
+  state.voice.reconnecting = true;
+  clearVoiceReconnectGrace();
+  state.voice.reconnectGraceTimer = setTimeout(() => {
+    if (!state.voice.manualLeave && state.voice.reconnecting) {
+      toast('Ses bağlantısı zaman aşımına uğradı.');
+      cleanupVoice({ manual: false });
+    }
+  }, VOICE_RECONNECT_GRACE_MS);
+  renderVoicePanel();
+  if (!alreadyReconnecting) toast('Bağlantı koptu, ses odasına yeniden bağlanılıyor...');
+}
+function closeAllVoicePeers() {
+  for (const socketId of [...state.voice.peers.keys()]) closePeer(socketId);
+}
+function emitVoiceJoin(channelId) {
+  return new Promise((resolve, reject) => {
+    if (!state.socket?.connected) return reject(new Error('Önce sunucu bağlantısı kurulmalı.'));
+    state.socket.emit('voice:join', { channelId }, async (response) => {
+      if (response?.error) return reject(new Error(response.error));
+      try {
+        state.voice.channelId = channelId;
+        state.voice.selfId = response.selfId || state.socket.id;
+        state.voice.manualLeave = false;
+        state.voice.reconnecting = false;
+        state.voice.participants.clear();
+        for (const member of response.members || []) state.voice.participants.set(member.id, { user: member });
+        for (const peer of response.peers || []) { createPeer(peer.socketId, peer.user); await offerPeer(peer.socketId); }
+        startVoiceKeepalive();
+        renderVoicePanel(response.members || null);
+        resolve(response);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+async function rejoinVoiceAfterReconnect() {
+  const channelId = state.voice.channelId;
+  if (!channelId || !state.voice.stream || state.voice.manualLeave) return;
+  state.voice.reconnecting = true;
+  closeAllVoicePeers();
+  state.voice.participants.clear();
+  renderVoicePanel();
+  try {
+    await emitVoiceJoin(channelId);
+    clearVoiceReconnectGrace();
+    state.voice.reconnecting = false;
+    renderVoicePanel();
+    toast('Ses odasına yeniden bağlandın.');
+  } catch (e) {
+    state.voice.reconnecting = true;
+    renderVoicePanel();
+    toast(e.message || 'Ses odasına yeniden bağlanılamadı.');
+  }
+}
 function renderVoicePanel(serverMembers = null) {
   const inCall = Boolean(state.voice.channelId);
   const viewingCallable = canCallCurrentChannel();
@@ -819,9 +929,10 @@ function renderVoicePanel(serverMembers = null) {
   const members = serverMembers || [...state.voice.participants.values()].map((p) => p.user || p).filter(Boolean);
   const count = inCall ? Math.max(1, members.filter((m) => m.id !== state.user?.id).length + 1) : 0;
   const activeHere = inCall && state.voice.channelId === state.currentChannelId;
-  const title = activeHere ? callLabel() : (inCall ? 'Başka bir ses kanalındasın' : callLabel());
+  const title = state.voice.reconnecting ? 'Bağlantı koptu, ses odasına yeniden bağlanılıyor...' : (activeHere ? callLabel() : (inCall ? 'Başka bir ses kanalındasın' : callLabel()));
+  const status = state.voice.reconnecting ? 'mikrofon açık tutuluyor' : `${count} kişi bağlı • ${state.voice.muted ? 'mikrofon kapalı' : 'mikrofon açık'}`;
   els.voicePanel.innerHTML = `
-    <div class="min-0"><strong>${escapeHTML(title)}</strong><small>${inCall ? `${count} kişi bağlı • ${state.voice.muted ? 'mikrofon kapalı' : 'mikrofon açık'}` : 'Canlı konuşmak için katıl.'}</small></div>
+    <div class="min-0"><strong>${escapeHTML(title)}</strong><small>${inCall ? status : 'Canlı konuşmak için katıl.'}</small></div>
     <div class="voice-members">${inCall ? `<span class="voice-chip">Sen ${state.voice.muted ? '🔇' : '🎙'}</span>${members.filter((m) => m.id !== state.user?.id).map((m) => `<span class="voice-chip">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</span>`).join('')}` : '<span class="voice-chip">Hazır</span>'}</div>
     <div class="voice-actions">${inCall ? '<button id="muteVoiceButton" class="ghost" type="button">' + (state.voice.muted ? 'Mikrofonu aç' : 'Mikrofonu kapat') + '</button><button id="leaveVoiceButton" class="ghost danger" type="button">Ayrıl</button>' : '<button id="joinVoiceButton" class="primary" type="button">Sese katıl</button>'}</div>`;
   $('joinVoiceButton')?.addEventListener('click', joinVoice);
@@ -840,10 +951,36 @@ function createPeer(socketId, user) {
     if (!audio) { audio = document.createElement('audio'); audio.id = `remote-${socketId}`; audio.autoplay = true; audio.playsInline = true; els.remoteAudio.appendChild(audio); }
     audio.srcObject = event.streams[0]; audio.play?.().catch(() => {});
   };
-  pc.onconnectionstatechange = () => { if (['closed', 'failed', 'disconnected'].includes(pc.connectionState)) closePeer(socketId); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'closed') { closePeer(socketId); return; }
+    if (pc.connectionState === 'failed') { restartPeerIce(socketId).catch(() => closePeer(socketId)); return; }
+    if (pc.connectionState === 'disconnected') {
+      clearPeerRestartTimer(socketId);
+      const timer = setTimeout(() => {
+        const current = state.voice.peers.get(socketId);
+        if (current?.connectionState === 'disconnected') restartPeerIce(socketId).catch((error) => console.warn('voice ice restart error', error));
+      }, VOICE_ICE_RESTART_DELAY_MS);
+      state.voice.peerRestartTimers.set(socketId, timer);
+      return;
+    }
+    if (pc.connectionState === 'connected') clearPeerRestartTimer(socketId);
+  };
   renderVoicePanel(); return pc;
 }
-async function offerPeer(socketId) { const pc = state.voice.peers.get(socketId); if (!pc) return; const offer = await pc.createOffer(); await pc.setLocalDescription(offer); state.socket?.emit('voice:signal', { to: socketId, signal: { description: pc.localDescription } }); }
+async function offerPeer(socketId, options = {}) {
+  const pc = state.voice.peers.get(socketId);
+  if (!pc || pc.connectionState === 'closed') return;
+  const offer = await pc.createOffer(options.iceRestart ? { iceRestart: true } : undefined);
+  await pc.setLocalDescription(offer);
+  state.socket?.emit('voice:signal', { to: socketId, signal: { description: pc.localDescription } });
+}
+async function restartPeerIce(socketId) {
+  const pc = state.voice.peers.get(socketId);
+  if (!pc || !state.socket?.connected || pc.connectionState === 'closed') return;
+  clearPeerRestartTimer(socketId);
+  try { pc.restartIce?.(); } catch {}
+  await offerPeer(socketId, { iceRestart: true });
+}
 async function handleVoiceSignal({ from, user, signal } = {}) {
   if (!from || !signal || !state.voice.channelId) return;
   const pc = createPeer(from, user); if (!pc) return;
@@ -852,7 +989,15 @@ async function handleVoiceSignal({ from, user, signal } = {}) {
     else if (signal.candidate) await pc.addIceCandidate(signal.candidate);
   } catch (e) { console.warn('voice signal error', e); }
 }
-function closePeer(socketId) { const pc = state.voice.peers.get(socketId); try { pc?.close(); } catch {} state.voice.peers.delete(socketId); state.voice.participants.delete(socketId); document.getElementById(`remote-${socketId}`)?.remove(); renderVoicePanel(); }
+function closePeer(socketId) {
+  const pc = state.voice.peers.get(socketId);
+  clearPeerRestartTimer(socketId);
+  state.voice.peers.delete(socketId);
+  state.voice.participants.delete(socketId);
+  document.getElementById(`remote-${socketId}`)?.remove();
+  try { if (pc && pc.connectionState !== 'closed') pc.close(); } catch {}
+  renderVoicePanel();
+}
 async function joinVoice() {
   if (!state.socket?.connected) return toast('Önce sunucu bağlantısı kurulmalı.');
   if (!canCallCurrentChannel()) return toast('Bir ses kanalı veya DM seç.');
@@ -861,19 +1006,34 @@ async function joinVoice() {
   if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast('Tarayıcı canlı sesi desteklemiyor.');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-    state.voice = { channelId: state.currentChannelId, stream, peers: new Map(), participants: new Map(), muted: false, selfId: state.socket.id };
+    state.voice = freshVoiceState({ channelId: state.currentChannelId, stream, selfId: state.socket.id, manualLeave: false });
     renderVoicePanel();
-    state.socket.emit('voice:join', { channelId: state.currentChannelId }, async (response) => {
-      if (response?.error) { toast(response.error); cleanupVoice(false); return; }
-      state.voice.selfId = response.selfId || state.socket.id;
-      for (const member of response.members || []) state.voice.participants.set(member.id, { user: member });
-      for (const peer of response.peers || []) { createPeer(peer.socketId, peer.user); await offerPeer(peer.socketId); }
-      renderVoicePanel(response.members || null); toast('Sesli odaya bağlandın.');
-    });
-  } catch { toast('Mikrofon izni alınamadı.'); cleanupVoice(false); }
+    await emitVoiceJoin(state.currentChannelId);
+    toast('Sesli odaya bağlandın.');
+  } catch (e) {
+    toast(e.message || 'Mikrofon izni alınamadı.');
+    cleanupVoice({ manual: false });
+  }
 }
-async function leaveVoice(emit = true) { if (emit && state.socket?.connected && state.voice.channelId) state.socket.emit('voice:leave', {}, () => {}); cleanupVoice(false); }
-function cleanupVoice() { for (const socketId of [...state.voice.peers.keys()]) closePeer(socketId); state.voice.stream?.getTracks().forEach((track) => track.stop()); state.voice = { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: state.socket?.id || null }; els.remoteAudio.innerHTML = ''; renderVoicePanel(); }
+async function leaveVoice(emit = true) {
+  state.voice.manualLeave = true;
+  clearVoiceKeepalive();
+  clearVoiceReconnectGrace();
+  if (emit && state.socket?.connected && state.voice.channelId) state.socket.emit('voice:leave', {}, () => {});
+  cleanupVoice({ manual: true });
+}
+function cleanupVoice(options = {}) {
+  const manual = typeof options === 'boolean' ? options : Boolean(options.manual);
+  state.voice.manualLeave = manual;
+  clearVoiceKeepalive();
+  clearVoiceReconnectGrace();
+  for (const socketId of [...(state.voice.peerRestartTimers?.keys() || [])]) clearPeerRestartTimer(socketId);
+  closeAllVoicePeers();
+  state.voice.stream?.getTracks().forEach((track) => track.stop());
+  state.voice = freshVoiceState({ manualLeave: manual });
+  els.remoteAudio.innerHTML = '';
+  renderVoicePanel();
+}
 function toggleMute() { if (!state.voice.stream) return; state.voice.muted = !state.voice.muted; state.voice.stream.getAudioTracks().forEach((track) => { track.enabled = !state.voice.muted; }); renderVoicePanel(); }
 
 async function showSettings() {
@@ -947,7 +1107,7 @@ function wireEvents() {
   els.settingsButton.addEventListener('click', showSettings);
   els.createServerButton.addEventListener('click', async () => { const name = prompt('Sunucu adı?', 'Bizim Ekip'); if (!name) return; try { const data = await api('/api/servers', { method: 'POST', body: { name } }); replaceServer(data.server); renderServerPanel(data.server.id); const first = data.server.channels?.find((c) => c.kind !== 'voice') || data.server.channels?.[0]; if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`, inviteCode: data.server.inviteCode, serverId: data.server.id }); } catch (e) { toast(e.message); } });
   els.joinServerButton.addEventListener('click', async () => { const inviteCode = prompt('Davet kodu?'); if (!inviteCode) return; try { const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode } }); replaceServer(data.server); renderServerPanel(data.server.id); toast('Sunucuya katıldın.'); } catch (e) { toast(e.message); } });
-  els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); state.socket?.disconnect(); cleanupVoice(false); purgeLegacySensitiveLocalBackups(); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); state.user = null; showAuth(); });
+  els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); cleanupVoice({ manual: true }); state.socket?.disconnect(); purgeLegacySensitiveLocalBackups(); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
   els.e2eeButton?.addEventListener('click', promptE2eeKey);
   els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });

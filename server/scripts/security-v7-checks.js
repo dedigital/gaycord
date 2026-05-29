@@ -196,7 +196,7 @@ async function main() {
   try {
     const health = await waitForHealth(baseUrl, child);
     assert.equal(health.storageMode, 'file');
-    assert.equal(health.version, '7.0.0');
+    assert.equal(health.version, '7.2.0');
 
     const admin = await register(baseUrl, 'admin_v7');
     const created = await api(baseUrl, '/api/servers', { method: 'POST', session: admin, body: { name: 'V7 Lab' } });
@@ -205,6 +205,22 @@ async function main() {
     assert(/^[A-F0-9]{32,}$/.test(server.inviteCode), 'invite code must be at least 128-bit hex');
     const channel = server.channels.find((item) => item.kind === 'text');
     assert(channel, 'expected text channel');
+    const voiceChannel = server.channels.find((item) => item.kind === 'voice');
+    assert(voiceChannel, 'expected voice channel');
+
+    const keepalive = await api(baseUrl, '/api/voice/keepalive', { method: 'POST', session: admin, body: { channelId: voiceChannel.id } });
+    assert.equal(keepalive.response.status, 200, JSON.stringify(keepalive.json));
+    assert.equal(keepalive.json.ok, true, 'voice keepalive must return ok');
+    assert.equal(keepalive.json.channelId, voiceChannel.id, 'voice keepalive must echo channelId');
+    assert(keepalive.json.time, 'voice keepalive must return a server time');
+
+    const voiceSocket = connectSocketIo(baseUrl, admin);
+    const joinedVoice = await voiceSocket.emit('voice:join', { channelId: voiceChannel.id });
+    assert.equal(joinedVoice.ok, true, JSON.stringify(joinedVoice));
+    const voicePing = await voiceSocket.emit('voice:ping', { channelId: voiceChannel.id });
+    voiceSocket.close();
+    assert.equal(voicePing.ok, true, JSON.stringify(voicePing));
+    assert.equal(voicePing.channelId, voiceChannel.id, 'voice:ping must ack the active voice channel');
 
     const restWarmup = await api(baseUrl, `/api/channels/${channel.id}/messages`, {
       method: 'POST',
@@ -279,7 +295,7 @@ async function main() {
     const storedDb = JSON.parse(fs.readFileSync(dbFile, 'utf8'));
     assert.deepEqual(storedDb.sessions, {}, 'import must not restore sessions');
 
-    console.log('V7 security checks passed');
+    console.log('V7.2 security and voice checks passed');
   } catch (error) {
     error.message += `\n\nServer output:\n${output}`;
     throw error;
