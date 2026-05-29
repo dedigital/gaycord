@@ -16,13 +16,16 @@ const PBKDF2_ITERATIONS = Number(process.env.PBKDF2_ITERATIONS || 310000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const DATABASE_URL = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '');
 const DB_STATE_KEY = String(process.env.DB_STATE_KEY || 'gaycord_state_v4'); // bilerek sabit: güncellemelerde PostgreSQL verisi aynı anahtarda kalır
-const APP_VERSION = '7.0.0';
+const APP_VERSION = '7.2.0';
 const APP_NAME = 'gaycord-v7';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 30);
 const CSRF_HEADER = 'x-gaycord-csrf';
 const MAX_E2EE_TEXT_BYTES = Number(process.env.MAX_E2EE_TEXT_BYTES || process.env.MAX_E2EE_PAYLOAD_LENGTH || 16 * 1024);
 const MAX_E2EE_METADATA_BYTES = Number(process.env.MAX_E2EE_METADATA_BYTES || 32 * 1024);
 const MAX_SOCKET_EVENT_BYTES = Number(process.env.MAX_SOCKET_EVENT_BYTES || 256 * 1024);
+const SOCKET_PING_INTERVAL_MS = Number(process.env.SOCKET_PING_INTERVAL_MS || 20 * 1000);
+const SOCKET_PING_TIMEOUT_MS = Number(process.env.SOCKET_PING_TIMEOUT_MS || 120 * 1000);
+const SOCKET_RECOVERY_MAX_MS = Number(process.env.SOCKET_RECOVERY_MAX_MS || 120 * 1000);
 const MAX_STORED_MESSAGE_BYTES = Number(process.env.MAX_STORED_MESSAGE_BYTES || 48 * 1024);
 const MAX_CHANNEL_MESSAGE_BYTES = Number(process.env.MAX_CHANNEL_MESSAGE_BYTES || 2 * 1024 * 1024);
 const MAX_USER_MESSAGE_BYTES = Number(process.env.MAX_USER_MESSAGE_BYTES || 8 * 1024 * 1024);
@@ -880,7 +883,13 @@ function securityHeaders(req, res, next) {
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: MAX_SOCKET_EVENT_BYTES, cors: { origin: false } });
+const io = new Server(server, {
+  maxHttpBufferSize: MAX_SOCKET_EVENT_BYTES,
+  pingInterval: SOCKET_PING_INTERVAL_MS,
+  pingTimeout: SOCKET_PING_TIMEOUT_MS,
+  connectionStateRecovery: { maxDisconnectionDuration: SOCKET_RECOVERY_MAX_MS, skipMiddlewares: false },
+  cors: { origin: false }
+});
 const wss = new WebSocketServer({ noServer: true });
 
 app.use(securityHeaders);
@@ -940,6 +949,11 @@ app.get('/api/security/status', auth, (req, res) => res.json({
   recentSecurityEvents: isAdminUser(req.user) ? (db.securityEvents || []).slice(-25).reverse() : undefined
 }));
 app.get('/api/csrf', auth, (req, res) => res.json({ csrfToken: getSessionByToken(getTokenFromRequest(req))?.csrfToken || '' }));
+app.post('/api/voice/keepalive', auth, (req, res) => {
+  const channelId = String(req.body?.channelId || '');
+  if (!canUseLiveVoice(req.user.id, channelId)) return res.status(403).json({ error: 'Ses kanalına erişimin yok.' });
+  res.json({ ok: true, channelId, time: now() });
+});
 app.post('/api/security/logout-all', auth, (req, res) => {
   for (const [key, session] of Object.entries(db.sessions || {})) if (session.userId === req.user.id) delete db.sessions[key];
   saveDbSoon();
@@ -1321,6 +1335,7 @@ io.on('connection', (socket) => {
     if (!canUseLiveVoice(userId, channelId)) return callback({ error: 'Ses kanalına erişimin yok.' });
     leaveWebVoice(socket);
     socket.voiceChannelId = channelId;
+    socket.voiceLastSeenAt = now();
     webVoiceClients.set(socket.id, { channelId, user: publicUser(socket.user) });
     socket.join(`voice:${channelId}`);
     const peers = [...webVoiceClients.entries()].filter(([socketId, item]) => socketId !== socket.id && item.channelId === channelId).map(([socketId, item]) => ({ socketId, user: item.user }));
@@ -1328,6 +1343,12 @@ io.on('connection', (socket) => {
     socket.to(`voice:${channelId}`).emit('voice:user_joined', { channelId, peer: { socketId: socket.id, user: publicUser(socket.user) } });
     broadcastNative('voice:user_joined', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
     emitVoiceMembers(channelId);
+  });
+  socket.on('voice:ping', ({ channelId } = {}, callback = () => {}) => {
+    const targetChannelId = String(channelId || socket.voiceChannelId || '');
+    if (!targetChannelId || !canUseLiveVoice(userId, targetChannelId)) return callback({ error: 'Ses kanalına erişimin yok.' });
+    socket.voiceLastSeenAt = now();
+    callback({ ok: true, channelId: targetChannelId, time: socket.voiceLastSeenAt });
   });
   socket.on('voice:leave', (_data = {}, callback = () => {}) => { leaveWebVoice(socket); callback({ ok: true }); });
   socket.on('voice:frame', ({ channelId, pcmBase64 } = {}) => {

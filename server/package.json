@@ -1,7 +1,7 @@
 {
   "name": "gaycord-server",
-  "version": "7.0.0",
-  "description": "Gaycord V7 Security Hardening: 128-bit invites, shared message limits, protected uploads and optional E2EE.",
+  "version": "7.2.0",
+  "description": "Gaycord V7.2 Voice Stability Hotfix: keepalive, reconnect grace and WebRTC ICE recovery.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
