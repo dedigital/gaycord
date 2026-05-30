@@ -559,6 +559,14 @@ body[data-theme="rainbow"] { --brand: #ec4899; --brand-2: #22d3ee; --accent-grad
 
 /* Profile modal */
 .modal-overlay { position: fixed; inset: 0; z-index: 95; display: grid; place-items: center; padding: 16px; background: rgba(0,0,0,.6); backdrop-filter: blur(4px); }
+.modal-card { width: min(420px, 100%); border-radius: 18px; padding: 20px; display: grid; gap: 14px; background: rgba(14,18,32,.98); border: 1px solid var(--line-2); box-shadow: var(--shadow); }
+.modal-title { font-size: 17px; color: #f2f4fa; }
+.modal-body { color: #9aa6c2; overflow-wrap: anywhere; }
+.modal-card input { width: 100%; padding: 11px 12px; border-radius: 12px; background: rgba(0,0,0,.25); border: 1px solid var(--line-2); color: #f2f4fa; font: inherit; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+.modal-actions button { min-height: 44px; min-width: 96px; }
+.invite-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; margin: 0 2px; border-radius: 999px; background: rgba(88,101,242,.18); border: 1px solid rgba(88,101,242,.45); color: #c9d2ff; font-weight: 800; font-size: .92em; cursor: pointer; vertical-align: baseline; }
+.invite-chip:hover { background: rgba(88,101,242,.3); }
 .profile-card { width: min(380px, 100%); border-radius: 22px; overflow: hidden; background: rgba(14,18,32,.98); border: 1px solid var(--line-2); box-shadow: var(--shadow); }
 .profile-banner { height: 110px; background: linear-gradient(135deg, var(--brand), var(--brand-2)); background-size: cover; background-position: center; }
 .profile-body { padding: 0 18px 18px; display: grid; gap: 4px; justify-items: start; }

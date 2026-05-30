@@ -215,6 +215,17 @@ async function main() {
 
   // --- V7.3 static UI / composer / E2EE / asset checks ---
   const indexHtml = read('public/index.html');
+  // ---- V7.9 invite crash hotfix + stability guardrails ----
+  assert(/function safeInviteClick\(/.test(appJs), 'V7.9 guarded invite-click handler exists');
+  assert(/let inviteJoinPending = false/.test(appJs) && /if \(inviteJoinPending\) return;/.test(appJs), 'V7.9 invite join is debounced (single in-flight)');
+  assert(!/prompt\('Davet kodu/.test(appJs), 'V7.9 no window.prompt() for invite join');
+  assert(/function openJoinByCodeModal\(/.test(appJs), 'V7.9 in-app join-by-code modal exists');
+  assert(/function inviteChip\(/.test(appJs) && /function linkifyMessageInto\(/.test(appJs), 'V7.9 invite chip + linkify exist');
+  assert(/chip\.textContent =/.test(appJs) && !/chip\.innerHTML/.test(appJs), 'V7.9 invite chip uses textContent, not innerHTML');
+  assert(/function installGlobalErrorBoundary\(/.test(appJs) && /addEventListener\('unhandledrejection'/.test(appJs), 'V7.9 global error boundary exists');
+  assert(/function bootstrap\(\) \{\s*[\r\n]\s*installGlobalErrorBoundary\(\);/.test(appJs), 'V7.9 error boundary installs first in bootstrap');
+  assert(/id="mobileSettingsButton"/.test(indexHtml), 'V7.9 mobile Settings button present in header');
+  assert(/getElementById\('mobileSettingsButton'\)\?\.addEventListener\('click'/.test(appJs), 'V7.9 mobile Settings button is wired');
   const stylesCss = read('public/styles.css');
   const swJs = read('public/sw.js');
   const serverJs = read('server.js');
@@ -240,11 +251,11 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.7.0', 'mobile.css?v=7.7.0', 'app.js?v=7.7.0', 'mobile.js?v=7.7.0']) {
+  for (const asset of ['styles.css?v=7.9.0', 'mobile.css?v=7.9.0', 'app.js?v=7.9.0', 'mobile.js?v=7.9.0']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-7-shell'/.test(swJs), 'service worker cache name must be bumped for V7.7');
+  assert(/CACHE_NAME = 'gaycord-v7-9-shell'/.test(swJs), 'service worker cache name must be bumped for V7.9');
 
   // --- V7.7 voice clarity / game ducking static checks ---
   // No NEW sensitive localStorage keys: every localStorage.setItem must still be a gaycord:voice-* pref.

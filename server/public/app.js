@@ -1027,7 +1027,7 @@ function buildPlainArticle(message) {
     else if (!state.settings.compactMode && mime.startsWith('audio/')) { const audio = document.createElement('audio'); audio.src = url; audio.controls = true; audio.preload = 'metadata'; bubble.appendChild(audio); }
     const link = document.createElement('a'); link.className = 'message-file'; link.href = url; link.target = '_blank'; link.rel = 'noopener'; link.textContent = `📎 ${message.fileName || 'dosya'} ${formatBytes(message.sizeBytes)}`; bubble.appendChild(link);
   } else {
-    const text = document.createElement('div'); text.className = 'message-body'; text.textContent = message.text || ''; bubble.appendChild(text);
+    const text = document.createElement('div'); text.className = 'message-body'; linkifyMessageInto(text, message.text || ''); bubble.appendChild(text);
   }
   article.append(avatar, bubble);
   decorateBubble(bubble, message);
@@ -1151,6 +1151,149 @@ async function leaveServer(server) {
   if (!confirm(`${server.name} sunucusundan çıkmak istiyor musun?`)) return;
   try { await api(`/api/servers/${server.id}/leave`, { method: 'POST', body: {} }); state.servers = state.servers.filter((item) => item.id !== server.id); toast('Sunucudan çıkıldı.'); renderFriendsPanel(); } catch (e) { toast(e.message); }
 }
+// ===================== V7.9 Invite crash hotfix + stability guardrails =====================
+// Invite codes are normalized to the server's stored form (uppercase hex) so validation and the
+// already-member check are reliable however a code was typed/pasted. Exactly one join may be in
+// flight (debounce), and every entry point is wrapped so a bad invite can never freeze/white-screen.
+let inviteJoinPending = false;
+function normalizeInviteCodeClient(code) {
+  return String(code || '').trim().toUpperCase().replace(/[^A-F0-9]/g, '');
+}
+function isValidInviteCodeClient(code) {
+  return /^[A-F0-9]{32,}$/.test(code);
+}
+// Best-effort switch to a server we just joined / already belong to. A render failure here must never
+// bubble out of a click handler.
+function switchToJoinedServer(server) {
+  if (!server) return;
+  try {
+    replaceServer(server);
+    renderServerPanel(server.id);
+    const first = (server.channels || []).find((c) => c.kind !== 'voice') || (server.channels || [])[0];
+    if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${server.name} • Davet kodu: ${server.inviteCode}`, inviteCode: server.inviteCode, serverId: server.id });
+  } catch { /* switching is best-effort */ }
+}
+// Minimal in-app modal built from DOM nodes (textContent only — never innerHTML — so invite/user text
+// can't inject markup). Reuses the existing .modal-overlay style.
+function openModal(build) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  const card = document.createElement('div'); card.className = 'modal-card';
+  const close = () => { try { overlay.remove(); } catch {} };
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  try { build(card, close); } catch { close(); return () => {}; }
+  overlay.appendChild(card); document.body.appendChild(overlay);
+  return close;
+}
+// Single shared join call — debounced (one in flight), disables its buttons, and only ever toasts on
+// failure (no throw, no freeze, no duplicate join).
+async function doInviteJoin(code, ui) {
+  if (inviteJoinPending) return;
+  inviteJoinPending = true;
+  if (ui && ui.join) { ui.join.disabled = true; ui.join.textContent = 'Katılıyor…'; }
+  if (ui && ui.cancel) ui.cancel.disabled = true;
+  try {
+    const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode: code } });
+    if (data && data.server) {
+      if (ui && ui.close) ui.close();
+      switchToJoinedServer(data.server);
+      toast(`${data.server.name || 'Sunucuya'} katıldın.`);
+    } else {
+      if (ui && ui.close) ui.close();
+      toast('Davet geçersiz veya süresi dolmuş.');
+    }
+  } catch (e) {
+    if (ui && ui.join) { ui.join.disabled = false; ui.join.textContent = 'Katıl'; }
+    if (ui && ui.cancel) ui.cancel.disabled = false;
+    toast(e && e.message ? e.message : 'Davet geçersiz veya süresi dolmuş.');
+  } finally {
+    inviteJoinPending = false;
+  }
+}
+function showInviteConfirm(code) {
+  openModal((card, close) => {
+    const title = document.createElement('strong'); title.className = 'modal-title'; title.textContent = 'Sunucuya katıl';
+    const body = document.createElement('p'); body.className = 'modal-body'; body.textContent = `Bu davete katılmak istiyor musun? Kod: ${code.slice(0, 12)}…`;
+    const actions = document.createElement('div'); actions.className = 'modal-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost'; cancel.textContent = 'Vazgeç'; cancel.addEventListener('click', close);
+    const join = document.createElement('button'); join.type = 'button'; join.className = 'primary'; join.textContent = 'Katıl';
+    join.addEventListener('click', () => doInviteJoin(code, { join, cancel, close }));
+    actions.append(cancel, join); card.append(title, body, actions);
+  });
+}
+// In-app "join by code" modal — replaces window.prompt(), which is unreliable and can freeze an
+// installed PWA / mobile webview.
+function openJoinByCodeModal(prefill) {
+  openModal((card, close) => {
+    const title = document.createElement('strong'); title.className = 'modal-title'; title.textContent = 'Davet koduyla katıl';
+    const input = document.createElement('input'); input.type = 'text'; input.placeholder = 'Davet kodu'; input.value = prefill || ''; input.autocomplete = 'off'; input.spellcheck = false;
+    const actions = document.createElement('div'); actions.className = 'modal-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost'; cancel.textContent = 'Vazgeç'; cancel.addEventListener('click', close);
+    const join = document.createElement('button'); join.type = 'button'; join.className = 'primary'; join.textContent = 'Katıl';
+    const go = () => {
+      const code = normalizeInviteCodeClient(input.value);
+      if (!isValidInviteCodeClient(code)) { toast('Davet geçersiz veya süresi dolmuş.'); return; }
+      const existing = state.servers.find((s) => normalizeInviteCodeClient(s.inviteCode) === code);
+      if (existing) { toast('Zaten bu sunucudasın.'); close(); switchToJoinedServer(existing); return; }
+      doInviteJoin(code, { join, cancel, close });
+    };
+    join.addEventListener('click', go);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    actions.append(cancel, join); card.append(title, input, actions);
+    setTimeout(() => { try { input.focus(); } catch {} }, 0);
+  });
+}
+// Guarded entry point for clicking an invite code in chat. Validates, handles already-member / confirm,
+// and can NEVER throw out of the handler — so a bad invite can't freeze or white-screen the app.
+function safeInviteClick(rawCode) {
+  try {
+    const code = normalizeInviteCodeClient(rawCode);
+    if (!isValidInviteCodeClient(code)) { toast('Davet geçersiz veya süresi dolmuş.'); return; }
+    const existing = state.servers.find((s) => normalizeInviteCodeClient(s.inviteCode) === code);
+    if (existing) { toast('Zaten bu sunucudasın.'); switchToJoinedServer(existing); return; }
+    showInviteConfirm(code);
+  } catch { toast('Davete katılırken bir sorun oldu.'); }
+}
+function inviteChip(code) {
+  const chip = document.createElement('button');
+  chip.type = 'button'; chip.className = 'invite-chip';
+  chip.textContent = '🎟️ Davete katıl';
+  // stopPropagation: clicking the chip must not also trigger the message row / context menu.
+  chip.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); safeInviteClick(code); });
+  return chip;
+}
+// Render message text with any embedded invite code (exactly 32 hex chars — the server's invite
+// format) turned into a safe clickable chip. Uses text nodes + DOM buttons only (no innerHTML), so
+// message text can never inject markup. Longer hex runs (git/SHA hashes) are left as plain text.
+function linkifyMessageInto(container, text) {
+  const s = String(text || '');
+  const re = /[A-Fa-f0-9]{32,}/g;
+  let last = 0; let m; let any = false;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0].length !== 32) continue;
+    any = true;
+    if (m.index > last) container.appendChild(document.createTextNode(s.slice(last, m.index)));
+    container.appendChild(inviteChip(m[0]));
+    last = m.index + m[0].length;
+  }
+  if (!any) { container.textContent = s; return; }
+  if (last < s.length) container.appendChild(document.createTextNode(s.slice(last)));
+}
+// Global client-side error boundary: a thrown error / unhandled rejection shows a rate-limited toast
+// instead of a white screen, and never exposes secrets (generic message only; details to console).
+let errorBoundaryLastToast = 0;
+function installGlobalErrorBoundary() {
+  if (window.__gaycordErrorBoundary) return;
+  window.__gaycordErrorBoundary = true;
+  const notify = () => {
+    const now = Date.now();
+    if (now - errorBoundaryLastToast < 4000) return;
+    errorBoundaryLastToast = now;
+    try { toast('Bir şeyler ters gitti ama uygulama çalışıyor.'); } catch {}
+  };
+  window.addEventListener('error', (e) => { try { console.warn('global error', e && (e.error || e.message)); } catch {} notify(); });
+  window.addEventListener('unhandledrejection', (e) => { try { console.warn('unhandled rejection', e && e.reason); } catch {} notify(); });
+}
+
 async function copyInvite(inviteCode = state.currentInviteCode) { if (!inviteCode) return; try { await navigator.clipboard.writeText(inviteCode); toast(`Davet kodu kopyalandı: ${inviteCode}`); } catch { toast(`Davet kodu: ${inviteCode}`); } }
 
 async function openChannel(channel, context = {}) {
@@ -2396,8 +2539,9 @@ function wireEvents() {
   });
   els.homeButton.addEventListener('click', renderFriendsPanel);
   els.settingsButton.addEventListener('click', showSettings);
+  document.getElementById('mobileSettingsButton')?.addEventListener('click', () => { try { showSettings(); } catch {} }); // V7.9: settings reachable on mobile
   els.createServerButton.addEventListener('click', async () => { const name = prompt('Sunucu adı?', 'Bizim Ekip'); if (!name) return; try { const data = await api('/api/servers', { method: 'POST', body: { name } }); replaceServer(data.server); renderServerPanel(data.server.id); const first = data.server.channels?.find((c) => c.kind !== 'voice') || data.server.channels?.[0]; if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`, inviteCode: data.server.inviteCode, serverId: data.server.id }); } catch (e) { toast(e.message); } });
-  els.joinServerButton.addEventListener('click', async () => { const inviteCode = prompt('Davet kodu?'); if (!inviteCode) return; try { const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode } }); replaceServer(data.server); renderServerPanel(data.server.id); toast('Sunucuya katıldın.'); } catch (e) { toast(e.message); } });
+  els.joinServerButton.addEventListener('click', () => { try { openJoinByCodeModal(); } catch { toast('Davete katılırken bir sorun oldu.'); } }); // V7.9: in-app modal, not window.prompt()
   els.logoutButton.addEventListener('click', async () => { discardRecording(); cleanupVoice({ manual: true }); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} state.socket?.disconnect(); purgeLegacySensitiveLocalBackups(); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
   els.e2eeButton?.addEventListener('click', promptE2eeKey);
@@ -2419,6 +2563,7 @@ function wireEvents() {
   document.addEventListener('paste', (event) => { const files = [...(event.clipboardData?.files || [])]; if (files.length && state.currentChannelId) sendFiles(files); });
 }
 async function bootstrap() {
+  installGlobalErrorBoundary(); // V7.9: catch stray errors first so nothing can white-screen the app
   wireEvents(); setAuthMode('login'); resetChat(); refreshPublicStatus();
   state.voicePrefs = loadVoicePrefs();
   if (navigator.mediaDevices?.addEventListener) {
