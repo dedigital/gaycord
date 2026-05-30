@@ -76,6 +76,17 @@ async function register(baseUrl, username) {
   return { cookie: cookieFrom(response), csrf: json.csrfToken, user: json.user };
 }
 
+async function login(baseUrl, username) {
+  const response = await fetch(`${baseUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password: 'correct horse battery staple' })
+  });
+  const json = await response.json();
+  assert.equal(response.status, 200, `login ${username}: ${JSON.stringify(json)}`);
+  return { cookie: cookieFrom(response), csrf: json.csrfToken, user: json.user };
+}
+
 function smallE2eePayload(ciphertext = 'U0VDUkVU') {
   return {
     v: 1,
@@ -224,11 +235,23 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.4.0', 'mobile.css?v=7.4.0', 'app.js?v=7.4.0', 'mobile.js?v=7.4.0']) {
+  for (const asset of ['styles.css?v=7.4.1', 'mobile.css?v=7.4.1', 'app.js?v=7.4.1', 'mobile.js?v=7.4.1']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-4-shell'/.test(swJs), 'service worker cache name must be bumped for V7.4');
+  assert(/CACHE_NAME = 'gaycord-v7-4-1-shell'/.test(swJs), 'service worker cache name must be bumped for V7.4.1');
+
+  // --- V7.4.1 admin boundary: global backup is App Owner (Super Admin) only ---
+  assert(appJs.includes('Yedek alma yalnızca uygulama sahibine açıktır.'), 'non-owner backup note copy must match spec');
+  assert(/state\.isAppOwner[\s\S]{0,60}owner-panel[\s\S]{0,600}downloadBackupButton[\s\S]{0,300}importBackupButton/.test(appJs), 'backup controls must render only in the App Owner (isAppOwner) panel');
+  assert(/recordSecurityEvent\('admin_denied'/.test(serverJs), 'denied admin access attempts must be logged');
+  assert(/recordSecurityEvent\('backup_export'/.test(serverJs), 'backup export must be logged');
+  assert(/recordSecurityEvent\('backup_import'/.test(serverJs), 'backup import must be logged');
+  assert(/\/api\/admin\/export'[\s\S]{0,120}requireAdmin/.test(serverJs), 'admin export must use requireAdmin');
+  assert(/\/api\/admin\/import'[\s\S]{0,160}requireAdmin[\s\S]{0,160}rateLimit\('admin_import'/.test(serverJs), 'admin import must use requireAdmin + a rate limit');
+  assert(/\/api\/admin\/security\/invalidate-sessions'[\s\S]{0,120}requireAdmin/.test(serverJs), 'invalidate-sessions must use requireAdmin');
+  assert(/function normalizeImportedDb[\s\S]*?next\.sessions = \{\};/.test(serverJs), 'import must never restore active sessions');
+  assert(/copy\.sessions = \{\};/.test(serverJs) && /sessions: \{\}/.test(serverJs), 'full + light export must strip sessions');
 
   // Mobile assets must still be referenced (V7.1 drawer/sheet preserved).
   assert(indexHtml.includes('/mobile.js'), 'index.html must reference mobile.js');
@@ -436,6 +459,39 @@ async function main() {
     leaverSocket.close();
     ownerReconnect.close();
     console.log('V7.4 stale recovered room authorization checks passed');
+
+    // --- V7.4.1 admin boundary: global backup/export/import is App Owner only ---
+    // owner_v74 owns a server but is NOT the app owner; leaver_v74 is a normal user.
+    const ownerExportDenied = await api(baseUrl, '/api/admin/export', { session: ownerA });
+    assert.equal(ownerExportDenied.response.status, 403, 'server owner (not app owner) must not export the global backup');
+    const leaverImportDenied = await api(baseUrl, '/api/admin/import', { method: 'POST', session: leaver, body: { db: { users: { x: { id: 'x' } }, servers: {} }, uploads: {} } });
+    assert.equal(leaverImportDenied.response.status, 403, 'normal user must not import a global backup');
+    const ownerImportDenied = await api(baseUrl, '/api/admin/import', { method: 'POST', session: ownerA, body: { db: { users: { x: { id: 'x' } }, servers: {} }, uploads: {} } });
+    assert.equal(ownerImportDenied.response.status, 403, 'server owner (not app owner) must not import a global backup');
+
+    // Repeated non-owner export attempts must ALL return 403, but admin_denied logging must be
+    // rate-limited so a non-owner cannot spam unbounded securityEvents + DB writes.
+    const deniedAttempts = 9;
+    for (let i = 0; i < deniedAttempts; i += 1) {
+      const denied = await api(baseUrl, '/api/admin/export', { session: leaver });
+      assert.equal(denied.response.status, 403, 'every non-owner export attempt must return 403');
+    }
+
+    // The app owner (admin_v7, first registered = db.adminUserId) logs back in and CAN export.
+    const appOwner = await login(baseUrl, 'admin_v7');
+    const appOwnerExport = await api(baseUrl, '/api/admin/export', { session: appOwner });
+    assert.equal(appOwnerExport.response.status, 200, 'app owner can export the global backup');
+    assert.deepEqual(appOwnerExport.json.db.sessions, {}, 'export must not contain active session tokens');
+    assert(appOwnerExport.json.db.adminUserId, 'export carries the app owner id');
+
+    // admin_denied logging for the spammed (user, path) must be capped at the 5/min log limit,
+    // not one event per attempt. (securityEvents was reset by the earlier import, so the App Owner's
+    // recent-events view contains all of them.)
+    const securityStatus = await api(baseUrl, '/api/security/status', { session: appOwner });
+    const leaverExportDenials = (securityStatus.json.recentSecurityEvents || []).filter((ev) => ev.type === 'admin_denied' && ev.details && ev.details.userId === leaver.user.id && ev.details.path === '/api/admin/export');
+    assert(leaverExportDenials.length >= 1, 'at least one denied admin attempt must be logged');
+    assert(leaverExportDenials.length <= 5, `admin_denied logging must be rate-limited; saw ${leaverExportDenials.length} events for ${deniedAttempts} attempts`);
+    console.log('V7.4.1 admin boundary checks passed');
   } catch (error) {
     error.message += `\n\nServer output:\n${output}`;
     throw error;
