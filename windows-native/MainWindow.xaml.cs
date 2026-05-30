@@ -330,11 +330,16 @@ public partial class MainWindow : Window
             else
             {
                 _audio.StopLive();
-                await _rt.LeaveVoiceAsync();
                 _isLiveVoice = false;
-                try { _ducking.Deactivate(); } catch { } // V7.7: restore other apps' volumes on leave
-                LiveVoiceButton.Content = "🎧 Ses odası";
-                SetStatus("Canlı sesten çıkıldı.");
+                // V7.7: restore other apps' volumes FIRST, so a network leave failure can never leave
+                // other apps ducked. Local restore must not depend on the realtime/network leave.
+                try { _ducking.Deactivate(); } catch { }
+                try { await _rt.LeaveVoiceAsync(); }
+                finally
+                {
+                    LiveVoiceButton.Content = "🎧 Ses odası";
+                    SetStatus("Canlı sesten çıkıldı.");
+                }
             }
         }
         catch (Exception ex) { SetStatus(ex.Message); }

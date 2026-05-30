@@ -282,6 +282,12 @@ async function main() {
   // documents "AudioEndpointVolume is never written".
   assert(!/AudioEndpointVolume\s*\.|MasterVolumeLevelScalar|MasterVolumeLevel\b|SetMasterVolume/.test(nativeDuck), 'native ducking must not touch the system master volume');
   assert(!/(Process\.Start|ShellExecute|cmd\.exe|powershell)/i.test(nativeDuck), 'native ducking must not run arbitrary commands');
+  // V7.7 P2: ducking must only LOWER — never raise an app already quieter than the duck level
+  // (target = Math.Min(original, level)), and must never set the raw level unconditionally.
+  assert(/Math\.Min\(original, level\)/.test(nativeDuck), 'native ducking must duck to Math.Min(original, level), never raising quiet apps');
+  assert(!/simple\.Volume = level;/.test(nativeDuck), 'native ducking must not set session volume to the raw duck level unconditionally');
+  // V7.7 P2: leaving a call must restore local volumes even if the network leave throws.
+  assert(/_ducking\.Deactivate\(\)[\s\S]{0,120}await _rt\.LeaveVoiceAsync\(\)/.test(nativeMain), 'native leave must restore ducking before/independent of the network leave');
   assert(!/requestedExecutionLevel|requireAdministrator|highestAvailable/i.test(nativeDuck + nativeMain), 'native ducking must not require admin');
   assert(/_ducking\.Deactivate\(\)/.test(nativeMain) && /_ducking\.Dispose\(\)/.test(nativeMain), 'native app must restore volumes on leave + exit');
   assert(/_ducking\.RecoverFromCrash\(\)/.test(nativeMain), 'native app must restore volumes after a crash on next launch');

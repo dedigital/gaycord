@@ -111,9 +111,14 @@ public sealed class AudioDuckingService : IDisposable
                 try
                 {
                     var simple = session.SimpleAudioVolume;
+                    // Snapshot the TRUE original once (so restore is exact), before we change anything.
                     if (!_originals.ContainsKey(key))
                         _originals[key] = new Snapshot(key, pid, name, simple.Volume);
-                    simple.Volume = level;
+                    // Only ever LOWER: never raise an app already quieter than the duck level. The target
+                    // is min(original, level) — an app at 10% stays 10% even when ducking to 50%.
+                    var original = _originals[key].Volume;
+                    var target = Math.Min(original, level);
+                    if (simple.Volume > target) simple.Volume = target;
                 }
                 catch { /* skip sessions we cannot read/set */ }
             }
