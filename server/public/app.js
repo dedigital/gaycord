@@ -698,7 +698,10 @@ function renderMembers(server) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'member-row';
-    row.innerHTML = `<span class="avatar ${member.online ? 'online' : ''}">${avatarInner(member)}</span><span class="row-grow"><strong>${escapeHTML(member.displayName || member.username)}</strong><br><small>@${escapeHTML(member.username)} ${(member.isOwner || member.owner) ? '• sahip' : ''} • ${member.online ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
+    const role = member.role || ((member.isOwner || member.owner) ? 'owner' : 'member');
+    const badge = role !== 'member' ? `<span class="role-badge role-${role}">${escapeHTML(ROLE_LABEL[role] || role)}</span>` : '';
+    const timeoutMark = member.timedOut ? '<span class="role-badge role-timeout">⏳</span>' : '';
+    row.innerHTML = `<span class="avatar ${member.online ? 'online' : ''}">${avatarInner(member)}</span><span class="row-grow"><span class="member-name-row"><strong>${escapeHTML(member.displayName || member.username)}</strong>${badge}${timeoutMark}</span><small>@${escapeHTML(member.username)} • ${member.online ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
     row.addEventListener('click', () => openProfile(member.id));
     els.membersList.appendChild(row);
   }
@@ -916,14 +919,19 @@ function renderServerPanel(serverId) {
   renderRail(); renderMembers(server);
   els.sidebarMode.textContent = 'Sunucu'; els.sidebarTitle.textContent = server.name;
   const isOwner = server.isOwner || server.ownerId === state.user?.id;
+  const canManage = canManageServerClient(server);
+  const canModerate = canModerateServerClient(server);
+  const myRole = serverRoleClient(server);
+  const roleBadge = myRole !== 'member' ? `<span class="role-badge role-${myRole}">${escapeHTML(ROLE_LABEL[myRole] || myRole)}</span>` : '';
   els.dynamicPanel.innerHTML = `
     ${persistenceCardHTML()}
-    <section class="stack panel-card"><div class="section-title">Sunucu</div><div class="info-card"><span class="avatar server">${escapeHTML(initials(server.name))}</span><span class="row-grow"><strong>${escapeHTML(server.name)}</strong><br><small>${server.memberCount || server.memberIds?.length || 0} üye • Davet: <code>${escapeHTML(server.inviteCode)}</code></small></span></div><div class="server-actions"><button id="copyInvitePanelButton" class="ghost" type="button">Davet kodunu kopyala</button>${isOwner ? '<button id="renameServerButton" class="ghost" type="button">Ad değiştir</button><button id="renewInviteButton" class="ghost" type="button">Davet kodunu yenile</button><button id="deleteServerButton" class="ghost danger" type="button">Sunucuyu sil</button>' : '<button id="leaveServerButton" class="ghost danger" type="button">Sunucudan çık</button>'}</div></section>
-    <section class="stack"><div class="section-title-row"><div class="section-title">Metin kanalları</div>${isOwner ? '<button id="addTextChannelButton" class="mini-button">＋</button>' : ''}</div><div id="textChannelList"></div></section>
-    <section class="stack"><div class="section-title-row"><div class="section-title">Ses kanalları</div>${isOwner ? '<button id="addVoiceChannelButton" class="mini-button">＋</button>' : ''}</div><div id="voiceChannelList"></div></section>`;
-  renderChannelGroup(els.dynamicPanel.querySelector('#textChannelList'), (server.channels || []).filter((c) => c.kind !== 'voice'), server, isOwner);
-  renderChannelGroup(els.dynamicPanel.querySelector('#voiceChannelList'), (server.channels || []).filter((c) => c.kind === 'voice'), server, isOwner);
+    <section class="stack panel-card"><div class="section-title">Sunucu</div><div class="info-card"><span class="avatar server">${escapeHTML(initials(server.name))}</span><span class="row-grow"><strong>${escapeHTML(server.name)} ${roleBadge}</strong><br><small>${server.memberCount || server.memberIds?.length || 0} üye • Davet: <code>${escapeHTML(server.inviteCode)}</code></small></span></div><div class="server-actions"><button id="copyInvitePanelButton" class="ghost" type="button">Davet kodunu kopyala</button>${canModerate ? '<button id="serverAdminButton" class="ghost" type="button">🛡 Yönetim</button>' : ''}${canManage ? '<button id="renameServerButton" class="ghost" type="button">Ad değiştir</button><button id="renewInviteButton" class="ghost" type="button">Davet kodunu yenile</button>' : ''}${isOwner ? '<button id="deleteServerButton" class="ghost danger" type="button">Sunucuyu sil</button>' : '<button id="leaveServerButton" class="ghost danger" type="button">Sunucudan çık</button>'}</div></section>
+    <section class="stack"><div class="section-title-row"><div class="section-title">Metin kanalları</div>${canManage ? '<button id="addTextChannelButton" class="mini-button">＋</button>' : ''}</div><div id="textChannelList"></div></section>
+    <section class="stack"><div class="section-title-row"><div class="section-title">Ses kanalları</div>${canManage ? '<button id="addVoiceChannelButton" class="mini-button">＋</button>' : ''}</div><div id="voiceChannelList"></div></section>`;
+  renderChannelGroup(els.dynamicPanel.querySelector('#textChannelList'), (server.channels || []).filter((c) => c.kind !== 'voice'), server, canManage);
+  renderChannelGroup(els.dynamicPanel.querySelector('#voiceChannelList'), (server.channels || []).filter((c) => c.kind === 'voice'), server, canManage);
   els.dynamicPanel.querySelector('#copyInvitePanelButton')?.addEventListener('click', () => copyInvite(server.inviteCode));
+  els.dynamicPanel.querySelector('#serverAdminButton')?.addEventListener('click', () => openServerAdmin(server.id));
   els.dynamicPanel.querySelector('#renameServerButton')?.addEventListener('click', async () => { const name = prompt('Yeni sunucu adı?', server.name); if (!name) return; try { const data = await api(`/api/servers/${server.id}`, { method: 'PATCH', body: { name } }); replaceServer(data.server); renderServerPanel(server.id); } catch (e) { toast(e.message); } });
   els.dynamicPanel.querySelector('#renewInviteButton')?.addEventListener('click', async () => { if (!confirm('Davet kodu yenilensin mi? Eski kod çalışmaz.')) return; try { const data = await api(`/api/servers/${server.id}`, { method: 'PATCH', body: { regenerateInvite: true } }); replaceServer(data.server); renderServerPanel(server.id); toast(`Yeni kod: ${data.server.inviteCode}`); } catch (e) { toast(e.message); } });
   els.dynamicPanel.querySelector('#deleteServerButton')?.addEventListener('click', () => deleteServer(server));
@@ -931,15 +939,19 @@ function renderServerPanel(serverId) {
   els.dynamicPanel.querySelector('#addTextChannelButton')?.addEventListener('click', () => createChannel(server, 'text'));
   els.dynamicPanel.querySelector('#addVoiceChannelButton')?.addEventListener('click', () => createChannel(server, 'voice'));
 }
-function renderChannelGroup(container, channels, server, isOwner) {
+function renderChannelGroup(container, channels, server, canManage) {
   container.innerHTML = channels.length ? '' : '<div class="empty-state compact">Kanal yok.</div>';
   for (const channel of channels) {
     const row = document.createElement('div'); row.className = `channel-row ${state.currentChannelId === channel.id ? 'active' : ''}`;
     const button = document.createElement('button'); button.type = 'button'; button.className = 'channel-main';
-    button.innerHTML = `<span class="avatar">${channel.kind === 'voice' ? '🔊' : '#'}</span><span class="row-grow"><strong>${escapeHTML(channel.name)}</strong><br><small>${channel.kind === 'voice' ? 'sesli oda' : 'metin kanalı'}</small></span>${unreadBadgeHTML(channel.id)}`;
-    button.addEventListener('click', () => openChannel(channel, { title: `${channel.kind === 'voice' ? '🔊' : '#'} ${channel.name}`, subtitle: `${server.name} • ${channel.kind === 'voice' ? 'canlı ses' : 'metin'} • Davet kodu: ${server.inviteCode}`, inviteCode: server.inviteCode, serverId: server.id }));
+    const lock = channel.private ? '<span class="channel-lock" title="Özel kanal">🔒</span>' : '';
+    button.innerHTML = `<span class="avatar">${channel.kind === 'voice' ? '🔊' : '#'}</span><span class="row-grow"><strong>${escapeHTML(channel.name)} ${lock}</strong><br><small>${channel.private ? 'özel • ' : ''}${channel.kind === 'voice' ? 'sesli oda' : 'metin kanalı'}</small></span>${unreadBadgeHTML(channel.id)}`;
+    button.addEventListener('click', () => openChannel(channel, { title: `${channel.kind === 'voice' ? '🔊' : '#'} ${channel.name}`, subtitle: `${server.name} • ${channel.kind === 'voice' ? 'canlı ses' : 'metin'}${channel.private ? ' • özel' : ''} • Davet kodu: ${server.inviteCode}`, inviteCode: server.inviteCode, serverId: server.id }));
     row.appendChild(button);
-    if (isOwner && server.channelIds?.length > 1) { const del = document.createElement('button'); del.type = 'button'; del.className = 'mini-button danger'; del.textContent = 'Sil'; del.addEventListener('click', () => deleteChannel(server, channel)); row.appendChild(del); }
+    if (canManage) {
+      const gear = document.createElement('button'); gear.type = 'button'; gear.className = 'mini-button'; gear.textContent = '⚙'; gear.title = 'İzinler'; gear.addEventListener('click', () => openChannelPrivacy(server, channel)); row.appendChild(gear);
+      if ((server.channels?.length || 0) > 1) { const del = document.createElement('button'); del.type = 'button'; del.className = 'mini-button danger'; del.textContent = 'Sil'; del.addEventListener('click', () => deleteChannel(server, channel)); row.appendChild(del); }
+    }
     container.appendChild(row);
   }
 }
@@ -1017,6 +1029,8 @@ function connectSocket() {
   state.socket.on('typing', ({ channelId, user, isTyping }) => { if (channelId !== state.currentChannelId || !isTyping || user?.id === state.user?.id) return; els.typingLine.textContent = `${user.displayName || user.username} yazıyor...`; clearTimeout(state.remoteTypingTimeout); state.remoteTypingTimeout = setTimeout(() => { els.typingLine.textContent = ''; }, 1500); });
   state.socket.on('server:updated', ({ server } = {}) => { if (!server) return; replaceServer(server); renderRail(); if (state.currentServerId === server.id) renderServerPanel(server.id); });
   state.socket.on('server:deleted', ({ serverId } = {}) => { state.servers = state.servers.filter((server) => server.id !== serverId); if (state.currentServerId === serverId) { cleanupVoice({ manual: true }); renderFriendsPanel(); resetChat('Sunucu silindi', 'Başka bir sunucu seç.'); } else renderRail(); });
+  state.socket.on('server:removed', ({ serverId, reason } = {}) => { state.servers = state.servers.filter((server) => server.id !== serverId); closeDrawer(); if (state.currentServerId === serverId) { cleanupVoice({ manual: true }); renderFriendsPanel(); resetChat(reason === 'ban' ? 'Sunucudan yasaklandın' : 'Sunucudan çıkarıldın', 'Başka bir sunucu seç.'); } else renderRail(); toast(reason === 'ban' ? 'Bir sunucudan yasaklandın.' : 'Bir sunucudan çıkarıldın.'); });
+  state.socket.on('server:member_timeout', ({ until } = {}) => { toast(until ? 'Bir sunucuda zaman aşımı (timeout) aldın; süre dolana kadar mesaj gönderemezsin.' : 'Timeout’un kaldırıldı.'); });
   state.socket.on('channel:deleted', ({ channelId, serverId } = {}) => { if (state.voice.channelId === channelId) cleanupVoice({ manual: true }); if (state.currentChannelId === channelId) resetChat('Kanal silindi', 'Başka bir kanal seç.'); const server = state.servers.find((s) => s.id === serverId); if (server) server.channels = server.channels.filter((c) => c.id !== channelId); if (state.currentServerId === serverId) renderServerPanel(serverId); });
   state.socket.on('data:imported', () => { toast('Yedek yüklendi; sayfa yenileniyor.'); setTimeout(() => location.reload(), 900); });
   state.socket.on('voice:user_joined', ({ channelId, peer } = {}) => { if (channelId !== state.voice.channelId || !peer?.socketId || peer.socketId === state.voice.selfId) return; createPeer(peer.socketId, peer.user); renderVoicePanel(); });
@@ -1597,6 +1611,227 @@ async function showSettings() {
   els.settingsModal.showModal?.();
 }
 
+/* ===================== V7.6 Server Admin Panel (roles / private channels / moderation / audit) ===================== */
+function canActOnRoleClient(myRole, targetRole) {
+  if (targetRole === 'owner') return false;
+  if (myRole === 'owner') return true;
+  return (ROLE_RANK_CLIENT[myRole] || 0) > (ROLE_RANK_CLIENT[targetRole] || 0);
+}
+function openServerAdmin(serverId, activeTab = 'overview') {
+  const server = state.servers.find((s) => s.id === serverId);
+  if (!server) return toast('Sunucu bulunamadı.');
+  const tabs = canManageServerClient(server)
+    ? [['overview', 'Genel'], ['members', 'Üyeler'], ['channels', 'Kanallar'], ['moderation', 'Moderasyon'], ['audit', 'Denetim'], ['reports', 'Raporlar']]
+    : [['moderation', 'Moderasyon'], ['audit', 'Denetim']]; // mods get a limited view
+  if (!tabs.some(([k]) => k === activeTab)) activeTab = tabs[0][0];
+  openDrawer('admin', `🛡 ${server.name} • Yönetim`, (body) => {
+    const tabbar = document.createElement('div'); tabbar.className = 'admin-tabs';
+    for (const [key, label] of tabs) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = `admin-tab ${key === activeTab ? 'active' : ''}`; b.textContent = label;
+      b.addEventListener('click', () => openServerAdmin(serverId, key));
+      tabbar.appendChild(b);
+    }
+    const content = document.createElement('div'); content.className = 'admin-tab-content';
+    body.append(tabbar, content);
+    renderAdminTab(content, server, activeTab);
+  });
+}
+async function renderAdminTab(content, server, tab) {
+  content.innerHTML = '<div class="empty-state compact">Yükleniyor…</div>';
+  try {
+    if (tab === 'overview') return renderAdminOverview(content, server);
+    if (tab === 'members') return await renderAdminMembers(content, server);
+    if (tab === 'channels') return renderAdminChannels(content, server);
+    if (tab === 'moderation') return await renderAdminModeration(content, server);
+    if (tab === 'audit') return await renderAdminAudit(content, server);
+    if (tab === 'reports') return renderAdminReports(content);
+  } catch (e) {
+    content.innerHTML = '';
+    const d = document.createElement('div'); d.className = 'empty-state compact'; d.textContent = e.message || 'Yüklenemedi.';
+    content.appendChild(d);
+  }
+}
+function renderAdminOverview(content, server) {
+  const owner = (server.members || []).find((m) => m.id === server.ownerId || m.isOwner);
+  const counts = { admin: 0, mod: 0 };
+  for (const m of server.members || []) if (m.role === 'admin' || m.role === 'mod') counts[m.role] += 1;
+  content.innerHTML = `
+    <div class="info-card"><span class="avatar server">${escapeHTML(initials(server.name))}</span><span class="row-grow"><strong>${escapeHTML(server.name)}</strong><br><small>Sahip: ${escapeHTML(owner?.displayName || owner?.username || '—')}</small></span></div>
+    <div class="admin-stat-grid">
+      <div class="admin-stat"><strong>${server.memberCount || server.members?.length || 0}</strong><small>üye</small></div>
+      <div class="admin-stat"><strong>${server.channelCount ?? server.channels?.length ?? 0}</strong><small>kanal</small></div>
+      <div class="admin-stat"><strong>${counts.admin}</strong><small>admin</small></div>
+      <div class="admin-stat"><strong>${counts.mod}</strong><small>mod</small></div>
+    </div>
+    <div class="section-title">Davet kodu</div>
+    <div class="info-card"><span class="row-grow"><code>${escapeHTML(server.inviteCode)}</code></span></div>`;
+}
+async function renderAdminMembers(content, server) {
+  const data = await api(`/api/servers/${server.id}/members`);
+  const members = data.members || [];
+  const isManager = canManageServerClient(server);
+  const canModerate = canModerateServerClient(server);
+  const myRole = serverRoleClient(server);
+  content.innerHTML = members.length ? '' : '<div class="empty-state compact">Üye yok.</div>';
+  for (const m of members) {
+    const role = m.role || 'member';
+    const card = document.createElement('div'); card.className = 'admin-member';
+    const head = document.createElement('div'); head.className = 'admin-member-head';
+    head.innerHTML = `<span class="avatar small ${m.online ? 'online' : ''}">${avatarInner(m)}</span><span class="row-grow"><strong>${escapeHTML(m.displayName || m.username)} <span class="role-badge role-${role}">${escapeHTML(ROLE_LABEL[role] || role)}</span>${m.timedOut ? ' <span class="role-badge role-timeout">⏳ timeout</span>' : ''}</strong><br><small>@${escapeHTML(m.username)} • ${m.online ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
+    card.appendChild(head);
+    const actions = document.createElement('div'); actions.className = 'admin-member-actions';
+    const actionable = m.id !== state.user?.id && role !== 'owner' && canActOnRoleClient(myRole, role);
+    if (isManager && actionable) {
+      const sel = document.createElement('select'); sel.className = 'admin-role-select'; sel.setAttribute('aria-label', 'Rol');
+      for (const r of ['member', 'mod', 'admin']) {
+        if (myRole !== 'owner' && (ROLE_RANK_CLIENT[r] || 0) >= (ROLE_RANK_CLIENT[myRole] || 0)) continue; // can't grant at/above own rank
+        const opt = document.createElement('option'); opt.value = r; opt.textContent = ROLE_LABEL[r]; if (r === role) opt.selected = true; sel.appendChild(opt);
+      }
+      sel.addEventListener('change', async () => {
+        try { await api(`/api/servers/${server.id}/members/${m.id}/role`, { method: 'PATCH', body: { role: sel.value } }); toast(`${m.displayName || m.username} → ${ROLE_LABEL[sel.value]}`); await refreshMe({ keepPanel: true }); openServerAdmin(server.id, 'members'); }
+        catch (e) { toast(e.message); }
+      });
+      actions.appendChild(sel);
+    }
+    if (canModerate && actionable) {
+      if (m.timedOut) { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini-button'; b.textContent = 'Timeout kaldır'; b.addEventListener('click', () => removeTimeout(server, m)); actions.appendChild(b); }
+      else { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini-button warn'; b.textContent = 'Timeout'; b.addEventListener('click', () => timeoutMember(server, m)); actions.appendChild(b); }
+      const k = document.createElement('button'); k.type = 'button'; k.className = 'mini-button danger'; k.textContent = 'At'; k.addEventListener('click', () => kickMember(server, m)); actions.appendChild(k);
+      if (isManager) { const ban = document.createElement('button'); ban.type = 'button'; ban.className = 'mini-button danger'; ban.textContent = 'Yasakla'; ban.addEventListener('click', () => banMember(server, m)); actions.appendChild(ban); }
+    }
+    if (actions.childElementCount) card.appendChild(actions);
+    content.appendChild(card);
+  }
+}
+function renderAdminChannels(content, server) {
+  const list = server.channels || [];
+  content.innerHTML = list.length ? '' : '<div class="empty-state compact">Kanal yok.</div>';
+  for (const ch of list) {
+    const card = document.createElement('div'); card.className = 'info-card';
+    card.innerHTML = `<span class="avatar">${ch.kind === 'voice' ? '🔊' : '#'}</span><span class="row-grow"><strong>${escapeHTML(ch.name)} ${ch.private ? '🔒' : ''}</strong><br><small>${ch.private ? 'özel' : 'herkese açık'} • ${ch.kind === 'voice' ? 'ses' : 'metin'}</small></span>`;
+    if (canManageServerClient(server)) { const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'mini-button'; edit.textContent = 'İzinler'; edit.addEventListener('click', () => openChannelPrivacy(server, ch)); card.appendChild(edit); }
+    content.appendChild(card);
+  }
+}
+async function renderAdminModeration(content, server) {
+  const [membersData, ] = await Promise.all([api(`/api/servers/${server.id}/members`).catch(() => ({ members: [], bans: [] }))]);
+  const timedOut = (membersData.members || []).filter((m) => m.timedOut);
+  const bans = membersData.bans || [];
+  content.innerHTML = '';
+  const t1 = document.createElement('div'); t1.className = 'section-title'; t1.textContent = 'Zaman aşımındaki üyeler'; content.appendChild(t1);
+  if (!timedOut.length) { const e = document.createElement('div'); e.className = 'empty-state compact'; e.textContent = 'Şu an timeout’ta üye yok.'; content.appendChild(e); }
+  for (const m of timedOut) {
+    const card = document.createElement('div'); card.className = 'info-card';
+    card.innerHTML = `<span class="avatar small">${avatarInner(m)}</span><span class="row-grow"><strong>${escapeHTML(m.displayName || m.username)}</strong><br><small>bitiş: ${escapeHTML(formatTime(m.timeoutUntil))}</small></span>`;
+    if (canModerateServerClient(server)) { const r = document.createElement('button'); r.type = 'button'; r.className = 'mini-button'; r.textContent = 'Kaldır'; r.addEventListener('click', () => removeTimeout(server, m)); card.appendChild(r); }
+    content.appendChild(card);
+  }
+  if (canManageServerClient(server)) {
+    const t2 = document.createElement('div'); t2.className = 'section-title'; t2.textContent = 'Yasaklılar'; content.appendChild(t2);
+    if (!bans.length) { const e = document.createElement('div'); e.className = 'empty-state compact'; e.textContent = 'Yasaklı üye yok.'; content.appendChild(e); }
+    for (const b of bans) {
+      const card = document.createElement('div'); card.className = 'info-card';
+      card.innerHTML = `<span class="avatar small">${avatarInner(b.user || {})}</span><span class="row-grow"><strong>${escapeHTML(b.user?.displayName || b.user?.username || b.user?.id || '?')}</strong><br><small>${escapeHTML(b.reason || 'sebep belirtilmemiş')}</small></span>`;
+      const u = document.createElement('button'); u.type = 'button'; u.className = 'mini-button'; u.textContent = 'Yasağı kaldır';
+      u.addEventListener('click', async () => { try { await api(`/api/servers/${server.id}/bans/${b.user.id}`, { method: 'DELETE', body: {} }); toast('Yasak kaldırıldı.'); openServerAdmin(server.id, 'moderation'); } catch (e) { toast(e.message); } });
+      card.appendChild(u); content.appendChild(card);
+    }
+  }
+}
+function auditLabel(e) {
+  const actor = e.actor?.displayName || e.actor?.username || 'Birisi';
+  const target = e.target?.displayName || e.target?.username || '';
+  const d = e.details || {};
+  switch (e.type) {
+    case 'role_updated': return `${actor}, ${target} kişisinin rolünü ${ROLE_LABEL[d.role] || d.role} yaptı`;
+    case 'member_kicked': return `${actor}, ${target} kişisini sunucudan attı`;
+    case 'member_banned': return `${actor}, ${target} kişisini yasakladı`;
+    case 'member_unbanned': return `${actor}, ${target} kişisinin yasağını kaldırdı`;
+    case 'member_timed_out': return `${actor}, ${target} kişisine ${d.minutes || ''}dk timeout verdi`;
+    case 'member_timeout_removed': return `${actor}, ${target} kişisinin timeout’unu kaldırdı`;
+    case 'channel_created': return `${actor}, #${d.channel || ''} kanalını oluşturdu`;
+    case 'channel_deleted': return `${actor}, #${d.channel || ''} kanalını sildi`;
+    case 'channel_privacy_updated': return `${actor}, #${d.channel || ''} kanalını ${d.private ? 'özel' : 'herkese açık'} yaptı`;
+    case 'server_updated': return `${actor}, sunucu adını “${d.name || ''}” yaptı`;
+    case 'invite_regenerated': return `${actor}, davet kodunu yeniledi`;
+    case 'message_deleted_by_moderator': return `${actor}, ${target} kişisinin mesajını sildi (#${d.channel || ''})`;
+    case 'pin_added': return `${actor}, #${d.channel || ''} kanalında mesaj sabitledi`;
+    case 'pin_removed': return `${actor}, #${d.channel || ''} kanalında sabiti kaldırdı`;
+    default: return `${actor}: ${e.type}`;
+  }
+}
+async function renderAdminAudit(content, server) {
+  const data = await api(`/api/servers/${server.id}/audit-log`);
+  const entries = data.auditLog || [];
+  content.innerHTML = entries.length ? '' : '<div class="empty-state compact">Henüz audit log yok.</div>';
+  for (const e of entries) {
+    const row = document.createElement('div'); row.className = 'audit-row';
+    const text = document.createElement('div'); text.className = 'audit-text'; text.textContent = auditLabel(e);
+    const time = document.createElement('time'); time.textContent = formatTime(e.createdAt);
+    row.append(text, time); content.appendChild(row);
+  }
+}
+function renderAdminReports(content) {
+  content.innerHTML = '<div class="empty-state compact">Bu sunucuda yönetilecek rapor yok.</div>';
+}
+async function kickMember(server, m) {
+  if (!confirm(`${m.displayName || m.username} sunucudan atılsın mı?`)) return;
+  try { await api(`/api/servers/${server.id}/members/${m.id}/kick`, { method: 'POST', body: {} }); toast(`${m.displayName || m.username} atıldı.`); await refreshMe({ keepPanel: true }); openServerAdmin(server.id, 'members'); } catch (e) { toast(e.message); }
+}
+async function banMember(server, m) {
+  if (!confirm(`${m.displayName || m.username} yasaklansın mı? Tekrar katılamaz.`)) return;
+  const reason = prompt('Yasak sebebi (opsiyonel):', '');
+  if (reason === null) return;
+  try { await api(`/api/servers/${server.id}/members/${m.id}/ban`, { method: 'POST', body: { reason } }); toast(`${m.displayName || m.username} yasaklandı.`); await refreshMe({ keepPanel: true }); openServerAdmin(server.id, 'members'); } catch (e) { toast(e.message); }
+}
+async function timeoutMember(server, m) {
+  const minsRaw = prompt('Kaç dakika timeout? (1-10080)', '10');
+  if (minsRaw === null) return;
+  const minutes = Number(minsRaw);
+  if (!Number.isFinite(minutes) || minutes < 1) return toast('Geçerli bir dakika gir.');
+  try { await api(`/api/servers/${server.id}/members/${m.id}/timeout`, { method: 'POST', body: { minutes } }); toast(`${m.displayName || m.username} ${minutes}dk timeout aldı.`); await refreshMe({ keepPanel: true }); openServerAdmin(server.id, 'members'); } catch (e) { toast(e.message); }
+}
+async function removeTimeout(server, m) {
+  try { await api(`/api/servers/${server.id}/members/${m.id}/timeout`, { method: 'DELETE', body: {} }); toast('Timeout kaldırıldı.'); await refreshMe({ keepPanel: true }); openServerAdmin(server.id, 'members'); } catch (e) { toast(e.message); }
+}
+function openChannelPrivacy(server, channel) {
+  openDrawer('channel-perms', `⚙ #${channel.name} • İzinler`, async (body) => {
+    body.innerHTML = '<div class="empty-state compact">Yükleniyor…</div>';
+    let perms;
+    try { perms = await api(`/api/servers/${server.id}/channels/${channel.id}/permissions`); }
+    catch (e) { body.innerHTML = ''; const d = document.createElement('div'); d.className = 'empty-state compact'; d.textContent = e.message; body.appendChild(d); return; }
+    const members = server.members || [];
+    body.innerHTML = `
+      <label class="toggle-row"><input id="permPrivate" type="checkbox" ${perms.private ? 'checked' : ''}> Özel kanal (sadece izinli rol/kişiler görür)</label>
+      <div class="section-title">İzinli roller</div>
+      <div id="permRoles" class="perm-roles">${['admin', 'mod', 'member'].map((r) => `<label class="check-row"><input type="checkbox" data-role="${r}" ${(perms.allowedRoles || []).includes(r) ? 'checked' : ''}> ${escapeHTML(ROLE_LABEL[r])}</label>`).join('')}</div>
+      <small class="perm-note">Sahip ve adminler özel kanallara her zaman erişir.</small>
+      <div class="section-title">İzinli kişiler</div>
+      <div id="permUsers" class="perm-users"></div>
+      <div class="wrap-actions"><button id="permSave" class="primary" type="button">Kaydet</button></div>`;
+    const usersWrap = body.querySelector('#permUsers');
+    const allowedSet = new Set(perms.allowedUserIds || []);
+    for (const m of members) {
+      if (m.role === 'owner') continue;
+      const label = document.createElement('label'); label.className = 'check-row';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.dataset.user = m.id; if (allowedSet.has(m.id)) cb.checked = true;
+      label.appendChild(cb); label.appendChild(document.createTextNode(` ${m.displayName || m.username} (${ROLE_LABEL[m.role || 'member']})`));
+      usersWrap.appendChild(label);
+    }
+    if (!members.length) usersWrap.innerHTML = '<div class="empty-state compact">Üye yok.</div>';
+    body.querySelector('#permSave').addEventListener('click', async () => {
+      const isPrivate = body.querySelector('#permPrivate').checked;
+      const allowedRoles = [...body.querySelectorAll('#permRoles input[data-role]')].filter((c) => c.checked).map((c) => c.dataset.role);
+      const allowedUserIds = [...usersWrap.querySelectorAll('input[data-user]')].filter((c) => c.checked).map((c) => c.dataset.user);
+      try {
+        const data = await api(`/api/servers/${server.id}/channels/${channel.id}/privacy`, { method: 'PATCH', body: { private: isPrivate, allowedRoles, allowedUserIds } });
+        replaceServer(data.server); toast(isPrivate ? 'Kanal özel yapıldı. 🔒' : 'Kanal herkese açık yapıldı.'); closeDrawer();
+        if (state.currentServerId === server.id) renderServerPanel(server.id);
+      } catch (e) { toast(e.message); }
+    });
+  });
+}
+
 /* ===================== V7.4 Safe Social Content Pack (client) ===================== */
 let currentDrawerKind = null;
 
@@ -1635,15 +1870,24 @@ function openContextMenu(x, y, sections) {
 
 function getArticleMessage(article) { try { return JSON.parse(article?.dataset?.messageJson || 'null'); } catch { return null; } }
 function canEditMessageClient(message) { return message.user?.id === state.user?.id && message.type === 'text' && !message.encrypted; }
+// ---- V7.6 client role helpers (mirror server policy; server re-checks everything) ----
+const ROLE_LABEL = { owner: 'Sahip', admin: 'Admin', mod: 'Mod', member: 'Üye' };
+const ROLE_RANK_CLIENT = { owner: 3, admin: 2, mod: 1, member: 0 };
+function serverRoleClient(server) {
+  if (!server) return 'member';
+  if (server.myRole) return server.myRole;
+  return (server.isOwner || server.ownerId === state.user?.id) ? 'owner' : 'member';
+}
+function canManageServerClient(server) { return Boolean(server && (server.canManage || server.isOwner || server.ownerId === state.user?.id)); }
+function canModerateServerClient(server) { return Boolean(server && (server.canModerate || canManageServerClient(server))); }
+function currentServerObj() { return state.servers.find((s) => s.id === state.currentServerId) || null; }
 function canDeleteMessageClient(message) {
   if (message.user?.id === state.user?.id) return true;
-  const server = state.servers.find((s) => s.id === state.currentServerId);
-  return Boolean(state.view === 'server' && server && (server.isOwner || server.ownerId === state.user?.id));
+  return Boolean(state.view === 'server' && canModerateServerClient(currentServerObj()));
 }
 function canManagePinsClient() {
   if (state.currentDmFriend) return true;
-  const server = state.servers.find((s) => s.id === state.currentServerId);
-  return Boolean(server && (server.isOwner || server.ownerId === state.user?.id));
+  return canModerateServerClient(currentServerObj());
 }
 function messageMenuFor(message, x, y) {
   if (!message) return;
