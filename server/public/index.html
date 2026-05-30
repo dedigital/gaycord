@@ -9,8 +9,8 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/brand/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/brand/icon-192.png">
-  <link rel="stylesheet" href="/styles.css?v=7.0.1">
-  <link rel="stylesheet" href="/mobile.css?v=7.1.0">
+  <link rel="stylesheet" href="/styles.css?v=7.3.0">
+  <link rel="stylesheet" href="/mobile.css?v=7.3.0">
 </head>
 <body>
   <main id="auth" class="auth-shell hidden">
@@ -73,6 +73,7 @@
       <div id="messages" class="messages" aria-live="polite"></div>
       <div id="typingLine" class="typing-line"></div>
       <form id="messageForm" class="composer">
+        <span id="composerLock" class="composer-lock hidden" aria-hidden="true">🔒 Uçtan uca şifreli</span>
         <button id="fileButton" class="tool-button" type="button" title="Dosya/fotoğraf gönder">＋</button>
         <input id="fileInput" class="hidden" type="file" multiple accept="image/*,audio/*,video/*,.txt,.pdf,.zip">
         <button id="recordButton" class="tool-button voice" type="button" title="Sesli mesaj kaydet">🎙</button>
@@ -96,7 +97,7 @@
   <div id="remoteAudio" class="remote-audio" aria-hidden="true"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/app.js?v=7.2.0" defer></script>
-  <script src="/mobile.js?v=7.1.0" defer></script>
+  <script src="/app.js?v=7.3.0" defer></script>
+  <script src="/mobile.js?v=7.3.0" defer></script>
 </body>
 </html>

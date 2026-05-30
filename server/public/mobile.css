@@ -232,7 +232,8 @@
   }
 
   .message.own {
-    justify-content: flex-end !important;
+    flex-direction: row-reverse !important;
+    justify-content: flex-start !important;
   }
 
   .message .avatar {
@@ -324,6 +325,13 @@
     content: '➤';
     font-size: 16px;
     line-height: 1;
+  }
+
+  .composer-lock {
+    top: -9px !important;
+    right: 12px !important;
+    padding: 2px 8px !important;
+    font-size: 10px !important;
   }
 
   .members-panel {

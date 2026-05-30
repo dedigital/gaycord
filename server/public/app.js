@@ -7,7 +7,7 @@ const els = {
   sidebarMode: $('sidebarMode'), sidebarTitle: $('sidebarTitle'), connectionState: $('connectionState'), dynamicPanel: $('dynamicPanel'),
   meAvatar: $('meAvatar'), meName: $('meName'), meUsername: $('meUsername'), settingsButton: $('settingsButton'), logoutButton: $('logoutButton'),
   chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), e2eeButton: $('e2eeButton'), e2eeWarning: $('e2eeWarning'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
-  messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'),
+  messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'), composerLock: $('composerLock'),
   membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast'),
   publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput')
 };
@@ -38,6 +38,7 @@ const state = {
   recordChannelId: '',
   recordMaxTimer: null,
   sendingFile: false,
+  sendInFlight: false,
   voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null, keepaliveTimer: null, reconnectGraceTimer: null, reconnecting: false, manualLeave: false, peerRestartTimers: new Map() },
   publicStatus: null,
   autoBackupTimer: null,
@@ -119,6 +120,13 @@ async function deriveE2eeKey(passphrase, salt) {
 }
 function e2eeChannelKey(channelId = state.currentChannelId) { return String(channelId || ''); }
 function e2eeEnabled(channelId = state.currentChannelId) { return Boolean(channelId && state.e2ee.enabled.has(e2eeChannelKey(channelId)) && state.e2ee.passphrases.has(e2eeChannelKey(channelId))); }
+function e2eeIntended(channelId = state.currentChannelId) { return Boolean(channelId && state.e2ee.enabled.has(e2eeChannelKey(channelId))); }
+function requireE2eeKeyOrPrompt(channelId) {
+  if (!e2eeIntended(channelId) || e2eePassphrase(channelId)) return true;
+  toast('E2EE açık ama bu sekmede anahtar yok. Mesaj göndermek için anahtar gir.');
+  promptE2eeKey();
+  return false;
+}
 function e2eePassphrase(channelId = state.currentChannelId) { return state.e2ee.passphrases.get(e2eeChannelKey(channelId)) || ''; }
 function setE2eePassphrase(channelId, passphrase, enabled = true) {
   const key = e2eeChannelKey(channelId);
@@ -199,16 +207,19 @@ function renderE2eeButton() {
   const hasChannel = Boolean(state.currentChannelId);
   els.e2eeButton.classList.toggle('hidden', !hasChannel);
   els.e2eeWarning?.classList.toggle('hidden', !hasChannel);
-  if (!hasChannel) return;
+  if (!hasChannel) { els.composerLock?.classList.add('hidden'); return; }
   const on = e2eeEnabled(state.currentChannelId);
   els.e2eeButton.classList.toggle('e2ee-on', on);
-  els.e2eeButton.textContent = on ? '🔒 E2EE açık' : '🔓 E2EE';
-  els.messageInput.placeholder = on ? 'Şifreli mesaj yaz... Server sadece ciphertext görür.' : 'Mesaj yaz, fotoğraf yapıştır veya dosya sürükle...';
+  els.e2eeButton.textContent = on ? '🔒 E2EE' : '🔓 E2EE';
+  els.e2eeButton.title = on ? 'E2EE açık — anahtarı değiştir' : 'E2EE aç / anahtar gir';
+  els.messageInput.placeholder = on ? 'Şifreli mesaj yaz… server yalnızca şifreli metni görür.' : 'Mesaj yaz, fotoğraf yapıştır veya dosya sürükle...';
+  els.composerLock?.classList.toggle('hidden', !on);
   if (els.e2eeWarning) {
     els.e2eeWarning.classList.toggle('e2ee-warning-on', on);
     els.e2eeWarning.innerHTML = on
-      ? '<strong>🔒 E2EE açık</strong><span>Yeni mesaj, dosya ve sesli mesajlar bu sekmedeki anahtarla şifrelenir.</span>'
-      : '<strong>🔓 E2EE kapalı</strong><span>Yeni mesajlar sunucuda okunabilir biçimde saklanır. Hassas içerik için kilit düğmesinden E2EE aç.</span>';
+      ? '<span class="e2ee-dot" aria-hidden="true">🔒</span><span class="e2ee-text">E2EE açık: yeni mesajlar bu sekmedeki anahtarla şifrelenir.</span><button type="button" class="mini-button e2ee-key">Anahtar</button>'
+      : '<span class="e2ee-dot" aria-hidden="true">🔓</span><span class="e2ee-text">E2EE kapalı: yeni mesajlar sunucuda okunabilir.</span><button type="button" class="mini-button e2ee-key">E2EE aç</button>';
+    els.e2eeWarning.querySelector('.e2ee-key')?.addEventListener('click', promptE2eeKey);
   }
 }
 function promptE2eeKey() {
@@ -396,6 +407,7 @@ function resetChat(title = 'Hoş geldin', subtitle = 'Bir kanal veya DM seç.') 
   els.copyInviteButton.classList.add('hidden');
   els.e2eeButton?.classList.add('hidden');
   els.e2eeWarning?.classList.add('hidden');
+  els.composerLock?.classList.add('hidden');
   els.messageInput.value = '';
   autoGrowInput();
   els.messageInput.disabled = true;
@@ -460,7 +472,7 @@ function appendSecureMessage(message, { scroll = true } = {}) {
   const meta = document.createElement('div'); meta.className = 'message-meta';
   const name = document.createElement('strong'); name.textContent = message.user?.displayName || message.user?.username || 'Bilinmeyen';
   const time = document.createElement('time'); time.textContent = formatTime(message.createdAt); meta.append(name, time); bubble.appendChild(meta);
-  const locked = document.createElement('div'); locked.className = 'secure-card'; locked.innerHTML = '<strong>🔒 Şifreli mesaj</strong><small>Bu mesaj serverda okunamaz. Açmak için bu kanalın E2EE anahtarını gir.</small>';
+  const locked = document.createElement('div'); locked.className = 'secure-card'; locked.innerHTML = '<strong>🔒 Bu mesaj şifreli. Anahtar gir.</strong><small>Açmak için bu kanalın E2EE anahtarını gir. Server içeriği göremez.</small>';
   const unlock = document.createElement('button'); unlock.type = 'button'; unlock.className = 'mini-button'; unlock.textContent = 'Anahtar gir / çöz'; unlock.addEventListener('click', promptE2eeKey);
   locked.appendChild(unlock); bubble.appendChild(locked);
   article.append(avatar, bubble); els.messages.appendChild(article);
@@ -629,7 +641,7 @@ async function openChannel(channel, context = {}) {
   els.chatSubtitle.textContent = context.subtitle || 'Mesajlaşmaya başla.';
   els.copyInviteButton.classList.toggle('hidden', !state.currentInviteCode);
   renderE2eeButton();
-  els.messageInput.disabled = false; els.sendButton.disabled = false; els.recordButton.disabled = false; els.fileButton.disabled = false; renderE2eeButton();
+  syncComposerEnabled();
   els.messageInput.focus(); renderVoicePanel();
   if (state.socket?.connected) {
     state.socket.emit('channel:join', { channelId: channel.id }, (response) => { if (response?.error) return toast(response.error); renderMessages(response.messages || []); });
@@ -645,6 +657,14 @@ function connectSocket() {
   state.socket.on('connect', () => {
     els.connectionState.textContent = 'çevrimiçi';
     els.connectionState.classList.remove('offline');
+    // A reconnect creates a fresh server-side socket that is no longer in any channel room,
+    // so re-join the open text channel (and reconcile history) or messages silently stop flowing.
+    if (state.currentChannelId) {
+      state.socket.emit('channel:join', { channelId: state.currentChannelId }, (response) => {
+        if (response?.error) return;
+        if (state.currentChannelId) renderMessages(response?.messages || []);
+      });
+    }
     rejoinVoiceAfterReconnect().catch((error) => console.warn('voice rejoin error', error));
   });
   state.socket.on('disconnect', () => {
@@ -670,28 +690,67 @@ async function sendSecurePayload(payload) {
   if (!state.currentChannelId) return;
   const e2ee = await encryptPayload(state.currentChannelId, payload);
   const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', encrypted: true, e2ee } });
-  if (!state.socket?.connected) appendMessage(data.message);
+  appendMessage(data.message); // optimistic; appendMessage dedups by id when the socket echo also arrives
   return data.message;
 }
-async function sendTextMessage() {
-  const text = els.messageInput.value.trim(); if (!text || !state.currentChannelId) return;
-  els.sendButton.disabled = true;
-  if (e2eeEnabled(state.currentChannelId)) {
+// Keeps composer controls in a sane state. Never leaves inputs permanently disabled.
+function syncComposerEnabled() {
+  const hasChannel = Boolean(state.currentChannelId);
+  if (els.messageInput) els.messageInput.disabled = !hasChannel;
+  if (els.recordButton) els.recordButton.disabled = !hasChannel;
+  if (els.fileButton) els.fileButton.disabled = !hasChannel || state.sendingFile;
+  if (els.sendButton) {
+    const hasText = Boolean(els.messageInput && els.messageInput.value.trim());
+    els.sendButton.disabled = !hasChannel || !hasText || state.sendInFlight;
+  }
+}
+// Socket emit with an ack timeout so a lost ack can never wedge the composer.
+function emitWithTimeout(event, payload, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (!state.socket?.connected) { reject(new Error('socket-offline')); return; }
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; reject(new Error('ack-timeout')); } }, timeoutMs);
     try {
-      await sendSecurePayload({ kind: 'text', text });
-      els.messageInput.value = ''; autoGrowInput(); state.socket?.emit('typing', { channelId: state.currentChannelId, isTyping: false });
-    } catch (e) { toast(e.message); }
-    finally { els.sendButton.disabled = false; }
+      state.socket.emit(event, payload, (response) => {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        if (response?.error) reject(new Error(response.error)); else resolve(response || {});
+      });
+    } catch (error) { if (!settled) { settled = true; clearTimeout(timer); reject(error); } }
+  });
+}
+async function sendPlainText(channelId, text) {
+  if (state.socket?.connected) {
+    const response = await emitWithTimeout('message:text', { channelId, text });
+    if (response?.message) appendMessage(response.message); // render own message even if not in the room
     return;
   }
-  if (state.socket?.connected) {
-    state.socket.emit('message:text', { channelId: state.currentChannelId, text }, (response) => {
-      els.sendButton.disabled = false;
-      if (response?.error) return toast(response.error);
-      els.messageInput.value = ''; autoGrowInput(); state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false });
-    });
-  } else {
-    try { const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', text } }); els.messageInput.value = ''; autoGrowInput(); appendMessage(data.message); } catch (e) { toast(e.message); } finally { els.sendButton.disabled = false; }
+  const data = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'text', text } });
+  appendMessage(data.message);
+}
+async function sendTextMessage() {
+  const channelId = state.currentChannelId;
+  if (!channelId) { toast('Önce bir kanal veya DM seç.'); return; }
+  const text = els.messageInput.value.trim();
+  if (!text) { syncComposerEnabled(); return; }
+  if (state.sendInFlight) return;
+  if (!requireE2eeKeyOrPrompt(channelId)) return;
+  state.sendInFlight = true;
+  syncComposerEnabled();
+  try {
+    if (e2eeEnabled(channelId)) await sendSecurePayload({ kind: 'text', text });
+    else await sendPlainText(channelId, text);
+    els.messageInput.value = '';
+    autoGrowInput();
+    if (state.socket?.connected) state.socket.emit('typing', { channelId, isTyping: false });
+  } catch (error) {
+    const reason = error && error.message;
+    if (reason === 'ack-timeout') toast('Yanıt gecikti. Mesaj gönderilmemişse tekrar dene.');
+    else toast(reason && reason !== 'socket-offline' ? reason : 'Mesaj gönderilemedi, tekrar dene.');
+  } finally {
+    state.sendInFlight = false;
+    syncComposerEnabled();
+    if (state.currentChannelId === channelId && els.messageInput && !els.messageInput.disabled) els.messageInput.focus();
   }
 }
 function blobToDataURL(blob) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(blob); }); }
@@ -736,8 +795,24 @@ function cleanupRecorderUi() {
   els.recordButton.classList.remove('recording');
   els.recordButton.textContent = '🎙';
 }
+// Tear down an in-progress recording WITHOUT uploading (used on logout to avoid a doomed post-signout send).
+function discardRecording() {
+  const recorder = state.recorder;
+  cleanupRecorderUi();
+  if (!recorder) return;
+  recorder.stopped = true;
+  try { recorder.processor?.disconnect(); } catch {}
+  try { recorder.source?.disconnect(); } catch {}
+  try { recorder.silence?.disconnect(); } catch {}
+  state.recordStream?.getTracks().forEach((track) => track.stop());
+  state.recordStream = null;
+  state.recorder = null;
+  state.recordChunks = [];
+  try { recorder.context?.close?.(); } catch {}
+}
 async function startRecording() {
   if (!state.currentChannelId) return toast('Önce kanal veya DM seç.');
+  if (!requireE2eeKeyOrPrompt(state.currentChannelId)) return;
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!navigator.mediaDevices?.getUserMedia || !AudioContextClass) return toast('Tarayıcı ses kaydını desteklemiyor.');
   try {
@@ -787,11 +862,11 @@ async function stopRecording() {
     if (e2eeEnabled(channelId)) {
       const encrypted = await encryptAttachmentForUpload(channelId, blob, { kind: 'voice', mimeType: 'audio/wav', fileName: 'voice.wav', durationMs });
       const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: encrypted.fileData, mimeType: 'application/octet-stream', fileName: 'encrypted-voice.gce', durationMs, encrypted: true, e2ee: encrypted.e2ee } });
-      if (!state.socket?.connected) appendMessage(response.message);
+      appendMessage(response.message);
       toast('Şifreli sesli mesaj gönderildi.');
     } else {
       const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs } });
-      if (!state.socket?.connected) appendMessage(response.message);
+      appendMessage(response.message);
       toast('Sesli mesaj gönderildi.');
     }
   } catch (error) { toast(error.message || 'Sesli mesaj gönderilemedi.'); }
@@ -800,23 +875,24 @@ async function stopRecording() {
 async function sendFile(file) {
   if (!file || !state.currentChannelId || state.sendingFile) return;
   if (file.size > 15 * 1024 * 1024) return toast('Dosya 15 MB sınırını aşıyor.');
+  if (!requireE2eeKeyOrPrompt(state.currentChannelId)) return;
   state.sendingFile = true; els.fileButton.disabled = true;
   try {
     const fileData = await fileToDataURL(file); const caption = els.messageInput.value.trim();
     if (e2eeEnabled(state.currentChannelId)) {
       const encrypted = await encryptAttachmentForUpload(state.currentChannelId, file, { kind: 'file', fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', sizeBytes: file.size || 0, text: caption });
       const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData: encrypted.fileData, fileName: 'encrypted-file.gce', mimeType: 'application/octet-stream', encrypted: true, e2ee: encrypted.e2ee } });
-      if (caption) { els.messageInput.value = ''; autoGrowInput(); }
-      if (!state.socket?.connected) appendMessage(data.message);
+      if (caption) { els.messageInput.value = ''; autoGrowInput(); syncComposerEnabled(); }
+      appendMessage(data.message);
       toast('Şifreli dosya gönderildi.');
     } else {
       const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption } });
-      if (caption) { els.messageInput.value = ''; autoGrowInput(); }
-      if (!state.socket?.connected) appendMessage(data.message);
+      if (caption) { els.messageInput.value = ''; autoGrowInput(); syncComposerEnabled(); }
+      appendMessage(data.message);
       toast('Dosya gönderildi.');
     }
   } catch (e) { toast(e.message); }
-  finally { state.sendingFile = false; els.fileButton.disabled = false; els.fileInput.value = ''; }
+  finally { state.sendingFile = false; els.fileInput.value = ''; syncComposerEnabled(); }
 }
 async function sendFiles(files) { for (const file of [...(files || [])]) await sendFile(file); }
 
@@ -924,8 +1000,9 @@ async function rejoinVoiceAfterReconnect() {
 function renderVoicePanel(serverMembers = null) {
   const inCall = Boolean(state.voice.channelId);
   const viewingCallable = canCallCurrentChannel();
-  if (!inCall && !viewingCallable) { els.voicePanel.classList.add('hidden'); els.voicePanel.innerHTML = ''; return; }
+  if (!inCall && !viewingCallable) { els.voicePanel.classList.add('hidden'); els.voicePanel.classList.remove('reconnecting'); els.voicePanel.innerHTML = ''; return; }
   els.voicePanel.classList.remove('hidden');
+  els.voicePanel.classList.toggle('reconnecting', Boolean(inCall && state.voice.reconnecting));
   const members = serverMembers || [...state.voice.participants.values()].map((p) => p.user || p).filter(Boolean);
   const count = inCall ? Math.max(1, members.filter((m) => m.id !== state.user?.id).length + 1) : 0;
   const activeHere = inCall && state.voice.channelId === state.currentChannelId;
@@ -933,7 +1010,7 @@ function renderVoicePanel(serverMembers = null) {
   const status = state.voice.reconnecting ? 'mikrofon açık tutuluyor' : `${count} kişi bağlı • ${state.voice.muted ? 'mikrofon kapalı' : 'mikrofon açık'}`;
   els.voicePanel.innerHTML = `
     <div class="min-0"><strong>${escapeHTML(title)}</strong><small>${inCall ? status : 'Canlı konuşmak için katıl.'}</small></div>
-    <div class="voice-members">${inCall ? `<span class="voice-chip">Sen ${state.voice.muted ? '🔇' : '🎙'}</span>${members.filter((m) => m.id !== state.user?.id).map((m) => `<span class="voice-chip">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</span>`).join('')}` : '<span class="voice-chip">Hazır</span>'}</div>
+    <div class="voice-members">${inCall ? `<span class="voice-chip ${state.voice.muted ? 'muted' : ''}">Sen ${state.voice.muted ? '🔇' : '🎙'}</span>${members.filter((m) => m.id !== state.user?.id).map((m) => `<span class="voice-chip">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</span>`).join('')}` : '<span class="voice-chip">Hazır</span>'}</div>
     <div class="voice-actions">${inCall ? '<button id="muteVoiceButton" class="ghost" type="button">' + (state.voice.muted ? 'Mikrofonu aç' : 'Mikrofonu kapat') + '</button><button id="leaveVoiceButton" class="ghost danger" type="button">Ayrıl</button>' : '<button id="joinVoiceButton" class="primary" type="button">Sese katıl</button>'}</div>`;
   $('joinVoiceButton')?.addEventListener('click', joinVoice);
   $('leaveVoiceButton')?.addEventListener('click', () => leaveVoice(true));
@@ -1107,15 +1184,15 @@ function wireEvents() {
   els.settingsButton.addEventListener('click', showSettings);
   els.createServerButton.addEventListener('click', async () => { const name = prompt('Sunucu adı?', 'Bizim Ekip'); if (!name) return; try { const data = await api('/api/servers', { method: 'POST', body: { name } }); replaceServer(data.server); renderServerPanel(data.server.id); const first = data.server.channels?.find((c) => c.kind !== 'voice') || data.server.channels?.[0]; if (first) openChannel(first, { title: `${first.kind === 'voice' ? '🔊' : '#'} ${first.name}`, subtitle: `${data.server.name} • Davet kodu: ${data.server.inviteCode}`, inviteCode: data.server.inviteCode, serverId: data.server.id }); } catch (e) { toast(e.message); } });
   els.joinServerButton.addEventListener('click', async () => { const inviteCode = prompt('Davet kodu?'); if (!inviteCode) return; try { const data = await api('/api/servers/join', { method: 'POST', body: { inviteCode } }); replaceServer(data.server); renderServerPanel(data.server.id); toast('Sunucuya katıldın.'); } catch (e) { toast(e.message); } });
-  els.logoutButton.addEventListener('click', async () => { try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} if (state.recorder) await stopRecording(); cleanupVoice({ manual: true }); state.socket?.disconnect(); purgeLegacySensitiveLocalBackups(); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); state.user = null; showAuth(); });
+  els.logoutButton.addEventListener('click', async () => { discardRecording(); cleanupVoice({ manual: true }); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} state.socket?.disconnect(); purgeLegacySensitiveLocalBackups(); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
   els.e2eeButton?.addEventListener('click', promptE2eeKey);
   els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });
-  els.messageInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendTextMessage(); } });
-  els.messageInput.addEventListener('input', () => { autoGrowInput(); if (!state.currentChannelId || !state.socket?.connected) return; state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: true }); clearTimeout(state.typingTimeout); state.typingTimeout = setTimeout(() => state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false }), 900); });
+  els.messageInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); sendTextMessage(); } });
+  els.messageInput.addEventListener('input', () => { autoGrowInput(); syncComposerEnabled(); if (!state.currentChannelId || !state.socket?.connected) return; state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: true }); clearTimeout(state.typingTimeout); state.typingTimeout = setTimeout(() => state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false }), 900); });
   els.recordButton.addEventListener('click', () => state.recorder ? stopRecording() : startRecording());
   els.fileButton.addEventListener('click', () => els.fileInput.click());
-  els.fileInput.addEventListener('change', () => sendFiles(els.fileInput.files));
+  els.fileInput.addEventListener('change', async () => { try { await sendFiles(els.fileInput.files); } finally { els.fileInput.value = ''; } });
   els.messages.addEventListener('dragover', (event) => { event.preventDefault(); els.messages.classList.add('drag-over'); });
   els.messages.addEventListener('dragleave', () => els.messages.classList.remove('drag-over'));
   els.messages.addEventListener('drop', (event) => { event.preventDefault(); els.messages.classList.remove('drag-over'); sendFiles(event.dataTransfer?.files); });
