@@ -188,7 +188,10 @@ function normalizeDb(raw) {
     // V7.6 private channels: default to public. allowedRoles ⊆ {admin,mod,member}; allowedUserIds capped.
     channel.private = Boolean(channel.private);
     channel.allowedRoles = Array.isArray(channel.allowedRoles) ? channel.allowedRoles.filter((r) => ['admin', 'mod', 'member'].includes(r)) : [];
-    channel.allowedUserIds = Array.isArray(channel.allowedUserIds) ? channel.allowedUserIds.filter((x) => typeof x === 'string').slice(0, MAX_ALLOWED_CHANNEL_USERS) : [];
+    const parentServer = channel.serverId ? db.servers[channel.serverId] : null;
+    // Defense-in-depth: drop allow-list entries for users who are not (or no longer) members of the
+    // owning server, so a stale private grant never survives a load/import (mirrors role/timeout pruning).
+    channel.allowedUserIds = Array.isArray(channel.allowedUserIds) ? channel.allowedUserIds.filter((x) => typeof x === 'string' && (!parentServer || (parentServer.memberIds || []).includes(x))).slice(0, MAX_ALLOWED_CHANNEL_USERS) : [];
     channel.topic = String(channel.topic || '').slice(0, 200);
     db.messages[channelId] ||= [];
   }
@@ -1099,6 +1102,22 @@ function revalidateNativeUser(userId) {
     }
   }
 }
+// V7.6 (post-review): when a user is removed from a server (kick/ban/leave), purge their per-server
+// privilege grants so a later rejoin starts as a plain Member with no lingering access. Roles and
+// every channel's allowedUserIds grant are always cleared; the timeout is cleared too unless the
+// caller opts out (a voluntary leave keeps the timeout as anti-evasion). Ban STATE (server.bans) is
+// kept separately and intentionally NOT touched here.
+function clearServerGrantsForUser(serverObj, userId, { clearTimeout = true } = {}) {
+  if (!serverObj || !userId) return;
+  if (serverObj.roles) delete serverObj.roles[userId];
+  if (clearTimeout && serverObj.timeouts) delete serverObj.timeouts[userId];
+  for (const cid of serverObj.channelIds || []) {
+    const channel = db.channels[cid];
+    if (channel && Array.isArray(channel.allowedUserIds) && channel.allowedUserIds.includes(userId)) {
+      channel.allowedUserIds = channel.allowedUserIds.filter((x) => x !== userId);
+    }
+  }
+}
 // V7.6 kick/ban: forcibly remove a user from this server's live channel + voice rooms. The user is
 // already out of memberIds, so revalidate* (Socket.IO + native WS) drops every room they held.
 function removeUserFromServerRealtime(serverObj, userId) {
@@ -1571,7 +1590,7 @@ app.post('/api/servers/:serverId/leave', auth, (req, res) => {
   if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
   if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahibi olduğun sunucudan çıkamazsın; silebilirsin.' });
   serverObj.memberIds = serverObj.memberIds.filter((id) => id !== req.user.id);
-  if (serverObj.roles) delete serverObj.roles[req.user.id]; // drop elevated role so it can't silently return on rejoin (timeouts persist as anti-evasion)
+  clearServerGrantsForUser(serverObj, req.user.id, { clearTimeout: false }); // drop role + private-channel grants so they can't silently return on rejoin (timeout persists as anti-evasion)
   saveDbSoon();
   broadcastServerUpdated(serverObj);
   revalidateUserRooms(req.user.id); // membership change: drop the leaver's live channel rooms immediately
@@ -1716,8 +1735,7 @@ app.post('/api/servers/:serverId/members/:userId/kick', auth, rateLimit('member_
   const check = canActOnMember(serverObj, req.user.id, targetId);
   if (!check.ok) return res.status(check.status).json({ error: check.error });
   serverObj.memberIds = serverObj.memberIds.filter((mid) => mid !== targetId);
-  if (serverObj.roles) delete serverObj.roles[targetId];
-  if (serverObj.timeouts) delete serverObj.timeouts[targetId];
+  clearServerGrantsForUser(serverObj, targetId); // purge role + timeout + private-channel grants so a rejoin starts clean
   addAudit(serverObj, 'member_kicked', req.user.id, targetId, { reason: String(req.body.reason || '').slice(0, 120) });
   saveDbSoon();
   removeUserFromServerRealtime(serverObj, targetId);                       // drop their channel + voice rooms now
@@ -1763,8 +1781,7 @@ app.post('/api/servers/:serverId/members/:userId/ban', auth, rateLimit('member_m
   const check = canActOnMember(serverObj, req.user.id, targetId);
   if (!check.ok) return res.status(check.status).json({ error: check.error });
   serverObj.memberIds = serverObj.memberIds.filter((mid) => mid !== targetId);
-  if (serverObj.roles) delete serverObj.roles[targetId];
-  if (serverObj.timeouts) delete serverObj.timeouts[targetId];
+  clearServerGrantsForUser(serverObj, targetId); // purge role + timeout + private-channel grants (ban state set below is kept separately)
   serverObj.bans = serverObj.bans || {};
   serverObj.bans[targetId] = { by: req.user.id, reason: String(req.body.reason || '').slice(0, 120), at: now() };
   addAudit(serverObj, 'member_banned', req.user.id, targetId, { reason: String(req.body.reason || '').slice(0, 120) });

@@ -1620,9 +1620,10 @@ function canActOnRoleClient(myRole, targetRole) {
 function openServerAdmin(serverId, activeTab = 'overview') {
   const server = state.servers.find((s) => s.id === serverId);
   if (!server) return toast('Sunucu bulunamadı.');
+  if (!canModerateServerClient(server)) return; // plain members cannot open the admin panel (backend also enforces every action)
   const tabs = canManageServerClient(server)
     ? [['overview', 'Genel'], ['members', 'Üyeler'], ['channels', 'Kanallar'], ['moderation', 'Moderasyon'], ['audit', 'Denetim'], ['reports', 'Raporlar']]
-    : [['moderation', 'Moderasyon'], ['audit', 'Denetim']]; // mods get a limited view
+    : [['members', 'Üyeler'], ['moderation', 'Moderasyon'], ['audit', 'Denetim']]; // mods: limited Members (kick/timeout Members only; no role/ban) + moderation + audit
   if (!tabs.some(([k]) => k === activeTab)) activeTab = tabs[0][0];
   openDrawer('admin', `🛡 ${server.name} • Yönetim`, (body) => {
     const tabbar = document.createElement('div'); tabbar.className = 'admin-tabs';

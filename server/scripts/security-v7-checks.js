@@ -450,6 +450,7 @@ async function main() {
     assert(/members\/:userId\/role'[\s\S]{0,200}rateLimit\('role_update'/.test(serverSrc), 'role assignment must be rate-limited');
     assert(/channels\/:channelId\/privacy'[\s\S]{0,200}rateLimit\('channel_privacy'/.test(serverSrc), 'channel privacy changes must be rate-limited');
     assert(/members\/:userId\/kick'[\s\S]{0,200}rateLimit\('member_moderation'/.test(serverSrc), 'moderation actions must be rate-limited');
+    assert(/function clearServerGrantsForUser\([\s\S]*?allowedUserIds\.filter/.test(serverSrc), 'membership removal must purge private-channel allowedUserIds grants (Fix 1)');
 
     const ownerA = await register(baseUrl, 'owner_v74');
     const createdA = await api(baseUrl, '/api/servers', { method: 'POST', session: ownerA, body: { name: 'V74 Social Lab' } });
@@ -629,6 +630,51 @@ async function main() {
     const auditView = await api(baseUrl, `/api/servers/${server76.id}/audit-log`, { session: owner76 });
     assert.equal(auditView.response.status, 200, JSON.stringify(auditView.json));
     assert(Array.isArray(auditView.json.auditLog) && auditView.json.auditLog.some((e) => e.type === 'role_updated'), 'audit log records V7.6 admin actions');
+
+    // Fix 2 (Codex P2): a Mod has backend authority for a LIMITED Members tab — list members and
+    // kick/timeout Members only; cannot change roles, cannot ban, cannot act on Admin/Owner/Mod.
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members`, { session: modUser })).response.status, 200, 'a mod can list members (data behind the Members tab)');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members/${plainMember.user.id}/role`, { method: 'PATCH', session: modUser, body: { role: 'mod' } })).response.status, 403, 'a mod cannot change roles');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members/${plainMember.user.id}/ban`, { method: 'POST', session: modUser, body: {} })).response.status, 403, 'a mod cannot ban');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members/${adminUser.user.id}/kick`, { method: 'POST', session: modUser, body: {} })).response.status, 403, 'a mod cannot kick an admin (hierarchy)');
+    const modTimeout = await api(baseUrl, `/api/servers/${server76.id}/members/${plainMember.user.id}/timeout`, { method: 'POST', session: modUser, body: { minutes: 5 } });
+    assert.equal(modTimeout.response.status, 200, 'a mod can timeout a member');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members/${plainMember.user.id}/timeout`, { method: 'DELETE', session: modUser })).response.status, 200, 'a mod can lift a timeout it can apply (member)');
+
+    // Fix 1 (Codex P2): removing a member purges private-channel grants, so rejoining does NOT
+    // regain explicit allowedUserIds access without re-approval.
+    const regrant = await register(baseUrl, 'regrant_v76');
+    assert.equal((await api(baseUrl, '/api/servers/join', { method: 'POST', session: regrant, body: { inviteCode: server76.inviteCode } })).response.status, 200, 'regrant user joins');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/channels/${privateChannel.id}/privacy`, { method: 'PATCH', session: owner76, body: { private: true, allowedRoles: [], allowedUserIds: [regrant.user.id] } })).response.status, 200, 'owner grants regrant user explicit private access');
+    let rgMe = ((await api(baseUrl, '/api/me', { session: regrant })).json.servers || []).find((s) => s.id === server76.id);
+    assert(rgMe && rgMe.channels.some((c) => c.id === privateChannel.id), 'granted user sees the private channel before removal');
+    assert.equal((await api(baseUrl, `/api/channels/${privateChannel.id}/messages`, { session: regrant })).response.status, 200, 'granted user can read the private channel before removal');
+    // A socket joined before the kick must stop receiving after the kick.
+    const rgSock = connectSocketIo(baseUrl, regrant);
+    assert.equal((await rgSock.emit('channel:join', { channelId: privateChannel.id })).ok, true, 'granted user joins the private channel room');
+    assert.equal((await api(baseUrl, `/api/servers/${server76.id}/members/${regrant.user.id}/kick`, { method: 'POST', session: owner76, body: {} })).response.status, 200, 'owner kicks the granted user');
+    const rgOwnerSock = connectSocketIo(baseUrl, owner76);
+    await rgOwnerSock.emit('channel:join', { channelId: privateChannel.id });
+    const rgLeak = rgSock.waitForEvent('message:new', 1000);
+    await rgOwnerSock.emit('message:text', { channelId: privateChannel.id, text: 'kick sonrasi gizli' });
+    assert.equal(await rgLeak, null, 'kicked user stale socket must NOT receive private message:new');
+    rgSock.close(); rgOwnerSock.close();
+    // Rejoin via a valid invite must NOT restore the stale grant.
+    assert.equal((await api(baseUrl, '/api/servers/join', { method: 'POST', session: regrant, body: { inviteCode: server76.inviteCode } })).response.status, 200, 'kicked user rejoins via valid invite');
+    rgMe = ((await api(baseUrl, '/api/me', { session: regrant })).json.servers || []).find((s) => s.id === server76.id);
+    assert(rgMe && rgMe.channels.every((c) => c.id !== privateChannel.id), 'rejoined user must NOT see the private channel (stale allowedUserIds purged)');
+    assert.equal((await api(baseUrl, `/api/channels/${privateChannel.id}/messages`, { session: regrant })).response.status, 403, 'rejoined user must get 403 on private channel messages');
+    assert.equal((await api(baseUrl, `/api/channels/${privateChannel.id}/media`, { session: regrant })).response.status, 403, 'rejoined user must get 403 on private channel media');
+    assert.equal((await api(baseUrl, `/api/channels/${privateChannel.id}/pins`, { session: regrant })).response.status, 403, 'rejoined user must get 403 on private channel pins');
+    const rgUpdSock = connectSocketIo(baseUrl, regrant);
+    await rgUpdSock.emit('channel:join', { channelId: publicText.id }); // await an emit first so the socket is fully connected before we wait for the broadcast
+    const rgUpd = rgUpdSock.waitForEvent('server:updated', 2000);
+    await api(baseUrl, `/api/servers/${server76.id}`, { method: 'PATCH', session: owner76, body: { name: 'V76 Lab regrant' } });
+    const rgUpdData = await rgUpd;
+    assert(rgUpdData && rgUpdData.server && rgUpdData.server.channels.every((c) => c.id !== privateChannel.id), 'server:updated must NOT leak the private channel to a rejoined non-granted user');
+    rgUpdSock.close();
+    const ownerPermsAfterKick = await api(baseUrl, `/api/servers/${server76.id}/channels/${privateChannel.id}/permissions`, { session: owner76 });
+    assert(Array.isArray(ownerPermsAfterKick.json.allowedUserIds) && !ownerPermsAfterKick.json.allowedUserIds.includes(regrant.user.id), 'kicked user must be removed from allowedUserIds');
 
     // Kick: removes membership, stops realtime, blocks REST.
     const kickSocket = connectSocketIo(baseUrl, plainMember);
