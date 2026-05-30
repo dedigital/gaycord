@@ -64,26 +64,32 @@ public sealed class AudioDuckingService : IDisposable
     {
         var results = new List<(AudioSessionControl, uint, string)>();
         if (!OperatingSystem.IsWindows()) return results;
-        MMDeviceEnumerator? enumerator = null;
         try
         {
-            enumerator = new MMDeviceEnumerator();
+            // Dispose the enumerator and each endpoint MMDevice (both IDisposable COM wrappers) so a
+            // join/leave or duck-level change doesn't leak COM RCWs. The AudioSessionControl entries are
+            // intentionally NOT disposed here — the caller reads/sets their volume after enumeration and
+            // each holds its own COM ref independent of the endpoint MMDevice.
+            using var enumerator = new MMDeviceEnumerator();
             foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
             {
-                try
+                using (device)
                 {
-                    var sessions = device.AudioSessionManager.Sessions;
-                    for (int i = 0; i < sessions.Count; i++)
+                    try
                     {
-                        var session = sessions[i];
-                        uint pid;
-                        try { pid = session.GetProcessID; } catch { continue; }
-                        string key;
-                        try { key = session.GetSessionInstanceIdentifier ?? $"{pid}"; } catch { key = $"{pid}"; }
-                        results.Add((session, pid, key));
+                        var sessions = device.AudioSessionManager.Sessions;
+                        for (int i = 0; i < sessions.Count; i++)
+                        {
+                            var session = sessions[i];
+                            uint pid;
+                            try { pid = session.GetProcessID; } catch { continue; }
+                            string key;
+                            try { key = session.GetSessionInstanceIdentifier ?? $"{pid}"; } catch { key = $"{pid}"; }
+                            results.Add((session, pid, key));
+                        }
                     }
+                    catch { /* skip endpoints we cannot read */ }
                 }
-                catch { /* skip endpoints we cannot read */ }
             }
         }
         catch { /* Core Audio unavailable — caller treats as no-op */ }

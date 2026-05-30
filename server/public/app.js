@@ -471,7 +471,6 @@ async function openVoiceSettings() {
         <label class="toggle-row"><input id="voiceBoost" type="checkbox"${p.voiceBoost ? ' checked' : ''}> Ses güçlendirme (Voice Boost)</label>
         <label class="toggle-row"><input id="voiceGameMode" type="checkbox"${p.gameMode ? ' checked' : ''}> Oyun Modu (sesleri oyun üstünde duy)</label>
         <label class="toggle-row"><input id="voiceNormalize" type="checkbox"${p.normalizeVoices ? ' checked' : ''}> Sesleri dengele (kısık konuşanlara yardım)</label>
-        <label class="toggle-row"><input id="voiceNoiseGate" type="checkbox"${p.noiseGate ? ' checked' : ''}> Gürültü kapısı (deneysel; varsayılan kapalı)</label>
         <label>Ana ses seviyesi: <span id="voiceMasterVal">${p.masterVolume}%</span><input id="voiceMaster" type="range" min="0" max="150" value="${p.masterVolume}"></label>
         <p class="voice-hint">Kişi başına ses seviyesini (%0–${MAX_USER_VOLUME}) ses panelindeki kaydırıcılardan ayarlayabilirsin.</p>
       </div>
@@ -494,7 +493,6 @@ async function openVoiceSettings() {
     $('voiceBoost')?.addEventListener('change', (e) => { setVoicePref('voiceBoost', e.target.checked); applyAllRemoteGains(); renderVoicePanel(); });
     $('voiceGameMode')?.addEventListener('change', (e) => { setVoicePref('gameMode', e.target.checked); applyAllRemoteGains(); renderVoicePanel(); });
     $('voiceNormalize')?.addEventListener('change', (e) => { setVoicePref('normalizeVoices', e.target.checked); applyAllRemoteGains(); });
-    $('voiceNoiseGate')?.addEventListener('change', (e) => setVoicePref('noiseGate', e.target.checked));
     $('voiceMaster')?.addEventListener('input', (e) => { const el = $('voiceMasterVal'); if (el) el.textContent = e.target.value + '%'; setVoicePref('masterVolume', Number(e.target.value)); applyAllRemoteGains(); });
     $('voiceCopyDiag')?.addEventListener('click', copyVoiceDiagnostics);
     $('voiceResetBtn')?.addEventListener('click', () => { if (confirm('Tüm ses ayarları sıfırlansın mı?')) { resetVoicePrefs(); applyAllRemoteGains(); renderVoicePanel(); toast('Ses ayarları sıfırlandı.'); closeDrawer(); openVoiceSettings(); } });
