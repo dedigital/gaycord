@@ -81,6 +81,12 @@ function absoluteUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
   return new URL(url, location.origin).href;
 }
+// Only accept server-generated upload-style URLs; rejects anything with quotes/parens/whitespace so a
+// value can never break out of an HTML attribute or a CSS url('...') context (defense-in-depth).
+function safeMediaUrl(url) {
+  const u = absoluteUrl(url);
+  return /^(https?:\/\/|\/)[^"'()\s<>]*$/.test(u) ? u : '';
+}
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function autoGrowInput() {
   if (!els.messageInput || els.messageInput.tagName !== 'TEXTAREA') return;
@@ -355,7 +361,8 @@ function enterApp(data) {
 
 
 function avatarInner(user) {
-  return user?.avatarUrl ? `<img src="${escapeHTML(absoluteUrl(user.avatarUrl))}" alt="" loading="lazy">` : escapeHTML(initials(user?.displayName || user?.username || '?'));
+  const url = safeMediaUrl(user?.avatarUrl);
+  return url ? `<img src="${url}" alt="" loading="lazy">` : escapeHTML(initials(user?.displayName || user?.username || '?'));
 }
 function renderMe() {
   setAvatar(els.meAvatar, state.user);
@@ -903,12 +910,14 @@ async function stopRecording() {
     const dataUrl = await blobToDataURL(blob);
     if (e2eeEnabled(channelId)) {
       const encrypted = await encryptAttachmentForUpload(channelId, blob, { kind: 'voice', mimeType: 'audio/wav', fileName: 'voice.wav', durationMs });
-      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: encrypted.fileData, mimeType: 'application/octet-stream', fileName: 'encrypted-voice.gce', durationMs, encrypted: true, e2ee: encrypted.e2ee } });
+      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: encrypted.fileData, mimeType: 'application/octet-stream', fileName: 'encrypted-voice.gce', durationMs, encrypted: true, e2ee: encrypted.e2ee, replyTo: consumeReplyTo() } });
       appendMessage(response.message);
+      clearReplyAfterSend();
       toast('Şifreli sesli mesaj gönderildi.');
     } else {
-      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs } });
+      const response = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'voice', audioData: dataUrl, mimeType: 'audio/wav', fileName: 'voice.wav', durationMs, replyTo: consumeReplyTo() } });
       appendMessage(response.message);
+      clearReplyAfterSend();
       toast('Sesli mesaj gönderildi.');
     }
   } catch (error) { toast(error.message || 'Sesli mesaj gönderilemedi.'); }
@@ -923,14 +932,16 @@ async function sendFile(file) {
     const fileData = await fileToDataURL(file); const caption = els.messageInput.value.trim();
     if (e2eeEnabled(state.currentChannelId)) {
       const encrypted = await encryptAttachmentForUpload(state.currentChannelId, file, { kind: 'file', fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', sizeBytes: file.size || 0, text: caption });
-      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData: encrypted.fileData, fileName: 'encrypted-file.gce', mimeType: 'application/octet-stream', encrypted: true, e2ee: encrypted.e2ee } });
+      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData: encrypted.fileData, fileName: 'encrypted-file.gce', mimeType: 'application/octet-stream', encrypted: true, e2ee: encrypted.e2ee, replyTo: consumeReplyTo() } });
       if (caption) { els.messageInput.value = ''; autoGrowInput(); syncComposerEnabled(); }
       appendMessage(data.message);
+      clearReplyAfterSend();
       toast('Şifreli dosya gönderildi.');
     } else {
-      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption } });
+      const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'file', fileData, fileName: file.name || 'dosya', mimeType: file.type || 'application/octet-stream', text: caption, replyTo: consumeReplyTo() } });
       if (caption) { els.messageInput.value = ''; autoGrowInput(); syncComposerEnabled(); }
       appendMessage(data.message);
+      clearReplyAfterSend();
       toast('Dosya gönderildi.');
     }
   } catch (e) { toast(e.message); }
@@ -1207,8 +1218,8 @@ let currentDrawerKind = null;
 
 function setAvatar(el, user) {
   if (!el) return;
-  const url = user?.avatarUrl;
-  if (url) { el.innerHTML = ''; const img = document.createElement('img'); img.src = absoluteUrl(url); img.alt = ''; img.loading = 'lazy'; el.appendChild(img); }
+  const url = safeMediaUrl(user?.avatarUrl);
+  if (url) { el.innerHTML = ''; const img = document.createElement('img'); img.src = url; img.alt = ''; img.loading = 'lazy'; el.appendChild(img); }
   else el.textContent = initials(user?.displayName || user?.username || '?');
 }
 
@@ -1333,7 +1344,7 @@ function decorateArticle(article, message) {
 function updateMessageInDom(message) {
   if (!message || message.channelId !== state.currentChannelId) return;
   const existing = els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`);
-  if (!existing) { appendMessage(message, { scroll: false }); return; }
+  if (!existing) return; // update for a message not in the loaded window — ignore (do not append out of order)
   const rebuilt = buildArticle(message);
   if (rebuilt) existing.replaceWith(rebuilt);
 }
@@ -1357,10 +1368,12 @@ function renderProfileModal(p) {
   const overlay = document.createElement('div'); overlay.id = 'gcProfile'; overlay.className = 'modal-overlay';
   overlay.addEventListener('click', (event) => { if (event.target === overlay) overlay.remove(); });
   const created = p.createdAt ? new Date(p.createdAt).toLocaleDateString('tr-TR') : '';
-  const avatar = p.avatarUrl ? `<img class="profile-avatar" src="${escapeHTML(absoluteUrl(p.avatarUrl))}" alt="">` : `<div class="profile-avatar initials">${escapeHTML(initials(p.displayName || p.username))}</div>`;
+  const avatarSafe = safeMediaUrl(p.avatarUrl);
+  const bannerSafe = safeMediaUrl(p.bannerUrl);
+  const avatar = avatarSafe ? `<img class="profile-avatar" src="${avatarSafe}" alt="">` : `<div class="profile-avatar initials">${escapeHTML(initials(p.displayName || p.username))}</div>`;
   const card = document.createElement('div'); card.className = 'profile-card';
   card.innerHTML = `
-    <div class="profile-banner"${p.bannerUrl ? ` style="background-image:url('${escapeHTML(absoluteUrl(p.bannerUrl))}')"` : ''}></div>
+    <div class="profile-banner"${bannerSafe ? ` style="background-image:url('${bannerSafe}')"` : ''}></div>
     <div class="profile-body">
       ${avatar}
       <h3>${escapeHTML(p.displayName || p.username || '')}</h3>

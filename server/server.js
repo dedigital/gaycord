@@ -681,6 +681,21 @@ function persistUpload({ data, mimeType, fileName = '', prefix = 'file_', channe
   saveDbSoon();
   return { storedName, url: uploadUrl(storedName), mimeType: validated.mimeType, sizeBytes: decoded.buffer.length, originalName: validated.originalName };
 }
+const PROFILE_MEDIA_MAX_BYTES = Number(process.env.PROFILE_MEDIA_MAX_BYTES || 4 * 1024 * 1024);
+function storedNameFromUrl(url) {
+  const match = String(url || '').match(/\/uploads\/([^/?#]+)/);
+  return match ? decodeURIComponent(match[1]) : '';
+}
+// Best-effort removal of a previously stored upload (used when an avatar/banner is replaced) so
+// orphaned blobs do not accumulate in db.uploads / db.uploadBlobs / on disk forever.
+function deleteStoredUpload(url, ownerUserId = '') {
+  const name = storedNameFromUrl(url);
+  if (!name || !/^[a-zA-Z0-9_.-]+$/.test(name)) return;
+  if (ownerUserId && db.uploads?.[name]?.userId && db.uploads[name].userId !== ownerUserId) return;
+  delete db.uploads[name];
+  if (db.uploadBlobs) delete db.uploadBlobs[name];
+  try { const filePath = path.join(UPLOAD_DIR, name); if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+}
 function sendUpload(req, res) {
   const fileName = path.basename(String(req.params.fileName || ''));
   if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) return res.status(404).end();
@@ -901,13 +916,19 @@ function revalidateSocketRooms(socket) {
   for (const room of [...socket.rooms]) {
     if (room === socket.id) continue;
     if (room.startsWith('voice:')) {
+      // Voice membership (webVoiceClients / socket.voiceChannelId) is NOT restored across
+      // connectionStateRecovery, so any restored voice room is stale. Always drop it: if the user is
+      // still in a call the client re-issues voice:join (the single source of truth). If access was
+      // lost, also notify peers so the member list stays correct.
       const channelId = room.slice('voice:'.length);
-      if (canUseLiveVoice(userId, channelId)) continue;
+      const lostAccess = !canUseLiveVoice(userId, channelId);
       socket.leave(room);
       if (webVoiceClients.get(socket.id)?.channelId === channelId) webVoiceClients.delete(socket.id);
       if (socket.voiceChannelId === channelId) socket.voiceChannelId = null;
-      socket.to(room).emit('voice:user_left', { channelId, socketId: socket.id, user: publicUser(socket.user) });
-      broadcastNative('voice:user_left', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+      if (lostAccess) {
+        socket.to(room).emit('voice:user_left', { channelId, socketId: socket.id, user: publicUser(socket.user) });
+        broadcastNative('voice:user_left', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+      }
       emitVoiceMembers(channelId);
     } else if (db.channels[room] && !canAccessChannel(userId, room)) {
       socket.leave(room);
@@ -1419,7 +1440,7 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', MESSAG
 });
 
 // ---- V7.4 Feature 1: message actions (edit own plaintext, delete own/owner, reactions) ----
-app.patch('/api/channels/:channelId/messages/:messageId', auth, (req, res) => {
+app.patch('/api/channels/:channelId/messages/:messageId', auth, rateLimit('message_actions', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const { channelId, messageId } = req.params;
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   const message = findMessageById(channelId, messageId);
@@ -1435,7 +1456,7 @@ app.patch('/api/channels/:channelId/messages/:messageId', auth, (req, res) => {
   broadcastMessageUpdated(channelId, view);
   res.json({ message: view });
 });
-app.delete('/api/channels/:channelId/messages/:messageId', auth, (req, res) => {
+app.delete('/api/channels/:channelId/messages/:messageId', auth, rateLimit('message_actions', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const { channelId, messageId } = req.params;
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   const list = db.messages[channelId] || [];
@@ -1458,7 +1479,12 @@ app.post('/api/channels/:channelId/messages/:messageId/reactions', auth, rateLim
   if (!REACTION_EMOJIS.includes(emoji)) return res.status(400).json({ error: 'Geçersiz tepki.' });
   message.reactions = (message.reactions && typeof message.reactions === 'object') ? message.reactions : {};
   const ids = Array.isArray(message.reactions[emoji]) ? message.reactions[emoji] : [];
-  message.reactions[emoji] = ids.includes(req.user.id) ? ids.filter((uid) => uid !== req.user.id) : [...ids, req.user.id];
+  if (ids.includes(req.user.id)) {
+    message.reactions[emoji] = ids.filter((uid) => uid !== req.user.id);
+  } else {
+    if (ids.length >= 200) return res.status(409).json({ error: 'Bu tepki için sınıra ulaşıldı.' }); // bound stored userIds (matches view cap)
+    message.reactions[emoji] = [...ids, req.user.id];
+  }
   if (!message.reactions[emoji].length) delete message.reactions[emoji];
   saveDbSoon();
   const view = sanitizeMessage(message);
@@ -1469,9 +1495,12 @@ app.post('/api/channels/:channelId/messages/:messageId/reactions', auth, rateLim
 // ---- V7.4 Feature 2: profile (avatar/banner uploads, bio, profile card) ----
 app.post('/api/me/avatar', auth, rateLimit('profile_media', 30, 60 * 1000, (req) => req.user.id), (req, res) => {
   try {
+    if (Math.floor(String(req.body.fileData || '').length * 0.75) > PROFILE_MEDIA_MAX_BYTES) return res.status(400).json({ error: `Avatar ${Math.round(PROFILE_MEDIA_MAX_BYTES / 1024 / 1024)} MB sınırını aşıyor.` });
     const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'image/png', fileName: req.body.fileName || 'avatar.png', prefix: 'avatar_', channelId: '', userId: req.user.id });
-    if (!upload.mimeType.startsWith('image/')) return res.status(400).json({ error: 'Avatar bir görsel olmalı.' });
+    if (!upload.mimeType.startsWith('image/')) { deleteStoredUpload(upload.url, req.user.id); return res.status(400).json({ error: 'Avatar bir görsel olmalı.' }); }
+    const previous = req.user.avatarUrl;
     req.user.avatarUrl = upload.url;
+    if (previous && previous !== upload.url) deleteStoredUpload(previous, req.user.id);
     saveDbSoon();
     emitToUsers([req.user.id], 'me:updated', { user: meUser(req.user) });
     res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
@@ -1479,9 +1508,12 @@ app.post('/api/me/avatar', auth, rateLimit('profile_media', 30, 60 * 1000, (req)
 });
 app.post('/api/me/banner', auth, rateLimit('profile_media', 30, 60 * 1000, (req) => req.user.id), (req, res) => {
   try {
+    if (Math.floor(String(req.body.fileData || '').length * 0.75) > PROFILE_MEDIA_MAX_BYTES) return res.status(400).json({ error: `Afiş ${Math.round(PROFILE_MEDIA_MAX_BYTES / 1024 / 1024)} MB sınırını aşıyor.` });
     const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'image/png', fileName: req.body.fileName || 'banner.png', prefix: 'banner_', channelId: '', userId: req.user.id });
-    if (!upload.mimeType.startsWith('image/')) return res.status(400).json({ error: 'Afiş bir görsel olmalı.' });
+    if (!upload.mimeType.startsWith('image/')) { deleteStoredUpload(upload.url, req.user.id); return res.status(400).json({ error: 'Afiş bir görsel olmalı.' }); }
+    const previous = req.user.bannerUrl;
     req.user.bannerUrl = upload.url;
+    if (previous && previous !== upload.url) deleteStoredUpload(previous, req.user.id);
     saveDbSoon();
     emitToUsers([req.user.id], 'me:updated', { user: meUser(req.user) });
     res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
@@ -1502,7 +1534,7 @@ app.get('/api/channels/:channelId/pins', auth, (req, res) => {
   const pins = (channel?.pinnedMessageIds || []).map((mid) => findMessageById(channelId, mid)).filter(Boolean).map(sanitizeMessage);
   res.json({ pins, canManage: canManagePins(req.user.id, channelId) });
 });
-app.post('/api/channels/:channelId/pins/:messageId', auth, (req, res) => {
+app.post('/api/channels/:channelId/pins/:messageId', auth, rateLimit('message_actions', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const { channelId, messageId } = req.params;
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   if (!canManagePins(req.user.id, channelId)) return res.status(403).json({ error: 'Mesaj sabitleme yetkin yok.' });
@@ -1515,7 +1547,7 @@ app.post('/api/channels/:channelId/pins/:messageId', auth, (req, res) => {
   emitToChannelSockets(channelId, 'channel:pins', { channelId });
   res.json({ ok: true });
 });
-app.delete('/api/channels/:channelId/pins/:messageId', auth, (req, res) => {
+app.delete('/api/channels/:channelId/pins/:messageId', auth, rateLimit('message_actions', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const { channelId, messageId } = req.params;
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   if (!canManagePins(req.user.id, channelId)) return res.status(403).json({ error: 'Yetkin yok.' });
@@ -1535,7 +1567,7 @@ app.get('/api/bookmarks', auth, (req, res) => {
   }
   res.json({ bookmarks: out.reverse() });
 });
-app.post('/api/bookmarks', auth, (req, res) => {
+app.post('/api/bookmarks', auth, rateLimit('user_state', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const channelId = String(req.body.channelId || '');
   const messageId = String(req.body.messageId || '');
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
@@ -1548,7 +1580,7 @@ app.post('/api/bookmarks', auth, (req, res) => {
   }
   res.status(201).json({ ok: true });
 });
-app.delete('/api/bookmarks/:messageId', auth, (req, res) => {
+app.delete('/api/bookmarks/:messageId', auth, rateLimit('user_state', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   req.user.bookmarks = (req.user.bookmarks || []).filter((b) => b.messageId !== req.params.messageId);
   saveDbSoon();
   res.json({ ok: true });
@@ -1563,15 +1595,22 @@ app.get('/api/channels/:channelId/media', auth, (req, res) => {
 });
 
 // ---- V7.4 Feature 5: notification center (unread counts, read markers) ----
-app.post('/api/channels/:channelId/read', auth, (req, res) => {
+app.post('/api/channels/:channelId/read', auth, rateLimit('user_state', 120, 60 * 1000, (req) => req.user.id), (req, res) => {
   const { channelId } = req.params;
   if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
   req.user.reads = (req.user.reads && typeof req.user.reads === 'object') ? req.user.reads : {};
   req.user.reads[channelId] = now();
+  // Prune stale read markers (deleted/left channels) and hard-cap the map so it cannot grow unbounded.
+  const keys = Object.keys(req.user.reads);
+  if (keys.length > 400) {
+    for (const cid of keys) if (!db.channels[cid]) delete req.user.reads[cid];
+    const remaining = Object.keys(req.user.reads);
+    if (remaining.length > 500) for (const cid of remaining.slice(0, remaining.length - 500)) delete req.user.reads[cid];
+  }
   saveDbSoon();
   res.json({ ok: true });
 });
-app.get('/api/notifications', auth, (req, res) => {
+app.get('/api/notifications', auth, rateLimit('notifications', 60, 60 * 1000, (req) => req.user.id), (req, res) => {
   const reads = (req.user.reads && typeof req.user.reads === 'object') ? req.user.reads : {};
   const unread = {};
   let totalUnread = 0;
@@ -1653,6 +1692,9 @@ io.on('connection', (socket) => {
   });
   socket.on('typing', ({ channelId, isTyping } = {}) => {
     if (!canAccessChannel(userId, channelId)) return;
+    // Room-scoped relay: recipients are trusted because revalidateSocketRooms (on connect) and
+    // revalidateUserRooms (on membership change) keep channel rooms free of unauthorized sockets.
+    // Any future kick/ban path MUST call revalidateUserRooms to preserve this invariant.
     socket.to(channelId).emit('typing', { channelId, user: publicUser(socket.user), isTyping: Boolean(isTyping) });
   });
 
