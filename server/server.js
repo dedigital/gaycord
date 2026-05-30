@@ -38,6 +38,9 @@ const SERVER_JOIN_RATE_LIMIT = Number(process.env.SERVER_JOIN_RATE_LIMIT || 5);
 const SERVER_JOIN_RATE_WINDOW_MS = Number(process.env.SERVER_JOIN_RATE_WINDOW_MS || 15 * 60 * 1000);
 const MAX_E2EE_PAYLOAD_LENGTH = MAX_E2EE_TEXT_BYTES;
 const SECURITY_LOG_LIMIT = Number(process.env.SECURITY_LOG_LIMIT || 500);
+const SERVER_AUDIT_LIMIT = Number(process.env.SERVER_AUDIT_LIMIT || 400); // V7.6: per-server audit log cap
+const MAX_ALLOWED_CHANNEL_USERS = Number(process.env.MAX_ALLOWED_CHANNEL_USERS || 200); // V7.6: private channel allow-list cap
+const MAX_CHANNELS_PER_SERVER = Number(process.env.MAX_CHANNELS_PER_SERVER || 100); // V7.6: bound channels (broadcast fan-out is O(members*channels))
 const TRUSTED_ORIGINS = String(process.env.TRUSTED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
 const REQUIRE_HTTPS = String(process.env.REQUIRE_HTTPS || (process.env.RENDER === 'true' ? '1' : '0')) === '1';
 
@@ -161,6 +164,20 @@ function normalizeDb(raw) {
     server.memberIds ||= [];
     server.channelIds ||= [];
     server.createdAt ||= now();
+    // V7.6 roles: backward-compatible defaults. Only non-owner Admin/Mod assignments are stored;
+    // everyone else (and any stale entry) is implicitly a Member. Never destructive.
+    server.roles = (server.roles && typeof server.roles === 'object' && !Array.isArray(server.roles)) ? server.roles : {};
+    for (const uid of Object.keys(server.roles)) {
+      if (uid === server.ownerId || !server.memberIds.includes(uid) || !['admin', 'mod'].includes(server.roles[uid])) delete server.roles[uid];
+    }
+    server.auditLog = Array.isArray(server.auditLog) ? server.auditLog.slice(-SERVER_AUDIT_LIMIT) : [];
+    // V7.6 moderation: timeouts (write-restriction) + bans. Prune expired/invalid/non-member entries on load.
+    server.timeouts = (server.timeouts && typeof server.timeouts === 'object' && !Array.isArray(server.timeouts)) ? server.timeouts : {};
+    for (const uid of Object.keys(server.timeouts)) {
+      const t = server.timeouts[uid];
+      if (!t || !t.until || uid === server.ownerId || !server.memberIds.includes(uid) || Date.parse(t.until) <= Date.now()) delete server.timeouts[uid];
+    }
+    server.bans = (server.bans && typeof server.bans === 'object' && !Array.isArray(server.bans)) ? server.bans : {};
   }
 
   for (const [channelId, channel] of Object.entries(db.channels)) {
@@ -168,6 +185,14 @@ function normalizeDb(raw) {
     channel.kind ||= 'text';
     channel.type ||= channel.serverId ? 'server' : 'dm';
     channel.pinnedMessageIds = Array.isArray(channel.pinnedMessageIds) ? channel.pinnedMessageIds : [];
+    // V7.6 private channels: default to public. allowedRoles ⊆ {admin,mod,member}; allowedUserIds capped.
+    channel.private = Boolean(channel.private);
+    channel.allowedRoles = Array.isArray(channel.allowedRoles) ? channel.allowedRoles.filter((r) => ['admin', 'mod', 'member'].includes(r)) : [];
+    const parentServer = channel.serverId ? db.servers[channel.serverId] : null;
+    // Defense-in-depth: drop allow-list entries for users who are not (or no longer) members of the
+    // owning server, so a stale private grant never survives a load/import (mirrors role/timeout pruning).
+    channel.allowedUserIds = Array.isArray(channel.allowedUserIds) ? channel.allowedUserIds.filter((x) => typeof x === 'string' && (!parentServer || (parentServer.memberIds || []).includes(x))).slice(0, MAX_ALLOWED_CHANNEL_USERS) : [];
+    channel.topic = String(channel.topic || '').slice(0, 200);
     db.messages[channelId] ||= [];
   }
 
@@ -379,13 +404,60 @@ function createOrGetDm(a, b) {
   }
   return db.channels[channelId];
 }
+// ---- V7.6 server roles & permissions (single source of truth) ----
+// Hierarchy: Owner > Admin > Mod > Member. server.roles only stores Admin/Mod; owner is derived from
+// server.ownerId; everyone else who is a member is a Member. App Owner (db.adminUserId) is an app-wide
+// gate for global backups ONLY (requireAdmin) and is deliberately NOT mixed into server role powers.
+const ROLE_RANK = { owner: 3, admin: 2, mod: 1, member: 0 };
+function getServerById(serverId) { return db.servers[serverId] || null; }
+function getServerRole(server, userId) {
+  if (!server || !userId || !server.memberIds?.includes(userId)) return null; // null = not a member
+  if (server.ownerId === userId) return 'owner';
+  const role = server.roles?.[userId];
+  return (role === 'admin' || role === 'mod') ? role : 'member';
+}
+function roleRank(role) { return Number.isFinite(ROLE_RANK[role]) ? ROLE_RANK[role] : -1; }
+function hasServerRole(server, userId, minRole) {
+  const role = getServerRole(server, userId);
+  return role !== null && roleRank(role) >= roleRank(minRole);
+}
+function canManageServer(userId, serverId) { return hasServerRole(getServerById(serverId), userId, 'admin'); }
+function canManageMembers(userId, serverId) { return hasServerRole(getServerById(serverId), userId, 'admin'); }
+function canManageChannels(userId, serverId) { return hasServerRole(getServerById(serverId), userId, 'admin'); }
+function canModerateServer(userId, serverId) { return hasServerRole(getServerById(serverId), userId, 'mod'); }
+function serverActiveTimeout(server, userId) {
+  const t = server?.timeouts?.[userId];
+  if (!t || !t.until || Date.parse(t.until) <= Date.now()) return null;
+  return t;
+}
+function isMemberTimedOut(server, userId) {
+  if (!server || server.ownerId === userId) return false; // owner is never write-restricted
+  return Boolean(serverActiveTimeout(server, userId));
+}
+function canManageMessage(userId, message) {
+  if (!userId || !message) return false;
+  if (message.userId === userId) return true; // own message
+  const channel = db.channels[message.channelId];
+  if (!channel || !channel.serverId) return false; // DM: only own message is manageable
+  return canModerateServer(userId, channel.serverId); // owner/admin/mod may moderate others' messages
+}
 function canAccessChannel(userId, channelId) {
   const channel = db.channels[channelId];
   if (!channel) return false;
-  if (channel.type === 'dm') return channel.memberIds?.includes(userId);
+  if (channel.type === 'dm') return Boolean(channel.memberIds?.includes(userId));
   const server = db.servers[channel.serverId];
-  return Boolean(server && server.memberIds?.includes(userId));
+  if (!server) return false;
+  const role = getServerRole(server, userId);
+  if (!role) return false;                                    // not a server member
+  if (!channel.private) return true;                          // public server channel: any member
+  if (role === 'owner' || role === 'admin') return true;      // managers always retain access (owner can never be locked out)
+  if (channel.allowedUserIds?.includes(userId)) return true;  // explicitly allowed user
+  if ((channel.allowedRoles || []).includes(role)) return true; // role granted access
+  return false;
 }
+// Channel metadata (existence/name) visibility mirrors message access: unauthorized users must not
+// even learn a private channel exists.
+function canSeeChannelMetadata(userId, channelId) { return canAccessChannel(userId, channelId); }
 function channelIsVoice(channelId) { const channel = db.channels[channelId]; return Boolean(channel && (channel.kind === 'voice' || channel.type === 'dm')); }
 function canUseLiveVoice(userId, channelId) {
   const channel = db.channels[channelId];
@@ -393,12 +465,56 @@ function canUseLiveVoice(userId, channelId) {
   return channel.kind === 'voice' || channel.type === 'dm';
 }
 
+// Safe, per-channel view. Only fields the client needs; private allow-lists are sent only with the
+// channel itself (which is already filtered per viewer in ensureServerView), never server-wide.
+function channelView(channel, includeAllowLists = false) {
+  const view = {
+    id: channel.id,
+    type: channel.type,
+    kind: channel.kind,
+    serverId: channel.serverId || '',
+    name: channel.name || '',
+    topic: channel.topic || '',
+    private: Boolean(channel.private),
+    pinnedMessageIds: Array.isArray(channel.pinnedMessageIds) ? channel.pinnedMessageIds : [],
+    createdAt: channel.createdAt
+  };
+  // Curated allow-lists are management metadata: expose them ONLY to channel managers (admin+), never
+  // to ordinary members who merely have access (they'd otherwise enumerate who else was granted in).
+  if (includeAllowLists) {
+    view.allowedRoles = Array.isArray(channel.allowedRoles) ? channel.allowedRoles : [];
+    view.allowedUserIds = Array.isArray(channel.allowedUserIds) ? channel.allowedUserIds : [];
+  }
+  return view;
+}
+// V7.6: viewer-specific. Channels are filtered to those the viewer may see (private channels are
+// hidden entirely from unauthorized members) so a single server payload can never leak private
+// channel metadata. broadcastServerUpdated emits one of these PER member.
 function ensureServerView(server, viewerId = '') {
-  const members = (server.memberIds || []).map((memberId) => db.users[memberId]).filter(Boolean).map((user) => ({
-    ...publicUser(user),
-    owner: user.id === server.ownerId,
-    isOwner: user.id === server.ownerId
-  })).sort((a, b) => Number(b.online) - Number(a.online) || Number(b.owner) - Number(a.owner) || a.displayName.localeCompare(b.displayName, 'tr'));
+  const viewerRole = getServerRole(server, viewerId);
+  const viewerIsManager = viewerRole !== null && roleRank(viewerRole) >= roleRank('mod');
+  const members = (server.memberIds || []).map((memberId) => db.users[memberId]).filter(Boolean).map((user) => {
+    const role = user.id === server.ownerId ? 'owner' : (['admin', 'mod'].includes(server.roles?.[user.id]) ? server.roles[user.id] : 'member');
+    const out = {
+      ...publicUser(user),
+      owner: user.id === server.ownerId,
+      isOwner: user.id === server.ownerId,
+      role
+    };
+    // Moderation state (timeout) is only exposed to managers (mod+); regular members don't need it.
+    if (viewerIsManager) {
+      const t = serverActiveTimeout(server, user.id);
+      out.timedOut = Boolean(t);
+      if (t) out.timeoutUntil = t.until;
+    }
+    return out;
+  }).sort((a, b) => Number(b.online) - Number(a.online) || Number(b.owner) - Number(a.owner) || a.displayName.localeCompare(b.displayName, 'tr'));
+  const viewerCanManageChannels = Boolean(viewerId && canManageChannels(viewerId, server.id));
+  const channels = (server.channelIds || [])
+    .map((channelId) => db.channels[channelId])
+    .filter(Boolean)
+    .filter((channel) => !viewerId || canSeeChannelMetadata(viewerId, channel.id))
+    .map((channel) => channelView(channel, viewerCanManageChannels));
   return {
     id: server.id,
     name: server.name,
@@ -408,7 +524,11 @@ function ensureServerView(server, viewerId = '') {
     memberCount: (server.memberIds || []).length,
     members,
     isOwner: Boolean(viewerId && server.ownerId === viewerId),
-    channels: (server.channelIds || []).map((channelId) => db.channels[channelId]).filter(Boolean),
+    myRole: viewerRole || 'member',
+    canManage: Boolean(viewerId && canManageServer(viewerId, server.id)),
+    canModerate: Boolean(viewerId && canModerateServer(viewerId, server.id)),
+    channelCount: channels.length,
+    channels,
     createdAt: server.createdAt
   };
 }
@@ -799,9 +919,13 @@ function emitToUsers(userIds = [], event, payload) {
   for (const socket of io.sockets.sockets.values()) if (socket.user && allowed.has(socket.user.id)) socket.emit(event, payload);
   broadcastNative(event, payload, (ws) => ws.user && allowed.has(ws.user.id));
 }
+// V7.6 leak prevention: NEVER send one all-channels server view to everyone. Each member receives a
+// view containing only the channels they may see, so private channel metadata cannot leak via
+// server:updated. (Costs one emit per member — fine for realistic server sizes.)
 function broadcastServerUpdated(serverObj) {
-  const server = ensureServerView(serverObj);
-  emitToUsers(serverObj.memberIds || [], 'server:updated', { server });
+  for (const memberId of serverObj.memberIds || []) {
+    emitToUsers([memberId], 'server:updated', { server: ensureServerView(serverObj, memberId) });
+  }
 }
 // V7.4 security: never trust Socket.IO room membership for delivery. connectionStateRecovery can
 // restore old channel rooms after a reconnect, so we emit per connected socket and re-check
@@ -837,17 +961,14 @@ function sanitizeReplyTo(channelId, replyTo) {
 }
 function canDeleteMessage(user, channelId, message) {
   if (!user || !message) return false;
-  if (message.userId === user.id) return true; // own message
-  const channel = db.channels[channelId];
-  if (channel?.serverId) { const server = db.servers[channel.serverId]; if (server && server.ownerId === user.id) return true; } // server owner = moderator
-  return false;
+  return canManageMessage(user.id, { ...message, channelId }); // own message OR owner/admin/mod moderation
 }
 function canManagePins(userId, channelId) {
   const channel = db.channels[channelId];
   if (!channel) return false;
   if (channel.type === 'dm') return Boolean(channel.memberIds?.includes(userId));
-  const server = db.servers[channel.serverId];
-  return Boolean(server && server.ownerId === userId);
+  if (!canAccessChannel(userId, channelId)) return false; // must be able to see the (possibly private) channel
+  return canModerateServer(userId, channel.serverId); // owner/admin/mod may manage pins
 }
 function channelDisplayName(channelId) {
   const channel = db.channels[channelId];
@@ -858,7 +979,8 @@ function channelDisplayName(channelId) {
 }
 function accessibleChannelIdsFor(userId) {
   const ids = new Set();
-  for (const server of Object.values(db.servers)) if (server.memberIds?.includes(userId)) for (const cid of server.channelIds || []) ids.add(cid);
+  // V7.6: respect private channels so notification/unread counts never leak inaccessible channels.
+  for (const server of Object.values(db.servers)) if (server.memberIds?.includes(userId)) for (const cid of server.channelIds || []) if (canAccessChannel(userId, cid)) ids.add(cid);
   for (const [cid, channel] of Object.entries(db.channels)) if (channel.type === 'dm' && channel.memberIds?.includes(userId)) ids.add(cid);
   return [...ids];
 }
@@ -904,7 +1026,7 @@ function emitVoiceMembers(channelId) {
   if (!channelId) return;
   const payload = { channelId, members: voiceMembers(channelId) };
   io.to(`voice:${channelId}`).emit('voice:members', payload);
-  broadcastNative('voice:members', payload, (client) => client.voiceChannelId === channelId);
+  broadcastNative('voice:members', payload, (client) => client.voiceChannelId === channelId && canAccessChannel(client.user?.id, channelId));
 }
 function leaveWebVoice(socket) {
   const channelId = socket.voiceChannelId;
@@ -951,6 +1073,97 @@ function revalidateUserRooms(userId) {
   for (const socket of io.sockets.sockets.values()) {
     if (socket.user && socket.user.id === userId) revalidateSocketRooms(socket);
   }
+  revalidateNativeUser(userId);
+}
+// V7.6: after a privacy/role change affecting a whole server, drop now-unauthorized live rooms for
+// every affected user (current members + any explicitly named, e.g. a just-kicked user) on BOTH
+// Socket.IO and native WS.
+function revalidateServerRooms(serverObj, extraUserIds = []) {
+  const affected = new Set([...(serverObj?.memberIds || []), ...extraUserIds]);
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.user && affected.has(socket.user.id)) revalidateSocketRooms(socket);
+  }
+  for (const userId of affected) revalidateNativeUser(userId);
+}
+// V7.6: native-WS clients are not Socket.IO rooms; their access keys off ws.joinedChannels (text) and
+// ws.voiceChannelId (voice). Drop any entry the user can no longer access so role/privacy changes
+// evict native clients symmetrically with Socket.IO — no ghost voice participants, no stale rooms,
+// and no voice:members/voice:user_joined roster leak to a revoked native client.
+function revalidateNativeUser(userId) {
+  if (!userId) return;
+  for (const ws of nativeClients) {
+    if (!ws.user || ws.user.id !== userId) continue;
+    for (const cid of [...(ws.joinedChannels || [])]) if (!canAccessChannel(userId, cid)) ws.joinedChannels.delete(cid);
+    if (ws.voiceChannelId && !canUseLiveVoice(userId, ws.voiceChannelId)) {
+      const old = ws.voiceChannelId;
+      ws.voiceChannelId = null;
+      broadcastNative('voice:user_left', { channelId: old, user: publicUser(ws.user) }, (client) => client.voiceChannelId === old && canAccessChannel(client.user?.id, old));
+      emitVoiceMembers(old);
+    }
+  }
+}
+// V7.6 (post-review): when a user is removed from a server (kick/ban/leave), purge their per-server
+// privilege grants so a later rejoin starts as a plain Member with no lingering access. Roles and
+// every channel's allowedUserIds grant are always cleared; the timeout is cleared too unless the
+// caller opts out (a voluntary leave keeps the timeout as anti-evasion). Ban STATE (server.bans) is
+// kept separately and intentionally NOT touched here.
+function clearServerGrantsForUser(serverObj, userId, { clearTimeout = true } = {}) {
+  if (!serverObj || !userId) return;
+  if (serverObj.roles) delete serverObj.roles[userId];
+  if (clearTimeout && serverObj.timeouts) delete serverObj.timeouts[userId];
+  for (const cid of serverObj.channelIds || []) {
+    const channel = db.channels[cid];
+    if (channel && Array.isArray(channel.allowedUserIds) && channel.allowedUserIds.includes(userId)) {
+      channel.allowedUserIds = channel.allowedUserIds.filter((x) => x !== userId);
+    }
+  }
+}
+// V7.6 kick/ban: forcibly remove a user from this server's live channel + voice rooms. The user is
+// already out of memberIds, so revalidate* (Socket.IO + native WS) drops every room they held.
+function removeUserFromServerRealtime(serverObj, userId) {
+  revalidateUserRooms(userId);
+}
+// V7.6 audit log: small, sanitized, capped per server. Never stores objects/secrets/E2EE plaintext.
+function addAudit(serverObj, type, actorId, targetId = '', details = {}) {
+  if (!serverObj) return;
+  serverObj.auditLog = Array.isArray(serverObj.auditLog) ? serverObj.auditLog : [];
+  const safeDetails = {};
+  for (const [k, v] of Object.entries(details || {})) {
+    if (v == null) continue;
+    if (typeof v === 'string') safeDetails[String(k).slice(0, 32)] = v.slice(0, 120);
+    else if (typeof v === 'number' || typeof v === 'boolean') safeDetails[String(k).slice(0, 32)] = v;
+    // objects/arrays are intentionally dropped to avoid leaking large/secret payloads
+  }
+  serverObj.auditLog.push({ id: id('aud_'), type: String(type).slice(0, 40), actorId: actorId || '', targetId: targetId || '', details: safeDetails, createdAt: now() });
+  if (serverObj.auditLog.length > SERVER_AUDIT_LIMIT) serverObj.auditLog = serverObj.auditLog.slice(-SERVER_AUDIT_LIMIT);
+}
+function auditEntryView(entry) {
+  return {
+    id: entry.id,
+    type: entry.type,
+    actor: publicUser(db.users[entry.actorId]) || (entry.actorId ? { id: entry.actorId } : null),
+    target: entry.targetId ? (publicUser(db.users[entry.targetId]) || { id: entry.targetId }) : null,
+    details: entry.details || {},
+    createdAt: entry.createdAt
+  };
+}
+// V7.6 moderation hierarchy gate for kick/timeout/ban. Owner > Admin > Mod > Member; nobody may act
+// on the owner or on a peer/superior (admins can act on mods/members, mods on members only).
+function canActOnMember(serverObj, actorId, targetId) {
+  if (!serverObj.memberIds.includes(targetId)) return { ok: false, status: 404, error: 'Üye bulunamadı.' };
+  if (targetId === actorId) return { ok: false, status: 400, error: 'Kendine bu işlemi uygulayamazsın.' };
+  if (targetId === serverObj.ownerId) return { ok: false, status: 403, error: 'Sunucu sahibine işlem yapılamaz.' };
+  const actorRole = getServerRole(serverObj, actorId);
+  const targetRole = getServerRole(serverObj, targetId);
+  if (!actorRole || roleRank(actorRole) < roleRank('mod')) return { ok: false, status: 403, error: 'Bu işlem için yetkin yok.' };
+  if (actorRole !== 'owner' && roleRank(targetRole) >= roleRank(actorRole)) return { ok: false, status: 403, error: 'Kendinle aynı veya üst yetkideki üyeye işlem yapamazsın.' };
+  return { ok: true };
+}
+// V7.6 timeout enforcement: a timed-out member may read but not write (text/voice/file) in a server.
+function assertCanPostInChannel(userId, channelId) {
+  const channel = db.channels[channelId];
+  if (!channel || !channel.serverId) return true; // DMs are unaffected by server timeouts
+  return !isMemberTimedOut(db.servers[channel.serverId], userId);
 }
 
 function createSession(userId, req = null) {
@@ -1166,7 +1379,7 @@ app.post('/api/bootstrap-import', rateLimit('bootstrap_import', 3, 15 * 60 * 100
   res.json({ ok: true, uploads: uploadCount, userCount: Object.keys(db.users || {}).length });
 });
 
-app.post('/api/register', rateLimit('register', 8, 10 * 60 * 1000), (req, res) => {
+app.post('/api/register', rateLimit('register', Number(process.env.REGISTER_RATE_LIMIT || 8), Number(process.env.REGISTER_RATE_WINDOW_MS || 10 * 60 * 1000)), (req, res) => {
   const username = normalizeUsername(req.body.username);
   const displayName = String(req.body.displayName || username).trim().slice(0, 32);
   const password = String(req.body.password || '');
@@ -1339,21 +1552,23 @@ app.post('/api/servers/join', auth, rateLimit('server_join', SERVER_JOIN_RATE_LI
   const code = normalizeInviteCode(req.body.inviteCode);
   const serverObj = Object.values(db.servers).find((server) => server.inviteCode === code);
   if (!serverObj) return res.status(404).json({ error: 'Davet kodu bulunamadı.' });
+  if (serverObj.bans?.[req.user.id]) return res.status(403).json({ error: 'Bu sunucudan yasaklandın.' }); // V7.6: banned users cannot rejoin
   if (!serverObj.memberIds.includes(req.user.id)) serverObj.memberIds.push(req.user.id);
   saveDbSoon();
   broadcastServerUpdated(serverObj);
   res.json({ server: ensureServerView(serverObj, req.user.id) });
 });
-app.patch('/api/servers/:serverId', auth, (req, res) => {
+app.patch('/api/servers/:serverId', auth, rateLimit('server_manage', 60, 60 * 1000, (req) => req.user.id), (req, res) => {
   const serverObj = db.servers[req.params.serverId];
   if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi düzenleyebilir.' });
+  if (!canManageServer(req.user.id, serverObj.id)) return res.status(403).json({ error: 'Bu işlem için yetkin yok.' });
   if (typeof req.body.name === 'string') {
     const name = String(req.body.name || '').trim().slice(0, 40);
     if (name.length < 2) return res.status(400).json({ error: 'Sunucu adı en az 2 karakter olmalı.' });
     serverObj.name = name;
+    addAudit(serverObj, 'server_updated', req.user.id, '', { name });
   }
-  if (req.body.regenerateInvite) serverObj.inviteCode = inviteCode();
+  if (req.body.regenerateInvite) { serverObj.inviteCode = createUniqueInviteCode(db, serverObj.id); addAudit(serverObj, 'invite_regenerated', req.user.id, '', {}); }
   serverObj.updatedAt = now();
   saveDbSoon();
   broadcastServerUpdated(serverObj);
@@ -1375,34 +1590,38 @@ app.post('/api/servers/:serverId/leave', auth, (req, res) => {
   if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
   if (serverObj.ownerId === req.user.id) return res.status(400).json({ error: 'Sahibi olduğun sunucudan çıkamazsın; silebilirsin.' });
   serverObj.memberIds = serverObj.memberIds.filter((id) => id !== req.user.id);
+  clearServerGrantsForUser(serverObj, req.user.id, { clearTimeout: false }); // drop role + private-channel grants so they can't silently return on rejoin (timeout persists as anti-evasion)
   saveDbSoon();
   broadcastServerUpdated(serverObj);
   revalidateUserRooms(req.user.id); // membership change: drop the leaver's live channel rooms immediately
   res.json({ ok: true });
 });
-app.post('/api/servers/:serverId/channels', auth, (req, res) => {
+app.post('/api/servers/:serverId/channels', auth, rateLimit('channel_manage', 60, 60 * 1000, (req) => req.user.id), (req, res) => {
   const serverObj = db.servers[req.params.serverId];
   if (!serverObj || !serverObj.memberIds.includes(req.user.id)) return res.status(404).json({ error: 'Sunucu bulunamadı.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal açabilir.' });
+  if (!canManageChannels(req.user.id, serverObj.id)) return res.status(403).json({ error: 'Bu işlem için yetkin yok.' });
+  if ((serverObj.channelIds?.length || 0) >= MAX_CHANNELS_PER_SERVER) return res.status(400).json({ error: 'Kanal limitine ulaşıldı.' });
   const kind = req.body.kind === 'voice' ? 'voice' : 'text';
   const name = String(req.body.name || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, '').slice(0, 24);
   if (name.length < 2) return res.status(400).json({ error: 'Kanal adı en az 2 karakter olmalı.' });
   const channelId = id('chn_');
-  db.channels[channelId] = { id: channelId, type: 'server', kind, serverId: serverObj.id, name, createdAt: now() };
+  db.channels[channelId] = { id: channelId, type: 'server', kind, serverId: serverObj.id, name, private: false, allowedRoles: [], allowedUserIds: [], topic: '', pinnedMessageIds: [], createdAt: now() };
   db.messages[channelId] = [];
   serverObj.channelIds.push(channelId);
+  addAudit(serverObj, 'channel_created', req.user.id, '', { channel: name, kind });
   saveDbSoon();
   const view = ensureServerView(serverObj, req.user.id);
   broadcastServerUpdated(serverObj);
-  res.status(201).json({ server: view, channel: db.channels[channelId] });
+  res.status(201).json({ server: view, channel: channelView(db.channels[channelId], true) });
 });
-app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
+app.delete('/api/servers/:serverId/channels/:channelId', auth, rateLimit('channel_manage', 60, 60 * 1000, (req) => req.user.id), (req, res) => {
   const serverObj = db.servers[req.params.serverId];
   const channel = db.channels[req.params.channelId];
   if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadı.' });
-  if (serverObj.ownerId !== req.user.id) return res.status(403).json({ error: 'Sadece sunucu sahibi kanal silebilir.' });
+  if (!canManageChannels(req.user.id, serverObj.id)) return res.status(403).json({ error: 'Bu işlem için yetkin yok.' });
   if (serverObj.channelIds.length <= 1) return res.status(400).json({ error: 'Son kanalı silemezsin.' });
   serverObj.channelIds = serverObj.channelIds.filter((id) => id !== channel.id);
+  addAudit(serverObj, 'channel_deleted', req.user.id, '', { channel: channel.name });
   delete db.messages[channel.id];
   delete db.channels[channel.id];
   saveDbSoon();
@@ -1410,6 +1629,184 @@ app.delete('/api/servers/:serverId/channels/:channelId', auth, (req, res) => {
   io.to(`voice:${channel.id}`).emit('channel:deleted', { channelId: channel.id, serverId: serverObj.id });
   broadcastNative('channel:deleted', { channelId: channel.id, serverId: serverObj.id }, (ws) => serverObj.memberIds?.includes(ws.user?.id));
   res.json({ ok: true, server: ensureServerView(serverObj, req.user.id), channelId: channel.id });
+});
+
+// ===================== V7.6 Roles, Private Channels, Moderation & Audit =====================
+const VALID_ASSIGNABLE_ROLES = ['admin', 'mod', 'member'];
+// Load a server the caller is a member of and enforce the required permission tier in one place.
+// need: 'manage'|'members'|'channels' => Admin+ ; 'moderate' => Mod+. Writes the 404/403 response.
+function loadManageableServer(req, res, need = 'manage') {
+  const serverObj = db.servers[req.params.serverId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id)) { res.status(404).json({ error: 'Sunucu bulunamadı.' }); return null; }
+  const ok = need === 'moderate' ? canModerateServer(req.user.id, serverObj.id)
+    : need === 'members' ? canManageMembers(req.user.id, serverObj.id)
+    : need === 'channels' ? canManageChannels(req.user.id, serverObj.id)
+    : canManageServer(req.user.id, serverObj.id);
+  if (!ok) { res.status(403).json({ error: 'Bu işlem için yetkin yok.' }); return null; }
+  return serverObj;
+}
+
+app.get('/api/servers/:serverId/roles', auth, (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate');
+  if (!serverObj) return;
+  res.json({ ownerId: serverObj.ownerId, roles: serverObj.roles || {}, members: ensureServerView(serverObj, req.user.id).members });
+});
+app.get('/api/servers/:serverId/members', auth, (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate');
+  if (!serverObj) return;
+  res.json({ members: ensureServerView(serverObj, req.user.id).members, bans: Object.entries(serverObj.bans || {}).map(([userId, b]) => ({ user: publicUser(db.users[userId]) || { id: userId }, reason: b.reason || '', at: b.at || '' })) });
+});
+// Assign Admin/Mod/Member. Owner/Admin only. Owner is immutable; an Admin cannot touch a peer/superior
+// nor grant a role at/above their own rank. Triggers per-user room revalidation (private access may change).
+app.patch('/api/servers/:serverId/members/:userId/role', auth, rateLimit('role_update', 60, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'members');
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  if (!serverObj.memberIds.includes(targetId)) return res.status(404).json({ error: 'Üye bulunamadı.' });
+  const nextRole = String(req.body.role || '').toLowerCase();
+  if (!VALID_ASSIGNABLE_ROLES.includes(nextRole)) return res.status(400).json({ error: 'Geçersiz rol.' });
+  if (targetId === serverObj.ownerId) return res.status(403).json({ error: 'Sunucu sahibinin rolü değiştirilemez.' });
+  if (targetId === req.user.id) return res.status(400).json({ error: 'Kendi rolünü değiştiremezsin.' });
+  const actorRole = getServerRole(serverObj, req.user.id);
+  const targetCurrentRole = getServerRole(serverObj, targetId);
+  if (actorRole !== 'owner') {
+    if (roleRank(targetCurrentRole) >= roleRank(actorRole)) return res.status(403).json({ error: 'Kendinle aynı veya üst yetkideki üyenin rolünü değiştiremezsin.' });
+    if (roleRank(nextRole) >= roleRank(actorRole)) return res.status(403).json({ error: 'Kendinden yüksek bir rol veremezsin.' });
+  }
+  serverObj.roles = serverObj.roles || {};
+  if (nextRole === 'member') delete serverObj.roles[targetId];
+  else serverObj.roles[targetId] = nextRole;
+  addAudit(serverObj, 'role_updated', req.user.id, targetId, { role: nextRole });
+  saveDbSoon();
+  broadcastServerUpdated(serverObj);
+  revalidateUserRooms(targetId); // role change may grant/revoke private channel access
+  res.json({ ok: true, role: nextRole, server: ensureServerView(serverObj, req.user.id) });
+});
+
+app.get('/api/servers/:serverId/channels/:channelId/permissions', auth, (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  const channel = db.channels[req.params.channelId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadı.' });
+  const canManage = canManageChannels(req.user.id, serverObj.id);
+  if (!canManage && !canAccessChannel(req.user.id, channel.id)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  res.json({
+    channelId: channel.id,
+    name: channel.name,
+    private: Boolean(channel.private),
+    topic: channel.topic || '',
+    permissionsUpdatedAt: channel.permissionsUpdatedAt || null,
+    canManage,
+    // allow-lists are manager-only metadata
+    allowedRoles: canManage ? (channel.allowedRoles || []) : undefined,
+    allowedUserIds: canManage ? (channel.allowedUserIds || []) : undefined
+  });
+});
+// Set channel visibility (public/private) + allow-lists. Owner/Admin only. Owner/Admin always retain
+// access via canAccessChannel, so a channel can never be made inaccessible to the owner.
+app.patch('/api/servers/:serverId/channels/:channelId/privacy', auth, rateLimit('channel_privacy', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = db.servers[req.params.serverId];
+  const channel = db.channels[req.params.channelId];
+  if (!serverObj || !serverObj.memberIds.includes(req.user.id) || !channel || channel.serverId !== serverObj.id) return res.status(404).json({ error: 'Kanal bulunamadı.' });
+  if (!canManageChannels(req.user.id, serverObj.id)) return res.status(403).json({ error: 'Bu işlem için yetkin yok.' });
+  const makePrivate = req.body.private === undefined ? Boolean(channel.private) : Boolean(req.body.private);
+  if (Array.isArray(req.body.allowedRoles)) {
+    channel.allowedRoles = [...new Set(req.body.allowedRoles.map((r) => String(r).toLowerCase()).filter((r) => ['admin', 'mod', 'member'].includes(r)))];
+  }
+  if (Array.isArray(req.body.allowedUserIds)) {
+    const members = new Set(serverObj.memberIds);
+    channel.allowedUserIds = [...new Set(req.body.allowedUserIds.map((x) => String(x)).filter((x) => members.has(x)))].slice(0, MAX_ALLOWED_CHANNEL_USERS);
+  }
+  if (typeof req.body.topic === 'string') channel.topic = req.body.topic.trim().slice(0, 200);
+  channel.private = makePrivate;
+  channel.permissionsUpdatedAt = now();
+  addAudit(serverObj, 'channel_privacy_updated', req.user.id, '', { channel: channel.name, private: makePrivate });
+  saveDbSoon();
+  broadcastServerUpdated(serverObj);                 // unauthorized members lose the channel from their list
+  revalidateServerRooms(serverObj);                  // drop now-unauthorized live text/voice rooms
+  emitToChannelSockets(channel.id, 'channel:permissions', { channelId: channel.id });
+  res.json({ ok: true, channel: channelView(channel, true), server: ensureServerView(serverObj, req.user.id) });
+});
+
+// ---- Member moderation: kick / timeout / ban (audited, rate-limited, hierarchy-enforced) ----
+app.post('/api/servers/:serverId/members/:userId/kick', auth, rateLimit('member_moderation', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate');
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  const check = canActOnMember(serverObj, req.user.id, targetId);
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+  serverObj.memberIds = serverObj.memberIds.filter((mid) => mid !== targetId);
+  clearServerGrantsForUser(serverObj, targetId); // purge role + timeout + private-channel grants so a rejoin starts clean
+  addAudit(serverObj, 'member_kicked', req.user.id, targetId, { reason: String(req.body.reason || '').slice(0, 120) });
+  saveDbSoon();
+  removeUserFromServerRealtime(serverObj, targetId);                       // drop their channel + voice rooms now
+  broadcastServerUpdated(serverObj);                                       // remaining members get the new member list
+  emitToUsers([targetId], 'server:removed', { serverId: serverObj.id, reason: 'kick' });
+  res.json({ ok: true });
+});
+app.post('/api/servers/:serverId/members/:userId/timeout', auth, rateLimit('member_moderation', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate');
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  const check = canActOnMember(serverObj, req.user.id, targetId);
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+  const minutes = Math.floor(Number(req.body.minutes));
+  if (!Number.isFinite(minutes) || minutes < 1) return res.status(400).json({ error: 'Geçerli bir süre gir (dakika).' });
+  const cappedMinutes = Math.min(minutes, 60 * 24 * 7); // hard cap: 7 days
+  const until = new Date(Date.now() + cappedMinutes * 60 * 1000).toISOString();
+  serverObj.timeouts = serverObj.timeouts || {};
+  serverObj.timeouts[targetId] = { until, by: req.user.id, reason: String(req.body.reason || '').slice(0, 120), createdAt: now() };
+  addAudit(serverObj, 'member_timed_out', req.user.id, targetId, { minutes: cappedMinutes, until });
+  saveDbSoon();
+  broadcastServerUpdated(serverObj);
+  emitToUsers([targetId], 'server:member_timeout', { serverId: serverObj.id, until });
+  res.json({ ok: true, until });
+});
+app.delete('/api/servers/:serverId/members/:userId/timeout', auth, rateLimit('member_moderation', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate');
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  const check = canActOnMember(serverObj, req.user.id, targetId); // same hierarchy gate as applying a timeout
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+  if (serverObj.timeouts) delete serverObj.timeouts[targetId];
+  addAudit(serverObj, 'member_timeout_removed', req.user.id, targetId, {});
+  saveDbSoon();
+  broadcastServerUpdated(serverObj);
+  emitToUsers([targetId], 'server:member_timeout', { serverId: serverObj.id, until: null });
+  res.json({ ok: true });
+});
+app.post('/api/servers/:serverId/members/:userId/ban', auth, rateLimit('member_moderation', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'members'); // ban is heavier: Admin+
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  const check = canActOnMember(serverObj, req.user.id, targetId);
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+  serverObj.memberIds = serverObj.memberIds.filter((mid) => mid !== targetId);
+  clearServerGrantsForUser(serverObj, targetId); // purge role + timeout + private-channel grants (ban state set below is kept separately)
+  serverObj.bans = serverObj.bans || {};
+  serverObj.bans[targetId] = { by: req.user.id, reason: String(req.body.reason || '').slice(0, 120), at: now() };
+  addAudit(serverObj, 'member_banned', req.user.id, targetId, { reason: String(req.body.reason || '').slice(0, 120) });
+  saveDbSoon();
+  removeUserFromServerRealtime(serverObj, targetId);
+  broadcastServerUpdated(serverObj);
+  emitToUsers([targetId], 'server:removed', { serverId: serverObj.id, reason: 'ban' });
+  res.json({ ok: true });
+});
+app.delete('/api/servers/:serverId/bans/:userId', auth, rateLimit('member_moderation', 40, 60 * 1000, (req) => req.user.id), (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'members');
+  if (!serverObj) return;
+  const targetId = req.params.userId;
+  if (!serverObj.bans || !serverObj.bans[targetId]) return res.status(404).json({ error: 'Yasaklı üye bulunamadı.' }); // only audit real state transitions
+  delete serverObj.bans[targetId];
+  addAudit(serverObj, 'member_unbanned', req.user.id, targetId, {});
+  saveDbSoon();
+  res.json({ ok: true });
+});
+
+app.get('/api/servers/:serverId/audit-log', auth, (req, res) => {
+  const serverObj = loadManageableServer(req, res, 'moderate'); // Owner/Admin/Mod may view
+  if (!serverObj) return;
+  const entries = (serverObj.auditLog || []).slice(-150).reverse().map(auditEntryView);
+  res.json({ auditLog: entries });
 });
 
 app.get('/api/channels/:channelId/messages', auth, (req, res) => {
@@ -1420,6 +1817,7 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', MESSAG
   try {
     const channelId = req.params.channelId;
     if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+    if (!assertCanPostInChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu sunucuda zaman aşımındasın (timeout); şu an mesaj gönderemezsin.' });
     const type = String(req.body.type || 'text').toLowerCase();
     const replyTo = sanitizeReplyTo(channelId, req.body.replyTo);
     let message;
@@ -1459,6 +1857,7 @@ app.patch('/api/channels/:channelId/messages/:messageId', auth, rateLimit('messa
   const message = findMessageById(channelId, messageId);
   if (!message) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
   if (message.userId !== req.user.id) return res.status(403).json({ error: 'Sadece kendi mesajını düzenleyebilirsin.' });
+  if (!assertCanPostInChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu sunucuda zaman aşımındasın (timeout); şu an mesaj gönderemezsin.' }); // editing re-broadcasts content -> same write-restriction as sending
   if (message.encrypted || message.type !== 'text') return res.status(400).json({ error: 'Sadece kendi şifresiz metin mesajların düzenlenebilir.' });
   const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
   if (!text) return res.status(400).json({ error: 'Boş mesaj olamaz.' });
@@ -1475,10 +1874,13 @@ app.delete('/api/channels/:channelId/messages/:messageId', auth, rateLimit('mess
   const list = db.messages[channelId] || [];
   const index = list.findIndex((m) => m.id === messageId);
   if (index < 0) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
-  if (!canDeleteMessage(req.user, channelId, list[index])) return res.status(403).json({ error: 'Bu mesajı silme yetkin yok.' });
+  const targetMessage = list[index];
+  if (!canDeleteMessage(req.user, channelId, targetMessage)) return res.status(403).json({ error: 'Bu mesajı silme yetkin yok.' });
+  const moderated = targetMessage.userId !== req.user.id; // a moderator removing someone else's message
   list.splice(index, 1);
   const channel = db.channels[channelId];
   if (channel?.pinnedMessageIds) channel.pinnedMessageIds = channel.pinnedMessageIds.filter((mid) => mid !== messageId);
+  if (moderated && channel?.serverId) addAudit(db.servers[channel.serverId], 'message_deleted_by_moderator', req.user.id, targetMessage.userId, { channel: channel.name });
   saveDbSoon();
   broadcastMessageDeleted(channelId, messageId);
   res.json({ ok: true });
@@ -1556,6 +1958,7 @@ app.post('/api/channels/:channelId/pins/:messageId', auth, rateLimit('message_ac
   channel.pinnedMessageIds = Array.isArray(channel.pinnedMessageIds) ? channel.pinnedMessageIds : [];
   if (!channel.pinnedMessageIds.includes(messageId)) channel.pinnedMessageIds.push(messageId);
   if (channel.pinnedMessageIds.length > 50) channel.pinnedMessageIds = channel.pinnedMessageIds.slice(-50);
+  if (channel.serverId) addAudit(db.servers[channel.serverId], 'pin_added', req.user.id, '', { channel: channel.name });
   saveDbSoon();
   emitToChannelSockets(channelId, 'channel:pins', { channelId });
   res.json({ ok: true });
@@ -1566,6 +1969,7 @@ app.delete('/api/channels/:channelId/pins/:messageId', auth, rateLimit('message_
   if (!canManagePins(req.user.id, channelId)) return res.status(403).json({ error: 'Yetkin yok.' });
   const channel = db.channels[channelId];
   if (channel?.pinnedMessageIds) channel.pinnedMessageIds = channel.pinnedMessageIds.filter((mid) => mid !== messageId);
+  if (channel?.serverId) addAudit(db.servers[channel.serverId], 'pin_removed', req.user.id, '', { channel: channel.name });
   saveDbSoon();
   emitToChannelSockets(channelId, 'channel:pins', { channelId });
   res.json({ ok: true });
@@ -1669,6 +2073,7 @@ io.on('connection', (socket) => {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
+      if (!assertCanPostInChannel(userId, channelId)) return callback({ error: 'Bu sunucuda zaman aşımındasın (timeout); şu an mesaj gönderemezsin.' });
       const clean = String(text || '').trim().slice(0, MAX_TEXT_LENGTH);
       if (!clean) return callback({ error: 'Boş mesaj gönderilemez.' });
       const message = createMessage({ channelId, userId, type: 'text', text: clean, replyTo: sanitizeReplyTo(channelId, replyTo) });
@@ -1682,6 +2087,7 @@ io.on('connection', (socket) => {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
+      if (!assertCanPostInChannel(userId, channelId)) return callback({ error: 'Bu sunucuda zaman aşımındasın (timeout); şu an mesaj gönderemezsin.' });
       const secure = Boolean(encrypted);
       const secureMeta = secure ? cleanE2eePayload(e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
       const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: secure ? 'encrypted-voice.gce' : 'voice.webm', prefix: 'voice_', channelId, userId, encrypted: secure });
@@ -1697,6 +2103,7 @@ io.on('connection', (socket) => {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
+      if (!assertCanPostInChannel(userId, channelId)) return callback({ error: 'Bu sunucuda zaman aşımındasın (timeout); şu an mesaj gönderemezsin.' });
       const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }), replyTo: sanitizeReplyTo(channelId, replyTo) });
       broadcastMessage(channelId, message);
       notifyNewMessage(channelId, message);
@@ -1721,7 +2128,7 @@ io.on('connection', (socket) => {
     const peers = [...webVoiceClients.entries()].filter(([socketId, item]) => socketId !== socket.id && item.channelId === channelId).map(([socketId, item]) => ({ socketId, user: item.user }));
     callback({ ok: true, selfId: socket.id, peers, members: voiceMembers(channelId) });
     socket.to(`voice:${channelId}`).emit('voice:user_joined', { channelId, peer: { socketId: socket.id, user: publicUser(socket.user) } });
-    broadcastNative('voice:user_joined', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+    broadcastNative('voice:user_joined', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId && canAccessChannel(client.user?.id, channelId));
     emitVoiceMembers(channelId);
   });
   socket.on('voice:ping', ({ channelId } = {}, callback = () => {}) => {
@@ -1738,7 +2145,7 @@ io.on('connection', (socket) => {
     if (!canAccessChannel(userId, targetChannelId) || !channelIsVoice(targetChannelId)) return;
     if (!frame || frame.length > 120000) return;
     socket.to(`voice:${targetChannelId}`).emit('voice:frame', { channelId: targetChannelId, from: publicUser(socket.user), pcmBase64: frame });
-    broadcastNative('voice:frame', { channelId: targetChannelId, from: publicUser(socket.user), pcmBase64: frame }, (client) => client.voiceChannelId === targetChannelId);
+    broadcastNative('voice:frame', { channelId: targetChannelId, from: publicUser(socket.user), pcmBase64: frame }, (client) => client.voiceChannelId === targetChannelId && canAccessChannel(client.user?.id, targetChannelId));
   });
   socket.on('voice:signal', ({ to, signal } = {}) => {
     const target = String(to || '');
@@ -1793,7 +2200,7 @@ wss.on('connection', (ws) => {
       const old = ws.voiceChannelId;
       ws.voiceChannelId = channelId;
       if (old && old !== channelId) emitVoiceMembers(old);
-      broadcastNative('voice:user_joined', { channelId, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === channelId);
+      broadcastNative('voice:user_joined', { channelId, user: publicUser(ws.user) }, (client) => client !== ws && client.voiceChannelId === channelId && canAccessChannel(client.user?.id, channelId));
       sendNative(ws, 'voice:joined', { channelId, members: voiceMembers(channelId) });
       emitVoiceMembers(channelId);
       return;
@@ -1811,7 +2218,7 @@ wss.on('connection', (ws) => {
       const channelId = String(data.channelId || ws.voiceChannelId || '');
       const pcmBase64 = String(data.pcmBase64 || '');
       if (!channelId || ws.voiceChannelId !== channelId || !canAccessChannel(userId, channelId) || pcmBase64.length > 90000) return;
-      broadcastNative('voice:frame', { channelId, from: publicUser(ws.user), pcmBase64 }, (client) => client !== ws && client.voiceChannelId === channelId);
+      broadcastNative('voice:frame', { channelId, from: publicUser(ws.user), pcmBase64 }, (client) => client !== ws && client.voiceChannelId === channelId && canAccessChannel(client.user?.id, channelId));
     }
   });
   ws.on('close', () => {

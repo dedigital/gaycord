@@ -628,3 +628,34 @@ body[data-theme="rainbow"] { --brand: #ec4899; --brand-2: #22d3ee; --accent-grad
 .voice-meter { height: 10px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; margin: 4px 0; }
 .voice-meter-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--good), var(--brand-2)); transition: width 0.06s linear; }
 .voice-connecting { flex: 0 0 auto; font-size: 11px; color: var(--muted-2); }
+
+/* ===================== V7.6 Roles, Private Channels & Admin Panel ===================== */
+.role-badge { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.04em; vertical-align: middle; border: 1px solid transparent; }
+.role-badge.role-owner { background: rgba(251, 191, 36, 0.16); color: #ffd970; border-color: rgba(251, 191, 36, 0.3); }
+.role-badge.role-admin { background: rgba(139, 92, 246, 0.18); color: #c4b3ff; border-color: rgba(139, 92, 246, 0.34); }
+.role-badge.role-mod { background: rgba(34, 211, 238, 0.14); color: #8ee7f5; border-color: rgba(34, 211, 238, 0.3); }
+.role-badge.role-timeout { background: rgba(251, 113, 133, 0.16); color: #ffb4c3; border-color: rgba(251, 113, 133, 0.32); }
+.channel-lock { font-size: 11px; opacity: 0.8; }
+.member-name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.member-name-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.member-name-row .role-badge { flex: 0 0 auto; }
+
+.admin-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px; border-radius: 14px; background: rgba(255, 255, 255, 0.05); position: sticky; top: 0; z-index: 1; }
+.admin-tab { padding: 8px 12px; border-radius: 10px; background: transparent; color: var(--muted); font-weight: 800; font-size: 13px; }
+.admin-tab.active { background: var(--surface-3); color: #fff; box-shadow: inset 0 0 0 1px var(--line); }
+.admin-tab-content { display: grid; gap: 10px; align-content: start; margin-top: 4px; }
+.admin-stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.admin-stat { display: grid; gap: 2px; place-items: center; padding: 12px 6px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
+.admin-stat strong { font-size: 20px; color: #fff; }
+.admin-stat small { color: var(--muted-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.admin-member { display: grid; gap: 8px; padding: 12px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); }
+.admin-member-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.admin-member-head strong { overflow-wrap: anywhere; }
+.admin-member-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.admin-role-select { flex: 0 0 auto; width: auto; padding: 7px 10px; border-radius: 10px; background: var(--surface-2); color: var(--text); border: 1px solid var(--line-2); font-weight: 700; font-size: 13px; }
+.audit-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 9px 11px; border-radius: 11px; background: var(--surface); border: 1px solid var(--line); }
+.audit-text { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.audit-row time { flex: 0 0 auto; color: var(--muted-2); font-size: 11px; }
+.perm-roles, .perm-users { display: grid; gap: 6px; }
+.perm-users { max-height: 240px; overflow: auto; padding-right: 2px; }
+.perm-note { color: var(--muted-2); font-size: 12px; }
