@@ -280,6 +280,13 @@ async function main() {
   assert(/function restartPeerIce\(/.test(appJs), 'V7.2 ICE restart must remain');
   assert(/state\.voice\.manualLeave = true/.test(appJs), 'manual leave must set manualLeave (no auto-rejoin)');
 
+  // V7.5 stale-device hardening: a stale saved mic id must never brick voice join.
+  assert(appJs.includes('Sistem varsayılanı'), 'Voice Settings must include a default (system default) device option');
+  assert(/function acquireMicStream\(/.test(appJs) && /function isMissingDeviceError\(/.test(appJs), 'mic acquisition must recover from a missing/overconstrained saved device');
+  assert(appJs.includes('Kayıtlı mikrofon bulunamadı, sistem varsayılanı kullanılıyor.'), 'stale-device fallback must inform the user');
+  assert(/function refreshVoiceDevices\(/.test(appJs) && /inputIds\.has\(p\.inputDeviceId\)/.test(appJs), 'stale saved inputDeviceId must be cleared when not enumerated');
+  assert(/state\.voiceDevices\?\.enumerated && !state\.voiceDevices\.inputIds\.has\(dev\)/.test(appJs), 'applyAudioConstraints must not pin an exact deviceId that is not currently enumerated');
+
   // No admin localStorage backup may be reintroduced.
   assert(!/localStorage\.setItem\([^)]*['"`][^'"`]*backup/i.test(appJs), 'app.js must not write backups to localStorage');
   assert(!/setLocalBackup\(\)\s*\{[^}]*localStorage\.setItem/.test(appJs), 'admin localStorage backup must not be reintroduced');

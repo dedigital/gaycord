@@ -46,6 +46,7 @@ const state = {
   replyTo: null,
   notify: { unread: {}, total: 0, items: [], friendRequests: 0 },
   voicePrefs: null,
+  voiceDevices: { inputIds: new Set(), outputIds: new Set(), enumerated: false },
   e2ee: { passphrases: new Map(), enabled: new Set(), objectUrls: new Map() }
 };
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '😮', '😢', '🔥', '👀', '✅', '🙏'];
@@ -86,9 +87,50 @@ function setUserVolume(userId, vol) {
 function applyAudioConstraints(deviceId) {
   const p = state.voicePrefs || voicePrefsDefault;
   const audio = { echoCancellation: p.echoCancellation, noiseSuppression: p.noiseSuppression, autoGainControl: p.autoGainControl };
-  const dev = deviceId || p.inputDeviceId;
+  let dev = deviceId !== undefined ? deviceId : p.inputDeviceId;
+  // Only pin to an exact device once we've reliably confirmed it still exists, so a stale saved
+  // microphone id can never produce an OverconstrainedError. Otherwise request the system default.
+  if (dev && state.voiceDevices?.enumerated && !state.voiceDevices.inputIds.has(dev)) dev = '';
   if (dev) audio.deviceId = { exact: dev };
   return audio;
+}
+function isMissingDeviceError(err) {
+  return ['NotFoundError', 'OverconstrainedError', 'NotReadableError', 'DevicesNotFoundError'].includes(err?.name || '');
+}
+// Acquire the mic with the saved device, recovering once to the system default if that device is
+// missing/overconstrained — a stale saved id must never brick voice join.
+async function acquireMicStream(deviceId) {
+  const wantId = deviceId !== undefined ? deviceId : (state.voicePrefs?.inputDeviceId || '');
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints(wantId) });
+  } catch (err) {
+    if (wantId && isMissingDeviceError(err)) {
+      if (state.voicePrefs) { state.voicePrefs.inputDeviceId = ''; saveVoicePrefs(); }
+      toast('Kayıtlı mikrofon bulunamadı, sistem varsayılanı kullanılıyor.');
+      return await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints('') });
+    }
+    throw err;
+  }
+}
+// Enumerate audio devices, cache real ids, and drop saved device prefs that no longer exist.
+async function refreshVoiceDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === 'audioinput');
+    const outputs = devices.filter((d) => d.kind === 'audiooutput');
+    const inputIds = new Set(inputs.map((d) => d.deviceId).filter(Boolean));
+    const outputIds = new Set(outputs.map((d) => d.deviceId).filter(Boolean));
+    const reliable = inputIds.size > 0; // real ids => permission granted => enumeration is trustworthy
+    state.voiceDevices = { inputIds, outputIds, enumerated: reliable };
+    if (reliable) {
+      const p = state.voicePrefs || (state.voicePrefs = loadVoicePrefs());
+      let changed = false;
+      if (p.inputDeviceId && !inputIds.has(p.inputDeviceId)) { p.inputDeviceId = ''; changed = true; }
+      if (p.outputDeviceId && outputIds.size > 0 && !outputIds.has(p.outputDeviceId)) { p.outputDeviceId = ''; changed = true; }
+      if (changed) saveVoicePrefs();
+    }
+    return { inputs, outputs };
+  } catch { return { inputs: [], outputs: [] }; }
 }
 function setSinkIdSupported() { return typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype; }
 function ensureVoiceAudioCtx() {
@@ -144,7 +186,7 @@ async function changeMicDevice(deviceId) {
   if (state.voicePrefs) { state.voicePrefs.inputDeviceId = deviceId || ''; saveVoicePrefs(); }
   if (!state.voice.channelId) return;
   try {
-    const newStream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints(deviceId) });
+    const newStream = await acquireMicStream(deviceId);
     const oldStream = state.voice.stream;
     state.voice.stream = newStream;
     const track = buildSendTrack();
@@ -254,15 +296,16 @@ function stopSpeakingLoop() {
 async function openVoiceSettings() {
   openDrawer('voice', '🎧 Ses ayarları', async (body) => {
     body.innerHTML = '<div class="empty-state compact">Cihazlar yükleniyor…</div>';
+    const { inputs: mics, outputs: speakers } = await refreshVoiceDevices(); // also clears stale saved device ids
     const p = state.voicePrefs || (state.voicePrefs = loadVoicePrefs());
-    let mics = [], speakers = [];
-    try { const devices = await navigator.mediaDevices.enumerateDevices(); mics = devices.filter((d) => d.kind === 'audioinput'); speakers = devices.filter((d) => d.kind === 'audiooutput'); } catch {}
-    const micOptions = mics.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId === p.inputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Mikrofon ' + (i + 1)))}</option>`).join('');
+    const micDefault = `<option value=""${!p.inputDeviceId ? ' selected' : ''}>Sistem varsayılanı</option>`;
+    const micOptions = mics.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId && d.deviceId === p.inputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Mikrofon ' + (i + 1)))}</option>`).join('');
     const spkSupported = setSinkIdSupported();
-    const spkOptions = speakers.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId === p.outputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Hoparlör ' + (i + 1)))}</option>`).join('');
+    const spkDefault = `<option value=""${!p.outputDeviceId ? ' selected' : ''}>Sistem varsayılanı</option>`;
+    const spkOptions = speakers.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId && d.deviceId === p.outputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Hoparlör ' + (i + 1)))}</option>`).join('');
     body.innerHTML = `
       <div class="settings-section"><h3>Mikrofon</h3>
-        <label>Giriş cihazı<select id="voiceMicSelect">${micOptions || '<option value="">Mikrofon bulunamadı</option>'}</select></label>
+        <label>Giriş cihazı<select id="voiceMicSelect">${micDefault}${micOptions}</select></label>
         <label>Kazanç: <span id="voiceGainVal">${p.inputGain}%</span><input id="voiceGain" type="range" min="0" max="200" value="${p.inputGain}"></label>
         <label class="toggle-row"><input id="voiceEC" type="checkbox"${p.echoCancellation ? ' checked' : ''}> Yankı engelleme</label>
         <label class="toggle-row"><input id="voiceNS" type="checkbox"${p.noiseSuppression ? ' checked' : ''}> Gürültü bastırma</label>
@@ -271,7 +314,7 @@ async function openVoiceSettings() {
         <button id="voiceMicTest" class="ghost" type="button">Mikrofonu test et</button>
       </div>
       <div class="settings-section"><h3>Hoparlör / çıkış</h3>
-        ${spkSupported ? `<label>Çıkış cihazı<select id="voiceSpkSelect">${spkOptions || '<option value="">Cihaz bulunamadı</option>'}</select></label>` : '<p>Tarayıcın çıkış cihazı seçimini desteklemiyor.</p>'}
+        ${spkSupported ? `<label>Çıkış cihazı<select id="voiceSpkSelect">${spkDefault}${spkOptions}</select></label>` : '<p>Tarayıcın çıkış cihazı seçimini desteklemiyor.</p>'}
       </div>`;
     $('voiceMicSelect')?.addEventListener('change', (e) => changeMicDevice(e.target.value));
     $('voiceGain')?.addEventListener('input', (e) => { const el = $('voiceGainVal'); if (el) el.textContent = e.target.value + '%'; });
@@ -287,7 +330,7 @@ async function testMicrophone(barEl) {
   let stream = null; let ownStream = false; let ctx = null;
   try {
     if (state.voice.channelId && state.voice.stream) { stream = state.voice.stream; }
-    else { stream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints() }); ownStream = true; }
+    else { stream = await acquireMicStream(); ownStream = true; }
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) { toast('Tarayıcı ses ölçümünü desteklemiyor.'); if (ownStream) stream.getTracks().forEach((t) => t.stop()); return; }
     ctx = new Ctx();
@@ -1428,11 +1471,12 @@ async function joinVoice() {
   if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast('Tarayıcı canlı sesi desteklemiyor.');
   if (!state.voicePrefs) state.voicePrefs = loadVoicePrefs();
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints() });
+    const stream = await acquireMicStream();
     state.voice = freshVoiceState({ channelId: state.currentChannelId, stream, selfId: state.socket.id, manualLeave: false });
     state.voice.sendTrack = buildSendTrack();
     applyMicEnabled();
     attachAnalyser('self', stream);
+    refreshVoiceDevices().catch(() => {}); // permission granted now: cache real device ids
     renderVoicePanel();
     await emitVoiceJoin(state.currentChannelId);
     toast('Sesli odaya bağlandın.');
