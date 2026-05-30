@@ -96,6 +96,8 @@ function connectSocketIo(baseUrl, session) {
   let connectedResolve;
   let connectedReject;
   const seenPackets = [];
+  const receivedEvents = [];
+  const eventWaiters = new Map();
   const connected = new Promise((resolve, reject) => {
     connectedResolve = resolve;
     connectedReject = reject;
@@ -132,6 +134,19 @@ function connectSocketIo(baseUrl, session) {
       let payload = [];
       try { payload = JSON.parse(ack[2] || '[]'); } catch (error) { callback.reject(error); return; }
       callback.resolve(payload[0] || {});
+      return;
+    }
+    const evt = packet.match(/^42(\d*)(\[[\s\S]*\])$/);
+    if (evt) {
+      try {
+        const arr = JSON.parse(evt[2]);
+        const name = arr[0];
+        const data = arr[1];
+        receivedEvents.push({ name, data });
+        const waiters = eventWaiters.get(name) || [];
+        eventWaiters.set(name, []);
+        for (const w of waiters) { clearTimeout(w.timer); w.resolve(data); }
+      } catch {}
     }
   });
   ws.on('error', (error) => connectedReject(error));
@@ -157,6 +172,19 @@ function connectSocketIo(baseUrl, session) {
       ws.send(`42${ackId}${JSON.stringify([event, payload])}`);
       return result;
     },
+    waitForEvent(name, ms = 1000) {
+      return new Promise((resolve) => {
+        const entry = { resolve };
+        entry.timer = setTimeout(() => {
+          eventWaiters.set(name, (eventWaiters.get(name) || []).filter((e) => e !== entry));
+          resolve(null);
+        }, ms);
+        const arr = eventWaiters.get(name) || [];
+        arr.push(entry);
+        eventWaiters.set(name, arr);
+      });
+    },
+    receivedEventNames() { return receivedEvents.map((e) => e.name); },
     close() {
       try { ws.close(); } catch {}
     }
@@ -196,11 +224,11 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.3.0', 'mobile.css?v=7.3.0', 'app.js?v=7.3.0', 'mobile.js?v=7.3.0']) {
+  for (const asset of ['styles.css?v=7.4.0', 'mobile.css?v=7.4.0', 'app.js?v=7.4.0', 'mobile.js?v=7.4.0']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-3-shell'/.test(swJs), 'service worker cache name must be bumped for V7.3');
+  assert(/CACHE_NAME = 'gaycord-v7-4-shell'/.test(swJs), 'service worker cache name must be bumped for V7.4');
 
   // Mobile assets must still be referenced (V7.1 drawer/sheet preserved).
   assert(indexHtml.includes('/mobile.js'), 'index.html must reference mobile.js');
@@ -354,6 +382,60 @@ async function main() {
     assert.deepEqual(storedDb.sessions, {}, 'import must not restore sessions');
 
     console.log('V7.2 security and voice checks passed');
+
+    // --- V7.4: stale recovered room authorization (connectionStateRecovery) ---
+    const serverSrc = read('server.js');
+    assert(/connectionStateRecovery/.test(serverSrc), 'connectionStateRecovery must remain enabled (must not be disabled)');
+    assert(/function revalidateSocketRooms\(/.test(serverSrc), 'revalidateSocketRooms helper must exist');
+    assert(/revalidateSocketRooms\(socket\)/.test(serverSrc), 'revalidateSocketRooms must run on the connected socket');
+    assert(/function emitToChannelSockets\([\s\S]*?canAccessChannel\(target\.user\.id, channelId\)/.test(serverSrc), 'broadcastMessage must authorize per socket via canAccessChannel');
+    assert(/broadcastNative\('message:new'[\s\S]*?canAccessChannel\(ws\.user\.id, channelId\)/.test(serverSrc), 'native message:new must also respect canAccessChannel');
+
+    const ownerA = await register(baseUrl, 'owner_v74');
+    const createdA = await api(baseUrl, '/api/servers', { method: 'POST', session: ownerA, body: { name: 'V74 Social Lab' } });
+    assert.equal(createdA.response.status, 201, JSON.stringify(createdA.json));
+    const serverA = createdA.json.server;
+    const textA = serverA.channels.find((c) => c.kind === 'text');
+    const leaver = await register(baseUrl, 'leaver_v74');
+    const joinedA = await api(baseUrl, '/api/servers/join', { method: 'POST', session: leaver, body: { inviteCode: serverA.inviteCode } });
+    assert.equal(joinedA.response.status, 200, JSON.stringify(joinedA.json));
+
+    const ownerSocket = connectSocketIo(baseUrl, ownerA);
+    const leaverSocket = connectSocketIo(baseUrl, leaver);
+    assert.equal((await ownerSocket.emit('channel:join', { channelId: textA.id })).ok, true, 'owner joins channel');
+    assert.equal((await leaverSocket.emit('channel:join', { channelId: textA.id })).ok, true, 'member joins channel while still a member');
+
+    // Member leaves the server; REST access must immediately become 403.
+    const left = await api(baseUrl, `/api/servers/${serverA.id}/leave`, { method: 'POST', session: leaver, body: {} });
+    assert.equal(left.response.status, 200, JSON.stringify(left.json));
+    const restAfter = await api(baseUrl, `/api/channels/${textA.id}/messages`, { session: leaver });
+    assert.equal(restAfter.response.status, 403, 'REST access must be 403 after leaving the server');
+    // V7.4 social endpoints must also enforce channel access.
+    const mediaAfter = await api(baseUrl, `/api/channels/${textA.id}/media`, { session: leaver });
+    assert.equal(mediaAfter.response.status, 403, 'media gallery must be 403 for non-members');
+    const pinsAfter = await api(baseUrl, `/api/channels/${textA.id}/pins`, { session: leaver });
+    assert.equal(pinsAfter.response.status, 403, 'pins must be 403 for non-members');
+
+    // Realtime delivery must also stop: owner (authorized) receives, ex-member (stale socket) does NOT.
+    const ownerRecv = ownerSocket.waitForEvent('message:new', 1500);
+    const leakRecv = leaverSocket.waitForEvent('message:new', 1000);
+    const sent = await ownerSocket.emit('message:text', { channelId: textA.id, text: 'sadece uyeler gorur' });
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    const ownerGot = await ownerRecv;
+    assert(ownerGot && ownerGot.text === 'sadece uyeler gorur', 'authorized member must still receive message:new');
+    const leak = await leakRecv;
+    assert.equal(leak, null, 'a member who left must NOT receive message:new even with a stale recovered room');
+
+    // Normal reconnect while still authorized continues to work.
+    const ownerReconnect = connectSocketIo(baseUrl, ownerA);
+    const rejoin = await ownerReconnect.emit('channel:join', { channelId: textA.id });
+    assert.equal(rejoin.ok, true, 'authorized reconnect must still join the channel');
+    assert(Array.isArray(rejoin.messages), 'reconnect join returns channel history');
+
+    ownerSocket.close();
+    leaverSocket.close();
+    ownerReconnect.close();
+    console.log('V7.4 stale recovered room authorization checks passed');
   } catch (error) {
     error.message += `\n\nServer output:\n${output}`;
     throw error;

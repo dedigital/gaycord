@@ -9,8 +9,8 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/brand/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/brand/icon-192.png">
-  <link rel="stylesheet" href="/styles.css?v=7.3.0">
-  <link rel="stylesheet" href="/mobile.css?v=7.3.0">
+  <link rel="stylesheet" href="/styles.css?v=7.4.0">
+  <link rel="stylesheet" href="/mobile.css?v=7.4.0">
 </head>
 <body>
   <main id="auth" class="auth-shell hidden">
@@ -66,7 +66,7 @@
     <section id="chatDropZone" class="chat">
       <header class="chat-header">
         <div class="chat-title-wrap min-0"><small id="chatKicker">Hazır</small><h2 id="chatTitle">Hoş geldin</h2><p id="chatSubtitle">Bir kanal veya DM seç.</p></div>
-        <div class="chat-actions"><button id="mobileMenuButton" class="ghost mobile-only" type="button">☰ Menü</button><button id="e2eeButton" class="ghost hidden" type="button" title="Uçtan uca şifreleme">🔓 E2EE</button><button id="copyInviteButton" class="ghost hidden" type="button">Davet kodu</button><button id="mobileMembersButton" class="ghost mobile-only" type="button">Üyeler</button></div>
+        <div class="chat-actions"><button id="mobileMenuButton" class="ghost mobile-only" type="button">☰ Menü</button><button id="notificationsButton" class="ghost" type="button" title="Bildirimler">🔔<span id="notifBadge" class="notif-badge hidden">0</span></button><button id="savedButton" class="ghost" type="button" title="Kaydedilenler">🔖</button><button id="pinsButton" class="ghost hidden" type="button" title="Sabitlenen mesajlar">📌</button><button id="mediaButton" class="ghost hidden" type="button" title="Medya galerisi">🖼</button><button id="e2eeButton" class="ghost hidden" type="button" title="Uçtan uca şifreleme">🔓 E2EE</button><button id="copyInviteButton" class="ghost hidden" type="button">Davet kodu</button><button id="mobileMembersButton" class="ghost mobile-only" type="button">Üyeler</button></div>
       </header>
       <section id="voicePanel" class="voice-panel hidden" aria-live="polite"></section>
       <section id="e2eeWarning" class="e2ee-warning hidden" aria-live="polite"></section>
@@ -74,6 +74,7 @@
       <div id="typingLine" class="typing-line"></div>
       <form id="messageForm" class="composer">
         <span id="composerLock" class="composer-lock hidden" aria-hidden="true">🔒 Uçtan uca şifreli</span>
+        <div id="replyBar" class="reply-bar hidden"><span id="replyBarText" class="reply-bar-text"></span><button id="replyCancelButton" class="reply-bar-close" type="button" title="Yanıtı iptal et">✕</button></div>
         <button id="fileButton" class="tool-button" type="button" title="Dosya/fotoğraf gönder">＋</button>
         <input id="fileInput" class="hidden" type="file" multiple accept="image/*,audio/*,video/*,.txt,.pdf,.zip">
         <button id="recordButton" class="tool-button voice" type="button" title="Sesli mesaj kaydet">🎙</button>
@@ -97,7 +98,7 @@
   <div id="remoteAudio" class="remote-audio" aria-hidden="true"></div>
   <div id="toast" class="toast hidden"></div>
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/app.js?v=7.3.0" defer></script>
-  <script src="/mobile.js?v=7.3.0" defer></script>
+  <script src="/app.js?v=7.4.0" defer></script>
+  <script src="/mobile.js?v=7.4.0" defer></script>
 </body>
 </html>

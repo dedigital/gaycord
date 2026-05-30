@@ -401,6 +401,13 @@
   h1 {
     font-size: clamp(30px, 12vw, 44px) !important;
   }
+
+  /* V7.4: message actions are always visible on touch (no hover) */
+  .msg-actions-btn { opacity: .82 !important; }
+  .drawer-panel { width: 100% !important; }
+  .context-menu { max-width: calc(100vw - 24px) !important; }
+  .media-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)) !important; }
+  .profile-card { width: 100% !important; }
 }
 
 @media (max-width: 380px) {

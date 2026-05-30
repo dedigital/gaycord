@@ -130,6 +130,11 @@ function normalizeDb(raw) {
     user.displayName ||= user.username;
     user.status ||= '';
     user.createdAt ||= now();
+    user.avatarUrl ||= '';
+    user.bannerUrl ||= '';
+    user.bio = String(user.bio || '');
+    user.bookmarks = Array.isArray(user.bookmarks) ? user.bookmarks : [];
+    user.reads = (user.reads && typeof user.reads === 'object' && !Array.isArray(user.reads)) ? user.reads : {};
     user.settings = { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true, ...(user.settings || {}) };
     user.passwordIterations ||= user.passwordHash ? 140000 : undefined;
     user.failedLoginCount ||= 0;
@@ -162,6 +167,7 @@ function normalizeDb(raw) {
     channel.id ||= channelId;
     channel.kind ||= 'text';
     channel.type ||= channel.serverId ? 'server' : 'dm';
+    channel.pinnedMessageIds = Array.isArray(channel.pinnedMessageIds) ? channel.pinnedMessageIds : [];
     db.messages[channelId] ||= [];
   }
 
@@ -329,13 +335,14 @@ function publicUser(user) {
     username: user.username,
     displayName: user.displayName || user.username,
     status: user.status || '',
+    avatarUrl: user.avatarUrl || '',
     online: onlineCounts.has(user.id),
     createdAt: user.createdAt
   };
 }
 
 function meUser(user) {
-  return { ...publicUser(user), settings: user?.settings || { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true } };
+  return { ...publicUser(user), bio: String(user?.bio || ''), bannerUrl: user?.bannerUrl || '', settings: user?.settings || { theme: 'dark', compactMode: false, reduceMotion: false, e2eeHints: true } };
 }
 
 function isAdminUser(user) {
@@ -432,6 +439,25 @@ function uploadUrl(fileName) {
   if (PUBLIC_URL) return `${PUBLIC_URL}/uploads/${encoded}`;
   return `/uploads/${encoded}`;
 }
+function findMessageById(channelId, messageId) {
+  return (db.messages[channelId] || []).find((m) => m.id === messageId) || null;
+}
+function reactionsView(reactions) {
+  if (!reactions || typeof reactions !== 'object') return [];
+  return Object.entries(reactions)
+    .filter(([, ids]) => Array.isArray(ids) && ids.length)
+    .map(([emoji, ids]) => ({ emoji, count: ids.length, userIds: ids.slice(0, 200) }));
+}
+function replyPreviewFor(message) {
+  if (!message.replyTo) return null;
+  const target = findMessageById(message.channelId, message.replyTo);
+  if (!target) return { id: message.replyTo, user: null, deleted: true, text: '', encrypted: false };
+  const u = publicUser(db.users[target.userId]);
+  const text = target.encrypted ? '' : String(
+    target.type === 'voice' ? '🎙️ sesli mesaj' : target.type === 'file' ? `📎 ${target.fileName || 'dosya'}` : (target.text || '')
+  ).slice(0, 120);
+  return { id: target.id, user: u ? { id: u.id, displayName: u.displayName, username: u.username } : null, encrypted: Boolean(target.encrypted), type: target.type, text };
+}
 function sanitizeMessage(message) {
   const user = db.users[message.userId];
   return {
@@ -448,6 +474,10 @@ function sanitizeMessage(message) {
     durationMs: message.durationMs || null,
     encrypted: Boolean(message.encrypted),
     e2ee: message.e2ee || null,
+    replyTo: message.replyTo || null,
+    replyPreview: replyPreviewFor(message),
+    reactions: reactionsView(message.reactions),
+    editedAt: message.editedAt || null,
     createdAt: message.createdAt
   };
 }
@@ -498,8 +528,8 @@ function enforceMessageAggregateLimits(channelId, userId) {
   trimChannelMessages(channelId);
   trimUserMessages(userId);
 }
-function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null, encrypted = false, e2ee = null }) {
-  const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, encrypted: Boolean(encrypted), e2ee: e2ee || null, createdAt: now() };
+function createMessage({ channelId, userId, type, text = '', audioUrl = '', fileUrl = '', fileName = '', mimeType = '', sizeBytes = null, durationMs = null, encrypted = false, e2ee = null, replyTo = null }) {
+  const message = { id: id('msg_'), channelId, userId, type, text, audioUrl, fileUrl, fileName, mimeType, sizeBytes, durationMs, encrypted: Boolean(encrypted), e2ee: e2ee || null, replyTo: replyTo || null, reactions: {}, createdAt: now() };
   const messageBytes = approxStoredBytes(message);
   if (messageBytes > Math.min(MAX_STORED_MESSAGE_BYTES, MAX_CHANNEL_MESSAGE_BYTES, MAX_USER_MESSAGE_BYTES)) throw new Error('Mesaj güvenlik sınırını aşıyor. Büyük dosyaları mesaj gövdesinde değil upload olarak gönder.');
   db.messages[channelId] ||= [];
@@ -747,9 +777,91 @@ function broadcastServerUpdated(serverObj) {
   const server = ensureServerView(serverObj);
   emitToUsers(serverObj.memberIds || [], 'server:updated', { server });
 }
+// V7.4 security: never trust Socket.IO room membership for delivery. connectionStateRecovery can
+// restore old channel rooms after a reconnect, so we emit per connected socket and re-check
+// canAccessChannel at send time. Nothing is broadcast to the room itself, so disconnected
+// recoverable sessions also get nothing buffered for replay.
+function emitToChannelSockets(channelId, event, payload) {
+  const room = io.sockets.adapter.rooms.get(channelId);
+  if (!room) return;
+  for (const socketId of [...room]) {
+    const target = io.sockets.sockets.get(socketId);
+    if (target?.user && canAccessChannel(target.user.id, channelId)) target.emit(event, payload);
+  }
+}
 function broadcastMessage(channelId, message) {
-  io.to(channelId).emit('message:new', message);
-  broadcastNative('message:new', { message }, (ws) => ws.joinedChannels?.has(channelId));
+  emitToChannelSockets(channelId, 'message:new', message);
+  broadcastNative('message:new', { message }, (ws) => ws.user && ws.joinedChannels?.has(channelId) && canAccessChannel(ws.user.id, channelId));
+}
+function broadcastMessageUpdated(channelId, message) {
+  emitToChannelSockets(channelId, 'message:updated', message);
+  broadcastNative('message:updated', { message }, (ws) => ws.user && ws.joinedChannels?.has(channelId) && canAccessChannel(ws.user.id, channelId));
+}
+function broadcastMessageDeleted(channelId, messageId) {
+  emitToChannelSockets(channelId, 'message:deleted', { channelId, messageId });
+  broadcastNative('message:deleted', { channelId, messageId }, (ws) => ws.user && ws.joinedChannels?.has(channelId) && canAccessChannel(ws.user.id, channelId));
+}
+
+// ---- V7.4 social content helpers (small, isolated) ----
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '😮', '😢', '🔥', '👀', '✅', '🙏'];
+function sanitizeReplyTo(channelId, replyTo) {
+  const ref = String(replyTo || '');
+  if (!ref) return null;
+  return findMessageById(channelId, ref) ? ref : null;
+}
+function canDeleteMessage(user, channelId, message) {
+  if (!user || !message) return false;
+  if (message.userId === user.id) return true; // own message
+  const channel = db.channels[channelId];
+  if (channel?.serverId) { const server = db.servers[channel.serverId]; if (server && server.ownerId === user.id) return true; } // server owner = moderator
+  return false;
+}
+function canManagePins(userId, channelId) {
+  const channel = db.channels[channelId];
+  if (!channel) return false;
+  if (channel.type === 'dm') return Boolean(channel.memberIds?.includes(userId));
+  const server = db.servers[channel.serverId];
+  return Boolean(server && server.ownerId === userId);
+}
+function channelDisplayName(channelId) {
+  const channel = db.channels[channelId];
+  if (!channel) return '';
+  if (channel.type === 'dm') return 'DM';
+  const server = db.servers[channel.serverId];
+  return `${server?.name || 'Sunucu'} #${channel.name || ''}`.trim();
+}
+function accessibleChannelIdsFor(userId) {
+  const ids = new Set();
+  for (const server of Object.values(db.servers)) if (server.memberIds?.includes(userId)) for (const cid of server.channelIds || []) ids.add(cid);
+  for (const [cid, channel] of Object.entries(db.channels)) if (channel.type === 'dm' && channel.memberIds?.includes(userId)) ids.add(cid);
+  return [...ids];
+}
+// Deliver live mention/DM notifications. Only to authorized recipients; never leaks E2EE plaintext.
+function deliverMentions(channelId, message) {
+  if (!message || message.encrypted || message.type !== 'text' || !message.text) return;
+  const matches = String(message.text).match(/@([a-zA-Z0-9_]{2,32})/g);
+  if (!matches) return;
+  const fromId = message.user?.id;
+  const notified = new Set();
+  for (const raw of matches) {
+    const uname = normalizeUsername(raw.slice(1));
+    const targetId = db.usernameIndex[uname];
+    if (!targetId || targetId === fromId || notified.has(targetId)) continue;
+    if (!canAccessChannel(targetId, channelId)) continue; // do not notify users who cannot see the channel
+    notified.add(targetId);
+    emitToUsers([targetId], 'notify', { kind: 'mention', channelId, messageId: message.id, from: message.user, snippet: String(message.text).slice(0, 140), createdAt: message.createdAt });
+  }
+}
+function notifyNewMessage(channelId, message) {
+  const channel = db.channels[channelId];
+  if (channel?.type === 'dm') {
+    const otherId = (channel.memberIds || []).find((mid) => mid !== message.user?.id);
+    if (otherId && canAccessChannel(otherId, channelId)) {
+      const snippet = message.encrypted ? '🔒 şifreli mesaj' : String(message.type === 'voice' ? '🎙️ sesli mesaj' : message.type === 'file' ? `📎 ${message.fileName || 'dosya'}` : (message.text || '')).slice(0, 140);
+      emitToUsers([otherId], 'notify', { kind: 'dm', channelId, messageId: message.id, from: message.user, snippet, createdAt: message.createdAt });
+    }
+  }
+  deliverMentions(channelId, message);
 }
 function emitPresence() {
   const onlineIds = [...onlineCounts.keys()];
@@ -777,6 +889,36 @@ function leaveWebVoice(socket) {
   socket.to(`voice:${channelId}`).emit('voice:user_left', { channelId, socketId: socket.id, user: publicUser(socket.user) });
   broadcastNative('voice:user_left', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
   emitVoiceMembers(channelId);
+}
+
+// V7.4 security: drop any restored room the socket can no longer access. connectionStateRecovery
+// re-joins a recovered socket to its previous channel/voice rooms; if the user lost access while
+// disconnected, those rooms are stale and must not deliver broadcasts. Voice rooms are cleaned up
+// safely (leave + notify peers) without weakening V7.2 voice stability.
+function revalidateSocketRooms(socket) {
+  if (!socket || !socket.user) return;
+  const userId = socket.user.id;
+  for (const room of [...socket.rooms]) {
+    if (room === socket.id) continue;
+    if (room.startsWith('voice:')) {
+      const channelId = room.slice('voice:'.length);
+      if (canUseLiveVoice(userId, channelId)) continue;
+      socket.leave(room);
+      if (webVoiceClients.get(socket.id)?.channelId === channelId) webVoiceClients.delete(socket.id);
+      if (socket.voiceChannelId === channelId) socket.voiceChannelId = null;
+      socket.to(room).emit('voice:user_left', { channelId, socketId: socket.id, user: publicUser(socket.user) });
+      broadcastNative('voice:user_left', { channelId, user: publicUser(socket.user) }, (client) => client.voiceChannelId === channelId);
+      emitVoiceMembers(channelId);
+    } else if (db.channels[room] && !canAccessChannel(userId, room)) {
+      socket.leave(room);
+    }
+  }
+}
+function revalidateUserRooms(userId) {
+  if (!userId) return;
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.user && socket.user.id === userId) revalidateSocketRooms(socket);
+  }
 }
 
 function createSession(userId, req = null) {
@@ -1046,6 +1188,7 @@ app.patch('/api/me', auth, (req, res) => {
   if (displayName.length < 2) return res.status(400).json({ error: 'Görünen ad en az 2 karakter olmalı.' });
   req.user.displayName = displayName;
   req.user.status = String(req.body.status || req.user.status || '').trim().slice(0, 80);
+  if (typeof req.body.bio === 'string') req.user.bio = String(req.body.bio).trim().slice(0, 280);
   const settings = req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
   req.user.settings = {
     ...(req.user.settings || {}),
@@ -1200,6 +1343,7 @@ app.post('/api/servers/:serverId/leave', auth, (req, res) => {
   serverObj.memberIds = serverObj.memberIds.filter((id) => id !== req.user.id);
   saveDbSoon();
   broadcastServerUpdated(serverObj);
+  revalidateUserRooms(req.user.id); // membership change: drop the leaver's live channel rooms immediately
   res.json({ ok: true });
 });
 app.post('/api/servers/:serverId/channels', auth, (req, res) => {
@@ -1243,15 +1387,16 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', MESSAG
     const channelId = req.params.channelId;
     if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
     const type = String(req.body.type || 'text').toLowerCase();
+    const replyTo = sanitizeReplyTo(channelId, req.body.replyTo);
     let message;
     if (type === 'text') {
       if (req.body.encrypted) {
         const e2ee = cleanE2eePayload(req.body.e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES });
-        message = createMessage({ channelId, userId: req.user.id, type: 'text', text: '', encrypted: true, e2ee });
+        message = createMessage({ channelId, userId: req.user.id, type: 'text', text: '', encrypted: true, e2ee, replyTo });
       } else {
         const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
         if (!text) return res.status(400).json({ error: 'Boş mesaj gönderilemez.' });
-        message = createMessage({ channelId, userId: req.user.id, type: 'text', text });
+        message = createMessage({ channelId, userId: req.user.id, type: 'text', text, replyTo });
       }
     } else if (type === 'voice') {
       const encrypted = Boolean(req.body.encrypted);
@@ -1259,17 +1404,192 @@ app.post('/api/channels/:channelId/messages', auth, rateLimit('messages', MESSAG
       if (encrypted) { const uploadRate = checkRateLimit('encrypted_uploads', req.user.id, 30, 60 * 1000); if (!uploadRate.ok) return res.status(429).json({ error: 'Çok hızlı dosya/ses gönderiyorsun. Biraz bekle.' }); }
       const upload = persistUpload({ data: req.body.audioData, mimeType: req.body.mimeType || 'audio/webm', fileName: req.body.fileName || 'voice.webm', prefix: 'voice_', channelId, userId: req.user.id, encrypted });
       if (!encrypted && !upload.mimeType.startsWith('audio/')) return res.status(400).json({ error: 'Ses formatı desteklenmiyor.' });
-      message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null, encrypted, e2ee });
+      message = createMessage({ channelId, userId: req.user.id, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(req.body.durationMs || 0) || null, encrypted, e2ee, replyTo });
     } else if (type === 'file') {
       const encrypted = Boolean(req.body.encrypted);
       const e2ee = encrypted ? cleanE2eePayload(req.body.e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
       if (encrypted) { const uploadRate = checkRateLimit('encrypted_uploads', req.user.id, 30, 60 * 1000); if (!uploadRate.ok) return res.status(429).json({ error: 'Çok hızlı dosya/ses gönderiyorsun. Biraz bekle.' }); }
       const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'application/octet-stream', fileName: req.body.fileName || 'dosya', prefix: 'file_', channelId, userId: req.user.id, encrypted });
-      message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: encrypted ? 'encrypted.gce' : upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: encrypted ? '' : String(req.body.text || '').slice(0, 300), encrypted, e2ee });
+      message = createMessage({ channelId, userId: req.user.id, type: 'file', fileUrl: upload.url, fileName: encrypted ? 'encrypted.gce' : upload.originalName, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, text: encrypted ? '' : String(req.body.text || '').slice(0, 300), encrypted, e2ee, replyTo });
     } else return res.status(400).json({ error: 'Bilinmeyen mesaj türü.' });
     broadcastMessage(channelId, message);
+    notifyNewMessage(channelId, message);
     res.status(201).json({ message });
   } catch (error) { res.status(400).json({ error: error.message || 'Mesaj gönderilemedi.' }); }
+});
+
+// ---- V7.4 Feature 1: message actions (edit own plaintext, delete own/owner, reactions) ----
+app.patch('/api/channels/:channelId/messages/:messageId', auth, (req, res) => {
+  const { channelId, messageId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  const message = findMessageById(channelId, messageId);
+  if (!message) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
+  if (message.userId !== req.user.id) return res.status(403).json({ error: 'Sadece kendi mesajını düzenleyebilirsin.' });
+  if (message.encrypted || message.type !== 'text') return res.status(400).json({ error: 'Sadece kendi şifresiz metin mesajların düzenlenebilir.' });
+  const text = String(req.body.text || '').trim().slice(0, MAX_TEXT_LENGTH);
+  if (!text) return res.status(400).json({ error: 'Boş mesaj olamaz.' });
+  message.text = text;
+  message.editedAt = now();
+  saveDbSoon();
+  const view = sanitizeMessage(message);
+  broadcastMessageUpdated(channelId, view);
+  res.json({ message: view });
+});
+app.delete('/api/channels/:channelId/messages/:messageId', auth, (req, res) => {
+  const { channelId, messageId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  const list = db.messages[channelId] || [];
+  const index = list.findIndex((m) => m.id === messageId);
+  if (index < 0) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
+  if (!canDeleteMessage(req.user, channelId, list[index])) return res.status(403).json({ error: 'Bu mesajı silme yetkin yok.' });
+  list.splice(index, 1);
+  const channel = db.channels[channelId];
+  if (channel?.pinnedMessageIds) channel.pinnedMessageIds = channel.pinnedMessageIds.filter((mid) => mid !== messageId);
+  saveDbSoon();
+  broadcastMessageDeleted(channelId, messageId);
+  res.json({ ok: true });
+});
+app.post('/api/channels/:channelId/messages/:messageId/reactions', auth, rateLimit('reactions', 120, 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
+  const { channelId, messageId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  const message = findMessageById(channelId, messageId);
+  if (!message) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
+  const emoji = String(req.body.emoji || '');
+  if (!REACTION_EMOJIS.includes(emoji)) return res.status(400).json({ error: 'Geçersiz tepki.' });
+  message.reactions = (message.reactions && typeof message.reactions === 'object') ? message.reactions : {};
+  const ids = Array.isArray(message.reactions[emoji]) ? message.reactions[emoji] : [];
+  message.reactions[emoji] = ids.includes(req.user.id) ? ids.filter((uid) => uid !== req.user.id) : [...ids, req.user.id];
+  if (!message.reactions[emoji].length) delete message.reactions[emoji];
+  saveDbSoon();
+  const view = sanitizeMessage(message);
+  broadcastMessageUpdated(channelId, view);
+  res.json({ message: view });
+});
+
+// ---- V7.4 Feature 2: profile (avatar/banner uploads, bio, profile card) ----
+app.post('/api/me/avatar', auth, rateLimit('profile_media', 30, 60 * 1000, (req) => req.user.id), (req, res) => {
+  try {
+    const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'image/png', fileName: req.body.fileName || 'avatar.png', prefix: 'avatar_', channelId: '', userId: req.user.id });
+    if (!upload.mimeType.startsWith('image/')) return res.status(400).json({ error: 'Avatar bir görsel olmalı.' });
+    req.user.avatarUrl = upload.url;
+    saveDbSoon();
+    emitToUsers([req.user.id], 'me:updated', { user: meUser(req.user) });
+    res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
+  } catch (error) { res.status(400).json({ error: error.message || 'Avatar yüklenemedi.' }); }
+});
+app.post('/api/me/banner', auth, rateLimit('profile_media', 30, 60 * 1000, (req) => req.user.id), (req, res) => {
+  try {
+    const upload = persistUpload({ data: req.body.fileData, mimeType: req.body.mimeType || 'image/png', fileName: req.body.fileName || 'banner.png', prefix: 'banner_', channelId: '', userId: req.user.id });
+    if (!upload.mimeType.startsWith('image/')) return res.status(400).json({ error: 'Afiş bir görsel olmalı.' });
+    req.user.bannerUrl = upload.url;
+    saveDbSoon();
+    emitToUsers([req.user.id], 'me:updated', { user: meUser(req.user) });
+    res.json({ user: { ...meUser(req.user), isAppOwner: isAdminUser(req.user) } });
+  } catch (error) { res.status(400).json({ error: error.message || 'Afiş yüklenemedi.' }); }
+});
+app.get('/api/users/:userId/profile', auth, (req, res) => {
+  const user = db.users[req.params.userId];
+  if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı.' });
+  const mutualServers = Object.values(db.servers).filter((s) => s.memberIds?.includes(user.id) && s.memberIds?.includes(req.user.id)).length;
+  res.json({ profile: { ...publicUser(user), bio: String(user.bio || ''), bannerUrl: user.bannerUrl || '', friendship: getFriendship(req.user.id, user.id)?.status || null, mutualServers, isSelf: user.id === req.user.id } });
+});
+
+// ---- V7.4 Feature 3: pins (owner/creator only) + personal bookmarks ----
+app.get('/api/channels/:channelId/pins', auth, (req, res) => {
+  const { channelId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  const channel = db.channels[channelId];
+  const pins = (channel?.pinnedMessageIds || []).map((mid) => findMessageById(channelId, mid)).filter(Boolean).map(sanitizeMessage);
+  res.json({ pins, canManage: canManagePins(req.user.id, channelId) });
+});
+app.post('/api/channels/:channelId/pins/:messageId', auth, (req, res) => {
+  const { channelId, messageId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  if (!canManagePins(req.user.id, channelId)) return res.status(403).json({ error: 'Mesaj sabitleme yetkin yok.' });
+  if (!findMessageById(channelId, messageId)) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
+  const channel = db.channels[channelId];
+  channel.pinnedMessageIds = Array.isArray(channel.pinnedMessageIds) ? channel.pinnedMessageIds : [];
+  if (!channel.pinnedMessageIds.includes(messageId)) channel.pinnedMessageIds.push(messageId);
+  if (channel.pinnedMessageIds.length > 50) channel.pinnedMessageIds = channel.pinnedMessageIds.slice(-50);
+  saveDbSoon();
+  emitToChannelSockets(channelId, 'channel:pins', { channelId });
+  res.json({ ok: true });
+});
+app.delete('/api/channels/:channelId/pins/:messageId', auth, (req, res) => {
+  const { channelId, messageId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  if (!canManagePins(req.user.id, channelId)) return res.status(403).json({ error: 'Yetkin yok.' });
+  const channel = db.channels[channelId];
+  if (channel?.pinnedMessageIds) channel.pinnedMessageIds = channel.pinnedMessageIds.filter((mid) => mid !== messageId);
+  saveDbSoon();
+  emitToChannelSockets(channelId, 'channel:pins', { channelId });
+  res.json({ ok: true });
+});
+app.get('/api/bookmarks', auth, (req, res) => {
+  const out = [];
+  for (const bm of (req.user.bookmarks || [])) {
+    if (!canAccessChannel(req.user.id, bm.channelId)) continue; // never reveal messages from channels the user lost access to
+    const message = findMessageById(bm.channelId, bm.messageId);
+    if (!message) continue;
+    out.push({ ...sanitizeMessage(message), channelName: channelDisplayName(bm.channelId), savedAt: bm.createdAt });
+  }
+  res.json({ bookmarks: out.reverse() });
+});
+app.post('/api/bookmarks', auth, (req, res) => {
+  const channelId = String(req.body.channelId || '');
+  const messageId = String(req.body.messageId || '');
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  if (!findMessageById(channelId, messageId)) return res.status(404).json({ error: 'Mesaj bulunamadı.' });
+  req.user.bookmarks = Array.isArray(req.user.bookmarks) ? req.user.bookmarks : [];
+  if (!req.user.bookmarks.some((b) => b.messageId === messageId)) {
+    req.user.bookmarks.push({ channelId, messageId, createdAt: now() });
+    if (req.user.bookmarks.length > 200) req.user.bookmarks = req.user.bookmarks.slice(-200);
+    saveDbSoon();
+  }
+  res.status(201).json({ ok: true });
+});
+app.delete('/api/bookmarks/:messageId', auth, (req, res) => {
+  req.user.bookmarks = (req.user.bookmarks || []).filter((b) => b.messageId !== req.params.messageId);
+  saveDbSoon();
+  res.json({ ok: true });
+});
+
+// ---- V7.4 Feature 4: channel media gallery (respects canAccessChannel + protected uploads) ----
+app.get('/api/channels/:channelId/media', auth, (req, res) => {
+  const { channelId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  const media = (db.messages[channelId] || []).filter((m) => m.type === 'file' || m.type === 'voice').slice(-120).reverse().map(sanitizeMessage);
+  res.json({ media });
+});
+
+// ---- V7.4 Feature 5: notification center (unread counts, read markers) ----
+app.post('/api/channels/:channelId/read', auth, (req, res) => {
+  const { channelId } = req.params;
+  if (!canAccessChannel(req.user.id, channelId)) return res.status(403).json({ error: 'Bu kanala erişimin yok.' });
+  req.user.reads = (req.user.reads && typeof req.user.reads === 'object') ? req.user.reads : {};
+  req.user.reads[channelId] = now();
+  saveDbSoon();
+  res.json({ ok: true });
+});
+app.get('/api/notifications', auth, (req, res) => {
+  const reads = (req.user.reads && typeof req.user.reads === 'object') ? req.user.reads : {};
+  const unread = {};
+  let totalUnread = 0;
+  for (const channelId of accessibleChannelIdsFor(req.user.id)) {
+    const since = reads[channelId] ? Date.parse(reads[channelId]) : 0;
+    const list = db.messages[channelId] || [];
+    let count = 0;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const m = list[i];
+      if (Date.parse(m.createdAt) <= since) break;
+      if (m.userId === req.user.id) continue;
+      count += 1;
+      if (count >= 99) break;
+    }
+    if (count) { unread[channelId] = count; totalUnread += count; }
+  }
+  const friends = friendSummaryFor(req.user.id);
+  res.json({ unread, totalUnread, friendRequests: friends.incomingRequests.length });
 });
 
 io.use((socket, next) => {
@@ -1281,28 +1601,31 @@ io.use((socket, next) => {
 });
 io.on('connection', (socket) => {
   const userId = socket.user.id;
+  // Drop stale rooms restored by connectionStateRecovery BEFORE this socket can receive any broadcast.
+  revalidateSocketRooms(socket);
   onlineCounts.set(userId, (onlineCounts.get(userId) || 0) + 1);
   emitPresence();
-  socket.emit('session', { user: publicUser(socket.user), onlineIds: [...onlineCounts.keys()] });
+  socket.emit('session', { user: publicUser(socket.user), onlineIds: [...onlineCounts.keys()], recovered: Boolean(socket.recovered) });
 
   socket.on('channel:join', ({ channelId } = {}, callback = () => {}) => {
     if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
     socket.join(channelId);
     callback({ ok: true, messages: (db.messages[channelId] || []).slice(-200).map(sanitizeMessage) });
   });
-  socket.on('message:text', ({ channelId, text } = {}, callback = () => {}) => {
+  socket.on('message:text', ({ channelId, text, replyTo } = {}, callback = () => {}) => {
     try {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
       const clean = String(text || '').trim().slice(0, MAX_TEXT_LENGTH);
       if (!clean) return callback({ error: 'Boş mesaj gönderilemez.' });
-      const message = createMessage({ channelId, userId, type: 'text', text: clean });
+      const message = createMessage({ channelId, userId, type: 'text', text: clean, replyTo: sanitizeReplyTo(channelId, replyTo) });
       broadcastMessage(channelId, message);
+      notifyNewMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Mesaj gönderilemedi.' }); }
   });
-  socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs, encrypted, e2ee } = {}, callback = () => {}) => {
+  socket.on('message:voice', ({ channelId, audioData, mimeType, durationMs, encrypted, e2ee, replyTo } = {}, callback = () => {}) => {
     try {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
@@ -1311,18 +1634,20 @@ io.on('connection', (socket) => {
       const secureMeta = secure ? cleanE2eePayload(e2ee, { allowAttachment: true, maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) : null;
       const upload = persistUpload({ data: audioData, mimeType: mimeType || 'audio/webm', fileName: secure ? 'encrypted-voice.gce' : 'voice.webm', prefix: 'voice_', channelId, userId, encrypted: secure });
       if (!secure && !upload.mimeType.startsWith('audio/')) return callback({ error: 'Ses formatı desteklenmiyor.' });
-      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null, encrypted: secure, e2ee: secureMeta });
+      const message = createMessage({ channelId, userId, type: 'voice', audioUrl: upload.url, mimeType: upload.mimeType, sizeBytes: upload.sizeBytes, durationMs: Number(durationMs || 0) || null, encrypted: secure, e2ee: secureMeta, replyTo: sanitizeReplyTo(channelId, replyTo) });
       broadcastMessage(channelId, message);
+      notifyNewMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Sesli mesaj gönderilemedi.' }); }
   });
-  socket.on('message:secure', ({ channelId, e2ee } = {}, callback = () => {}) => {
+  socket.on('message:secure', ({ channelId, e2ee, replyTo } = {}, callback = () => {}) => {
     try {
       const limited = socketRateLimit(socket, 'messages');
       if (!limited.ok) return callback({ error: limited.error });
       if (!canAccessChannel(userId, channelId)) return callback({ error: 'Bu kanala erişimin yok.' });
-      const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }) });
+      const message = createMessage({ channelId, userId, type: 'text', text: '', encrypted: true, e2ee: cleanE2eePayload(e2ee, { maxCiphertextChars: MAX_E2EE_TEXT_BYTES, maxStoredBytes: MAX_E2EE_METADATA_BYTES }), replyTo: sanitizeReplyTo(channelId, replyTo) });
       broadcastMessage(channelId, message);
+      notifyNewMessage(channelId, message);
       callback({ ok: true, message });
     } catch (error) { callback({ error: error.message || 'Şifreli mesaj gönderilemedi.' }); }
   });
