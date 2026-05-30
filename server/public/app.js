@@ -9,7 +9,8 @@ const els = {
   chatKicker: $('chatKicker'), chatTitle: $('chatTitle'), chatSubtitle: $('chatSubtitle'), e2eeButton: $('e2eeButton'), e2eeWarning: $('e2eeWarning'), copyInviteButton: $('copyInviteButton'), voicePanel: $('voicePanel'),
   messages: $('messages'), typingLine: $('typingLine'), messageForm: $('messageForm'), fileButton: $('fileButton'), fileInput: $('fileInput'), recordButton: $('recordButton'), messageInput: $('messageInput'), sendButton: $('sendButton'), composerLock: $('composerLock'),
   membersTitle: $('membersTitle'), membersList: $('membersList'), settingsModal: $('settingsModal'), settingsContent: $('settingsContent'), remoteAudio: $('remoteAudio'), toast: $('toast'),
-  publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput')
+  publicDataStatus: $('publicDataStatus'), bootstrapRestoreWrap: $('bootstrapRestoreWrap'), restoreLocalBackupButton: $('restoreLocalBackupButton'), restoreBackupFileButton: $('restoreBackupFileButton'), bootstrapFileInput: $('bootstrapFileInput'),
+  notificationsButton: $('notificationsButton'), notifBadge: $('notifBadge'), savedButton: $('savedButton'), pinsButton: $('pinsButton'), mediaButton: $('mediaButton'), replyBar: $('replyBar'), replyBarText: $('replyBarText'), replyCancelButton: $('replyCancelButton')
 };
 
 const state = {
@@ -42,8 +43,11 @@ const state = {
   voice: { channelId: null, stream: null, peers: new Map(), participants: new Map(), muted: false, selfId: null, keepaliveTimer: null, reconnectGraceTimer: null, reconnecting: false, manualLeave: false, peerRestartTimers: new Map() },
   publicStatus: null,
   autoBackupTimer: null,
+  replyTo: null,
+  notify: { unread: {}, total: 0, items: [], friendRequests: 0 },
   e2ee: { passphrases: new Map(), enabled: new Set(), objectUrls: new Map() }
 };
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '😮', '😢', '🔥', '👀', '✅', '🙏'];
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
 const VOICE_KEEPALIVE_MS = 27000;
@@ -344,13 +348,17 @@ function enterApp(data) {
   renderRail();
   renderFriendsPanel();
   connectSocket();
+  loadNotifications();
   warnTemporaryStorageOnce();
   startAutoBackup();
 }
 
 
+function avatarInner(user) {
+  return user?.avatarUrl ? `<img src="${escapeHTML(absoluteUrl(user.avatarUrl))}" alt="" loading="lazy">` : escapeHTML(initials(user?.displayName || user?.username || '?'));
+}
 function renderMe() {
-  els.meAvatar.textContent = initials(state.user?.displayName || state.user?.username);
+  setAvatar(els.meAvatar, state.user);
   els.meName.textContent = state.user?.displayName || '-';
   els.meUsername.textContent = state.user ? `@${state.user.username}` : '-';
 }
@@ -377,7 +385,7 @@ function renderMembers(server) {
     if (state.currentDmFriend) {
       const f = state.currentDmFriend;
       els.membersTitle.textContent = 'DM';
-      els.membersList.innerHTML = `<div class="member-row"><span class="avatar ${state.onlineIds.has(f.id) ? 'online' : ''}">${escapeHTML(initials(f.displayName || f.username))}</span><span class="row-grow"><strong>${escapeHTML(f.displayName || f.username)}</strong><br><small>@${escapeHTML(f.username)} • ${state.onlineIds.has(f.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span></div>`;
+      els.membersList.innerHTML = `<div class="member-row"><span class="avatar ${state.onlineIds.has(f.id) ? 'online' : ''}">${avatarInner(f)}</span><span class="row-grow"><strong>${escapeHTML(f.displayName || f.username)}</strong><br><small>@${escapeHTML(f.username)} • ${state.onlineIds.has(f.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span></div>`;
     } else {
       els.membersTitle.textContent = 'Kişiler';
       els.membersList.innerHTML = '<div class="empty-state compact">Sunucu seçince üyeler burada görünür.</div>';
@@ -388,9 +396,11 @@ function renderMembers(server) {
   els.membersTitle.textContent = `${server.name} üyeleri`;
   els.membersList.innerHTML = members.length ? '' : '<div class="empty-state compact">Üye yok.</div>';
   for (const member of members) {
-    const row = document.createElement('div');
+    const row = document.createElement('button');
+    row.type = 'button';
     row.className = 'member-row';
-    row.innerHTML = `<span class="avatar ${member.online ? 'online' : ''}">${escapeHTML(initials(member.displayName || member.username))}</span><span class="row-grow"><strong>${escapeHTML(member.displayName || member.username)}</strong><br><small>@${escapeHTML(member.username)} ${(member.isOwner || member.owner) ? '• sahip' : ''} • ${member.online ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
+    row.innerHTML = `<span class="avatar ${member.online ? 'online' : ''}">${avatarInner(member)}</span><span class="row-grow"><strong>${escapeHTML(member.displayName || member.username)}</strong><br><small>@${escapeHTML(member.username)} ${(member.isOwner || member.owner) ? '• sahip' : ''} • ${member.online ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
+    row.addEventListener('click', () => openProfile(member.id));
     els.membersList.appendChild(row);
   }
 }
@@ -408,6 +418,9 @@ function resetChat(title = 'Hoş geldin', subtitle = 'Bir kanal veya DM seç.') 
   els.e2eeButton?.classList.add('hidden');
   els.e2eeWarning?.classList.add('hidden');
   els.composerLock?.classList.add('hidden');
+  els.pinsButton?.classList.add('hidden');
+  els.mediaButton?.classList.add('hidden');
+  cancelReply();
   els.messageInput.value = '';
   autoGrowInput();
   els.messageInput.disabled = true;
@@ -453,47 +466,62 @@ async function renderDecryptedMessage(message, article) {
   try {
     const payload = message.e2ee?.mode === 'attachment' ? await decryptAttachmentPayload(message) : await decryptPayload(message.channelId, message.e2ee);
     renderDecryptedPayloadInto(bubble, message, payload);
+    decorateBubble(bubble, getArticleMessage(article) || message);
     article.classList.remove('secure-locked'); article.classList.add('secure-unlocked');
   } catch {
     article.classList.add('secure-locked'); article.classList.remove('secure-unlocked');
   }
 }
-function appendSecureMessage(message, { scroll = true } = {}) {
-  if (!message || message.channelId !== state.currentChannelId) return;
-  if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
-  if (els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
+function buildSecureArticle(message) {
   const article = document.createElement('article');
   article.className = `message secure-message ${message.user?.id === state.user?.id ? 'own' : ''}`;
   article.dataset.messageId = message.id;
   article.dataset.secureMessage = '1';
-  article.dataset.messageJson = JSON.stringify(message);
-  const avatar = document.createElement('div'); avatar.className = `avatar ${state.onlineIds.has(message.user?.id) || message.user?.online ? 'online' : ''}`; avatar.textContent = initials(message.user?.displayName || message.user?.username || '?');
+  const avatar = document.createElement('div'); avatar.className = `avatar ${state.onlineIds.has(message.user?.id) || message.user?.online ? 'online' : ''}`; setAvatar(avatar, message.user); avatar.addEventListener('click', () => openProfile(message.user?.id));
   const bubble = document.createElement('div'); bubble.className = 'message-bubble';
   const meta = document.createElement('div'); meta.className = 'message-meta';
-  const name = document.createElement('strong'); name.textContent = message.user?.displayName || message.user?.username || 'Bilinmeyen';
+  const name = document.createElement('strong'); name.textContent = message.user?.displayName || message.user?.username || 'Bilinmeyen'; name.addEventListener('click', () => openProfile(message.user?.id));
   const time = document.createElement('time'); time.textContent = formatTime(message.createdAt); meta.append(name, time); bubble.appendChild(meta);
   const locked = document.createElement('div'); locked.className = 'secure-card'; locked.innerHTML = '<strong>🔒 Bu mesaj şifreli. Anahtar gir.</strong><small>Açmak için bu kanalın E2EE anahtarını gir. Server içeriği göremez.</small>';
   const unlock = document.createElement('button'); unlock.type = 'button'; unlock.className = 'mini-button'; unlock.textContent = 'Anahtar gir / çöz'; unlock.addEventListener('click', promptE2eeKey);
   locked.appendChild(unlock); bubble.appendChild(locked);
-  article.append(avatar, bubble); els.messages.appendChild(article);
+  article.append(avatar, bubble);
+  decorateBubble(bubble, message);
+  decorateArticle(article, message);
   if (e2eePassphrase(message.channelId)) renderDecryptedMessage(message, article);
-  if (scroll) scrollMessages();
+  return article;
 }
-
-function appendMessage(message, { scroll = true } = {}) {
-  if (message?.encrypted && message?.e2ee) return appendSecureMessage(message, { scroll });
+function appendSecureMessage(message, { scroll = true } = {}) {
   if (!message || message.channelId !== state.currentChannelId) return;
   if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
   if (els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
+  els.messages.appendChild(buildSecureArticle(message));
+  if (scroll) scrollMessages();
+}
+
+function buildArticle(message) {
+  if (message?.encrypted && message?.e2ee) return buildSecureArticle(message);
+  return buildPlainArticle(message);
+}
+function appendMessage(message, { scroll = true } = {}) {
+  if (!message || message.channelId !== state.currentChannelId) return;
+  if (els.messages.querySelector('.empty-state')) els.messages.innerHTML = '';
+  if (els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
+  els.messages.appendChild(buildArticle(message));
+  if (scroll) scrollMessages();
+}
+function buildPlainArticle(message) {
   const article = document.createElement('article');
   article.className = `message ${message.user?.id === state.user?.id ? 'own' : ''}`;
   article.dataset.messageId = message.id;
   const avatar = document.createElement('div');
   avatar.className = `avatar ${state.onlineIds.has(message.user?.id) || message.user?.online ? 'online' : ''}`;
-  avatar.textContent = initials(message.user?.displayName || message.user?.username || '?');
+  setAvatar(avatar, message.user);
+  avatar.addEventListener('click', () => openProfile(message.user?.id));
   const bubble = document.createElement('div'); bubble.className = 'message-bubble';
   const meta = document.createElement('div'); meta.className = 'message-meta';
   const name = document.createElement('strong'); name.textContent = message.user?.displayName || message.user?.username || 'Bilinmeyen';
+  name.addEventListener('click', () => openProfile(message.user?.id));
   const time = document.createElement('time'); time.textContent = formatTime(message.createdAt);
   meta.append(name, time); bubble.appendChild(meta);
   if (message.type === 'voice') {
@@ -519,7 +547,10 @@ function appendMessage(message, { scroll = true } = {}) {
   } else {
     const text = document.createElement('div'); text.className = 'message-body'; text.textContent = message.text || ''; bubble.appendChild(text);
   }
-  article.append(avatar, bubble); els.messages.appendChild(article); if (scroll) scrollMessages();
+  article.append(avatar, bubble);
+  decorateBubble(bubble, message);
+  decorateArticle(article, message);
+  return article;
 }
 
 function renderFriendsPanel() {
@@ -544,7 +575,7 @@ function renderFriendsPanel() {
   friendList.innerHTML = friends.length ? '' : '<div class="empty-state compact">Henüz arkadaş yok.</div>';
   for (const friend of friends) {
     const button = document.createElement('button'); button.type = 'button'; button.className = 'user-row';
-    button.innerHTML = `<span class="avatar ${state.onlineIds.has(friend.id) ? 'online' : ''}">${escapeHTML(initials(friend.displayName || friend.username))}</span><span class="row-grow"><strong>${escapeHTML(friend.displayName || friend.username)}</strong><br><small>@${escapeHTML(friend.username)} • ${state.onlineIds.has(friend.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span>`;
+    button.innerHTML = `<span class="avatar ${state.onlineIds.has(friend.id) ? 'online' : ''}">${avatarInner(friend)}</span><span class="row-grow"><strong>${escapeHTML(friend.displayName || friend.username)}</strong><br><small>@${escapeHTML(friend.username)} • ${state.onlineIds.has(friend.id) ? 'çevrimiçi' : 'çevrimdışı'}</small></span>${unreadBadgeHTML(dmChannelIdFor(friend.id))}`;
     button.addEventListener('click', () => openDm(friend)); friendList.appendChild(button);
   }
   const outgoingWrap = els.dynamicPanel.querySelector('#outgoingRequests');
@@ -606,7 +637,7 @@ function renderChannelGroup(container, channels, server, isOwner) {
   for (const channel of channels) {
     const row = document.createElement('div'); row.className = `channel-row ${state.currentChannelId === channel.id ? 'active' : ''}`;
     const button = document.createElement('button'); button.type = 'button'; button.className = 'channel-main';
-    button.innerHTML = `<span class="avatar">${channel.kind === 'voice' ? '🔊' : '#'}</span><span class="row-grow"><strong>${escapeHTML(channel.name)}</strong><br><small>${channel.kind === 'voice' ? 'sesli oda' : 'metin kanalı'}</small></span>`;
+    button.innerHTML = `<span class="avatar">${channel.kind === 'voice' ? '🔊' : '#'}</span><span class="row-grow"><strong>${escapeHTML(channel.name)}</strong><br><small>${channel.kind === 'voice' ? 'sesli oda' : 'metin kanalı'}</small></span>${unreadBadgeHTML(channel.id)}`;
     button.addEventListener('click', () => openChannel(channel, { title: `${channel.kind === 'voice' ? '🔊' : '#'} ${channel.name}`, subtitle: `${server.name} • ${channel.kind === 'voice' ? 'canlı ses' : 'metin'} • Davet kodu: ${server.inviteCode}`, inviteCode: server.inviteCode, serverId: server.id }));
     row.appendChild(button);
     if (isOwner && server.channelIds?.length > 1) { const del = document.createElement('button'); del.type = 'button'; del.className = 'mini-button danger'; del.textContent = 'Sil'; del.addEventListener('click', () => deleteChannel(server, channel)); row.appendChild(del); }
@@ -640,6 +671,9 @@ async function openChannel(channel, context = {}) {
   els.chatTitle.textContent = context.title || channel.name || 'Sohbet';
   els.chatSubtitle.textContent = context.subtitle || 'Mesajlaşmaya başla.';
   els.copyInviteButton.classList.toggle('hidden', !state.currentInviteCode);
+  els.pinsButton?.classList.remove('hidden');
+  els.mediaButton?.classList.remove('hidden');
+  cancelReply();
   renderE2eeButton();
   syncComposerEnabled();
   els.messageInput.focus(); renderVoicePanel();
@@ -648,6 +682,7 @@ async function openChannel(channel, context = {}) {
   } else {
     try { const data = await api(`/api/channels/${channel.id}/messages`); renderMessages(data.messages || []); } catch (e) { toast(e.message); }
   }
+  markChannelRead(channel.id);
   if (state.currentServerId) renderServerPanel(state.currentServerId);
 }
 
@@ -675,6 +710,11 @@ function connectSocket() {
   state.socket.on('connect_error', (error) => { els.connectionState.textContent = 'hata'; els.connectionState.classList.add('offline'); toast(error.message || 'Bağlantı hatası.'); });
   state.socket.on('presence:update', ({ onlineIds }) => { state.onlineIds = new Set(onlineIds || []); renderMe(); if (state.view === 'home') renderFriendsPanel(); else if (state.currentServerId) refreshMe({ keepPanel: true }).catch(() => {}); });
   state.socket.on('message:new', (message) => appendMessage(message));
+  state.socket.on('message:updated', (message) => updateMessageInDom(message));
+  state.socket.on('message:deleted', ({ channelId, messageId } = {}) => { if (channelId === state.currentChannelId) removeMessageFromDom(messageId); });
+  state.socket.on('channel:pins', ({ channelId } = {}) => { if (currentDrawerKind === 'pins' && channelId === state.currentChannelId) openPinsDrawer(); });
+  state.socket.on('notify', (item) => pushNotify(item));
+  state.socket.on('me:updated', ({ user } = {}) => { if (user) { state.user = { ...state.user, ...user }; renderMe(); } });
   state.socket.on('typing', ({ channelId, user, isTyping }) => { if (channelId !== state.currentChannelId || !isTyping || user?.id === state.user?.id) return; els.typingLine.textContent = `${user.displayName || user.username} yazıyor...`; clearTimeout(state.remoteTypingTimeout); state.remoteTypingTimeout = setTimeout(() => { els.typingLine.textContent = ''; }, 1500); });
   state.socket.on('server:updated', ({ server } = {}) => { if (!server) return; replaceServer(server); renderRail(); if (state.currentServerId === server.id) renderServerPanel(server.id); });
   state.socket.on('server:deleted', ({ serverId } = {}) => { state.servers = state.servers.filter((server) => server.id !== serverId); if (state.currentServerId === serverId) { cleanupVoice({ manual: true }); renderFriendsPanel(); resetChat('Sunucu silindi', 'Başka bir sunucu seç.'); } else renderRail(); });
@@ -689,7 +729,7 @@ function connectSocket() {
 async function sendSecurePayload(payload) {
   if (!state.currentChannelId) return;
   const e2ee = await encryptPayload(state.currentChannelId, payload);
-  const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', encrypted: true, e2ee } });
+  const data = await api(`/api/channels/${state.currentChannelId}/messages`, { method: 'POST', body: { type: 'text', encrypted: true, e2ee, replyTo: consumeReplyTo() } });
   appendMessage(data.message); // optimistic; appendMessage dedups by id when the socket echo also arrives
   return data.message;
 }
@@ -720,12 +760,13 @@ function emitWithTimeout(event, payload, timeoutMs = 8000) {
   });
 }
 async function sendPlainText(channelId, text) {
+  const replyTo = consumeReplyTo();
   if (state.socket?.connected) {
-    const response = await emitWithTimeout('message:text', { channelId, text });
+    const response = await emitWithTimeout('message:text', { channelId, text, replyTo });
     if (response?.message) appendMessage(response.message); // render own message even if not in the room
     return;
   }
-  const data = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'text', text } });
+  const data = await api(`/api/channels/${channelId}/messages`, { method: 'POST', body: { type: 'text', text, replyTo } });
   appendMessage(data.message);
 }
 async function sendTextMessage() {
@@ -742,6 +783,7 @@ async function sendTextMessage() {
     else await sendPlainText(channelId, text);
     els.messageInput.value = '';
     autoGrowInput();
+    clearReplyAfterSend();
     if (state.socket?.connected) state.socket.emit('typing', { channelId, isTyping: false });
   } catch (error) {
     const reason = error && error.message;
@@ -1116,7 +1158,7 @@ function toggleMute() { if (!state.voice.stream) return; state.voice.muted = !st
 async function showSettings() {
   const settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(state.settings || {}) };
   els.settingsContent.innerHTML = `
-    <section class="settings-section"><h3>Profil</h3><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
+    <section class="settings-section"><h3>Profil</h3><div class="profile-edit-row"><span class="avatar small" id="settingsAvatarPreview"></span><div class="row-grow"><button id="settingsAvatarButton" class="ghost" type="button">Avatar yükle</button> <button id="settingsBannerButton" class="ghost" type="button">Afiş yükle</button></div></div><input id="settingsAvatarInput" class="hidden" type="file" accept="image/*"><input id="settingsBannerInput" class="hidden" type="file" accept="image/*"><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><label>Hakkımda<textarea id="settingsBio" maxlength="280" rows="3" placeholder="Kısa bir bio...">${escapeHTML(state.user?.bio || '')}</textarea></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
     <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>E2EE kapalıyken yeni mesajlar sunucuda okunabilir biçimde saklanır; kanal üstünde ayrıca uyarı görünür.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V7 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button>${state.isAppOwner ? '<button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm kullanıcı oturumlarını sıfırla</button>' : ''}</section>
@@ -1124,8 +1166,13 @@ async function showSettings() {
     <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
   theme.value = settings.theme || 'dark'; compact.checked = Boolean(settings.compactMode); reduce.checked = Boolean(settings.reduceMotion);
+  setAvatar($('settingsAvatarPreview'), state.user);
+  $('settingsAvatarButton')?.addEventListener('click', () => $('settingsAvatarInput')?.click());
+  $('settingsBannerButton')?.addEventListener('click', () => $('settingsBannerInput')?.click());
+  $('settingsAvatarInput')?.addEventListener('change', async (event) => { await uploadProfileMedia('avatar', event.target.files?.[0]); setAvatar($('settingsAvatarPreview'), state.user); event.target.value = ''; });
+  $('settingsBannerInput')?.addEventListener('change', async (event) => { await uploadProfileMedia('banner', event.target.files?.[0]); event.target.value = ''; });
   $('saveProfileButton')?.addEventListener('click', async () => {
-    try { const response = await api('/api/me', { method: 'PATCH', body: { displayName: $('settingsDisplayName').value, status: $('settingsStatus').value, settings: state.settings } }); state.user = { ...state.user, ...response.user }; renderMe(); toast('Profil kaydedildi.'); } catch (e) { toast(e.message); }
+    try { const response = await api('/api/me', { method: 'PATCH', body: { displayName: $('settingsDisplayName').value, status: $('settingsStatus').value, bio: $('settingsBio')?.value || '', settings: state.settings } }); state.user = { ...state.user, ...response.user }; renderMe(); toast('Profil kaydedildi.'); } catch (e) { toast(e.message); }
   });
   $('saveUiButton')?.addEventListener('click', async () => {
     try { const newSettings = { theme: theme.value, compactMode: compact.checked, reduceMotion: reduce.checked }; const response = await api('/api/me', { method: 'PATCH', body: { displayName: state.user.displayName, status: state.user.status || '', settings: newSettings } }); state.user = { ...state.user, ...response.user }; state.settings = { ...newSettings, ...(response.user?.settings || {}) }; applySettings(); toast('Görünüm kaydedildi.'); } catch (e) { toast(e.message); }
@@ -1153,6 +1200,349 @@ async function showSettings() {
     try { await api('/api/admin/import', { method: 'POST', body: JSON.parse(await file.text()) }); toast('Yedek yüklendi. Sayfa yenileniyor.'); setTimeout(() => location.reload(), 900); } catch (e) { toast(e.message); }
   });
   els.settingsModal.showModal?.();
+}
+
+/* ===================== V7.4 Safe Social Content Pack (client) ===================== */
+let currentDrawerKind = null;
+
+function setAvatar(el, user) {
+  if (!el) return;
+  const url = user?.avatarUrl;
+  if (url) { el.innerHTML = ''; const img = document.createElement('img'); img.src = absoluteUrl(url); img.alt = ''; img.loading = 'lazy'; el.appendChild(img); }
+  else el.textContent = initials(user?.displayName || user?.username || '?');
+}
+
+function closeContextMenu() { document.getElementById('gcContextMenu')?.remove(); }
+function openContextMenu(x, y, sections) {
+  closeContextMenu();
+  const menu = document.createElement('div'); menu.id = 'gcContextMenu'; menu.className = 'context-menu';
+  for (const section of sections) {
+    if (section.reactions) {
+      const row = document.createElement('div'); row.className = 'context-reactions';
+      for (const emoji of REACTION_EMOJIS) { const b = document.createElement('button'); b.type = 'button'; b.className = 'context-emoji'; b.textContent = emoji; b.addEventListener('click', () => { closeContextMenu(); section.onReact?.(emoji); }); row.appendChild(b); }
+      menu.appendChild(row); continue;
+    }
+    if (section.separator) { const s = document.createElement('div'); s.className = 'context-sep'; menu.appendChild(s); continue; }
+    const b = document.createElement('button'); b.type = 'button'; b.className = `context-item${section.danger ? ' danger' : ''}`; b.textContent = section.label;
+    b.addEventListener('click', () => { closeContextMenu(); section.onClick?.(); });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  setTimeout(() => {
+    const onClose = (event) => { if (!menu.contains(event.target)) { closeContextMenu(); document.removeEventListener('mousedown', onClose); document.removeEventListener('touchstart', onClose); } };
+    document.addEventListener('mousedown', onClose);
+    document.addEventListener('touchstart', onClose);
+  }, 0);
+}
+
+function getArticleMessage(article) { try { return JSON.parse(article?.dataset?.messageJson || 'null'); } catch { return null; } }
+function canEditMessageClient(message) { return message.user?.id === state.user?.id && message.type === 'text' && !message.encrypted; }
+function canDeleteMessageClient(message) {
+  if (message.user?.id === state.user?.id) return true;
+  const server = state.servers.find((s) => s.id === state.currentServerId);
+  return Boolean(state.view === 'server' && server && (server.isOwner || server.ownerId === state.user?.id));
+}
+function canManagePinsClient() {
+  if (state.currentDmFriend) return true;
+  const server = state.servers.find((s) => s.id === state.currentServerId);
+  return Boolean(server && (server.isOwner || server.ownerId === state.user?.id));
+}
+function messageMenuFor(message, x, y) {
+  if (!message) return;
+  const sections = [{ reactions: true, onReact: (emoji) => toggleReaction(message, emoji) },
+    { label: '↩︎ Yanıtla', onClick: () => startReply(message) },
+    { label: '🔖 Kaydet', onClick: () => addBookmark(message) }];
+  if (canManagePinsClient()) sections.push({ label: '📌 Sabitle', onClick: () => pinMessage(message) });
+  if (!message.encrypted && message.type === 'text') sections.push({ label: '📋 Kopyala', onClick: () => copyMessageText(message.text || '') });
+  sections.push({ label: '👤 Profil', onClick: () => openProfile(message.user?.id) });
+  if (canEditMessageClient(message)) sections.push({ label: '✏️ Düzenle', onClick: () => startEdit(message) });
+  if (canDeleteMessageClient(message)) sections.push({ separator: true }, { label: '🗑 Sil', danger: true, onClick: () => deleteMessage(message) });
+  openContextMenu(x, y, sections);
+}
+
+async function toggleReaction(message, emoji) { try { await api(`/api/channels/${message.channelId}/messages/${message.id}/reactions`, { method: 'POST', body: { emoji } }); } catch (e) { toast(e.message); } }
+async function pinMessage(message) { try { await api(`/api/channels/${message.channelId}/pins/${message.id}`, { method: 'POST', body: {} }); toast('Mesaj sabitlendi. 📌'); } catch (e) { toast(e.message); } }
+async function addBookmark(message) { try { await api('/api/bookmarks', { method: 'POST', body: { channelId: message.channelId, messageId: message.id } }); toast('Kaydedildi. 🔖'); } catch (e) { toast(e.message); } }
+async function copyMessageText(text) { try { await navigator.clipboard.writeText(text); toast('Kopyalandı.'); } catch { toast('Kopyalanamadı.'); } }
+async function deleteMessage(message) { if (!confirm('Bu mesaj silinsin mi?')) return; try { await api(`/api/channels/${message.channelId}/messages/${message.id}`, { method: 'DELETE', body: {} }); } catch (e) { toast(e.message); } }
+function startEdit(message) {
+  const next = prompt('Mesajı düzenle:', message.text || '');
+  if (next === null) return;
+  const text = next.trim();
+  if (!text) return toast('Boş mesaj olamaz.');
+  api(`/api/channels/${message.channelId}/messages/${message.id}`, { method: 'PATCH', body: { text } }).catch((e) => toast(e.message));
+}
+
+function startReply(message) {
+  state.replyTo = { id: message.id, name: message.user?.displayName || message.user?.username || 'mesaj', text: message.encrypted ? '🔒 şifreli mesaj' : (message.text || (message.type === 'voice' ? '🎙️ sesli mesaj' : message.type === 'file' ? `📎 ${message.fileName || 'dosya'}` : '')) };
+  renderReplyBar();
+  els.messageInput?.focus();
+}
+function cancelReply() { state.replyTo = null; renderReplyBar(); }
+function consumeReplyTo() { return state.replyTo?.id || null; }
+function clearReplyAfterSend() { if (state.replyTo) { state.replyTo = null; renderReplyBar(); } }
+function renderReplyBar() {
+  if (!els.replyBar) return;
+  if (!state.replyTo) { els.replyBar.classList.add('hidden'); return; }
+  els.replyBar.classList.remove('hidden');
+  if (els.replyBarText) els.replyBarText.innerHTML = `<strong>↩︎ ${escapeHTML(state.replyTo.name)}</strong> <span>${escapeHTML(String(state.replyTo.text || '').slice(0, 80))}</span>`;
+}
+
+function replyPreviewEl(message) {
+  const rp = message.replyPreview;
+  if (!rp) return null;
+  const el = document.createElement('button'); el.type = 'button'; el.className = 'reply-preview';
+  const name = rp.user?.displayName || rp.user?.username || (rp.deleted ? 'silinmiş' : 'mesaj');
+  const text = rp.deleted ? 'mesaj silindi' : (rp.encrypted ? '🔒 şifreli mesaj' : (rp.text || ''));
+  el.innerHTML = `<span class="reply-preview-name">↩︎ ${escapeHTML(name)}</span><span class="reply-preview-text">${escapeHTML(String(text).slice(0, 90))}</span>`;
+  el.addEventListener('click', () => jumpToMessage(rp.id));
+  return el;
+}
+function reactionsRowEl(message) {
+  const reactions = Array.isArray(message.reactions) ? message.reactions : [];
+  if (!reactions.length) return null;
+  const row = document.createElement('div'); row.className = 'reactions-row';
+  for (const r of reactions) {
+    const mine = Array.isArray(r.userIds) && r.userIds.includes(state.user?.id);
+    const chip = document.createElement('button'); chip.type = 'button'; chip.className = `reaction-chip${mine ? ' mine' : ''}`;
+    chip.textContent = `${r.emoji} ${r.count}`;
+    chip.addEventListener('click', () => toggleReaction(message, r.emoji));
+    row.appendChild(chip);
+  }
+  return row;
+}
+function decorateBubble(bubble, message) {
+  if (!bubble) return;
+  const rp = replyPreviewEl(message);
+  if (rp) bubble.insertBefore(rp, bubble.firstChild);
+  if (message.editedAt) { const body = bubble.querySelector('.message-body'); if (body && !body.querySelector('.edited-tag')) { const ed = document.createElement('span'); ed.className = 'edited-tag'; ed.textContent = ' (düzenlendi)'; body.appendChild(ed); } }
+  const rr = reactionsRowEl(message); if (rr) bubble.appendChild(rr);
+}
+function decorateArticle(article, message) {
+  article.dataset.messageJson = JSON.stringify(message);
+  if (!article.querySelector('.msg-actions-btn')) {
+    const actions = document.createElement('button'); actions.type = 'button'; actions.className = 'msg-actions-btn'; actions.textContent = '⋯'; actions.title = 'İşlemler';
+    actions.addEventListener('click', (event) => { event.stopPropagation(); const r = actions.getBoundingClientRect(); messageMenuFor(getArticleMessage(article) || message, r.right, r.bottom); });
+    article.appendChild(actions);
+    article.addEventListener('contextmenu', (event) => { event.preventDefault(); messageMenuFor(getArticleMessage(article) || message, event.clientX, event.clientY); });
+  }
+}
+function updateMessageInDom(message) {
+  if (!message || message.channelId !== state.currentChannelId) return;
+  const existing = els.messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`);
+  if (!existing) { appendMessage(message, { scroll: false }); return; }
+  const rebuilt = buildArticle(message);
+  if (rebuilt) existing.replaceWith(rebuilt);
+}
+function removeMessageFromDom(messageId) {
+  els.messages.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`)?.remove();
+}
+function jumpToMessage(messageId) {
+  closeDrawer();
+  const target = els.messages.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+  if (target) { target.scrollIntoView({ block: 'center', behavior: 'smooth' }); target.classList.add('flash'); setTimeout(() => target.classList.remove('flash'), 1100); }
+  else toast('Mesaj bu görünümde değil.');
+}
+
+/* ---- Profile card ---- */
+async function openProfile(userId) {
+  if (!userId) return;
+  try { const data = await api(`/api/users/${userId}/profile`); renderProfileModal(data.profile || {}); } catch (e) { toast(e.message); }
+}
+function renderProfileModal(p) {
+  document.getElementById('gcProfile')?.remove();
+  const overlay = document.createElement('div'); overlay.id = 'gcProfile'; overlay.className = 'modal-overlay';
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) overlay.remove(); });
+  const created = p.createdAt ? new Date(p.createdAt).toLocaleDateString('tr-TR') : '';
+  const avatar = p.avatarUrl ? `<img class="profile-avatar" src="${escapeHTML(absoluteUrl(p.avatarUrl))}" alt="">` : `<div class="profile-avatar initials">${escapeHTML(initials(p.displayName || p.username))}</div>`;
+  const card = document.createElement('div'); card.className = 'profile-card';
+  card.innerHTML = `
+    <div class="profile-banner"${p.bannerUrl ? ` style="background-image:url('${escapeHTML(absoluteUrl(p.bannerUrl))}')"` : ''}></div>
+    <div class="profile-body">
+      ${avatar}
+      <h3>${escapeHTML(p.displayName || p.username || '')}</h3>
+      <small>@${escapeHTML(p.username || '')}${p.online ? ' • çevrimiçi' : ''}</small>
+      ${p.status ? `<p class="profile-status">${escapeHTML(p.status)}</p>` : ''}
+      ${p.bio ? `<p class="profile-bio">${escapeHTML(p.bio)}</p>` : ''}
+      <div class="profile-facts"><span>📅 Katıldı: ${escapeHTML(created)}</span><span>🤝 ${Number(p.mutualServers || 0)} ortak sunucu</span></div>
+      <button class="ghost full profile-close" type="button">Kapat</button>
+    </div>`;
+  card.querySelector('.profile-close')?.addEventListener('click', () => overlay.remove());
+  overlay.appendChild(card); document.body.appendChild(overlay);
+}
+
+/* ---- Drawers (pins, media, bookmarks, notifications) ---- */
+function closeDrawer() { document.getElementById('gcDrawer')?.remove(); currentDrawerKind = null; }
+function openDrawer(kind, title, build) {
+  closeDrawer();
+  currentDrawerKind = kind;
+  const overlay = document.createElement('div'); overlay.id = 'gcDrawer'; overlay.className = 'drawer-overlay'; overlay.dataset.kind = kind;
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) closeDrawer(); });
+  const panel = document.createElement('aside'); panel.className = 'drawer-panel';
+  const header = document.createElement('header'); header.className = 'drawer-head';
+  const h = document.createElement('strong'); h.textContent = title; header.appendChild(h);
+  const close = document.createElement('button'); close.type = 'button'; close.className = 'icon-button'; close.textContent = '✕'; close.addEventListener('click', closeDrawer); header.appendChild(close);
+  const body = document.createElement('div'); body.className = 'drawer-body';
+  panel.append(header, body); overlay.appendChild(panel); document.body.appendChild(overlay);
+  build(body);
+}
+async function decryptCardText(message) {
+  if (!message.encrypted || !message.e2ee || !e2eePassphrase(message.channelId)) return null;
+  try { if (message.e2ee.mode === 'attachment') return '🔒📎 şifreli ek (anahtar var)'; const payload = await decryptPayload(message.channelId, message.e2ee); return `🔒 ${payload.text || ''}`; } catch { return null; }
+}
+function savedCard(message, extra = {}) {
+  const card = document.createElement('div'); card.className = 'saved-card';
+  const head = document.createElement('div'); head.className = 'saved-card-head';
+  head.innerHTML = `<span class="saved-author">${escapeHTML(message.user?.displayName || message.user?.username || '?')}</span><time>${escapeHTML(formatTime(message.createdAt))}</time>`;
+  card.appendChild(head);
+  if (extra.channelName) { const ch = document.createElement('small'); ch.className = 'saved-channel'; ch.textContent = extra.channelName; card.appendChild(ch); }
+  const body = document.createElement('div'); body.className = 'saved-body';
+  if (message.encrypted) body.textContent = '🔒 Şifreli mesaj — açmak için kanalın E2EE anahtarı gerekli.';
+  else if (message.type === 'file') body.textContent = `📎 ${message.fileName || 'dosya'}`;
+  else if (message.type === 'voice') body.textContent = '🎙️ sesli mesaj';
+  else body.textContent = message.text || '';
+  card.appendChild(body);
+  if (message.encrypted) decryptCardText(message).then((t) => { if (t) body.textContent = t; });
+  const actions = document.createElement('div'); actions.className = 'saved-actions';
+  if (extra.onJump) { const jump = document.createElement('button'); jump.type = 'button'; jump.className = 'mini-button'; jump.textContent = 'Mesaja git'; jump.addEventListener('click', extra.onJump); actions.appendChild(jump); }
+  if (extra.onRemove) { const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'mini-button danger'; rm.textContent = extra.removeLabel || 'Kaldır'; rm.addEventListener('click', extra.onRemove); actions.appendChild(rm); }
+  if (actions.childElementCount) card.appendChild(actions);
+  return card;
+}
+async function openPinsDrawer() {
+  if (!state.currentChannelId) return toast('Önce bir kanal seç.');
+  openDrawer('pins', '📌 Sabitlenen mesajlar', async (body) => {
+    body.innerHTML = '<div class="empty-state compact">Yükleniyor…</div>';
+    try {
+      const data = await api(`/api/channels/${state.currentChannelId}/pins`);
+      const canManage = data.canManage;
+      body.innerHTML = (data.pins || []).length ? '' : '<div class="empty-state compact">Sabitlenen mesaj yok.</div>';
+      for (const message of data.pins || []) {
+        body.appendChild(savedCard(message, { onJump: () => jumpToMessage(message.id), onRemove: canManage ? async () => { try { await api(`/api/channels/${message.channelId}/pins/${message.id}`, { method: 'DELETE', body: {} }); openPinsDrawer(); } catch (e) { toast(e.message); } } : null, removeLabel: 'Kaldır' }));
+      }
+    } catch (e) { body.innerHTML = `<div class="empty-state compact">${escapeHTML(e.message)}</div>`; }
+  });
+}
+function mediaCard(message) {
+  const card = document.createElement('div'); card.className = 'media-card';
+  if (message.encrypted) { card.innerHTML = '<div class="media-locked">🔒</div><small>Şifreli ek</small>'; return card; }
+  const mime = String(message.mimeType || '').toLowerCase();
+  const url = absoluteUrl(message.fileUrl || message.audioUrl);
+  if (mime.startsWith('image/')) { const img = document.createElement('img'); img.src = url; img.loading = 'lazy'; img.alt = message.fileName || ''; img.addEventListener('click', () => window.open(url, '_blank', 'noopener')); card.appendChild(img); }
+  else if (mime.startsWith('video/')) { const v = document.createElement('video'); v.src = url; v.controls = true; v.preload = 'metadata'; card.appendChild(v); }
+  else if (mime.startsWith('audio/') || message.type === 'voice') { const a = document.createElement('audio'); a.src = url; a.controls = true; a.preload = 'none'; card.appendChild(a); }
+  else { const link = document.createElement('a'); link.href = url; link.target = '_blank'; link.rel = 'noopener'; link.className = 'media-file'; link.textContent = `📎 ${message.fileName || 'dosya'}`; card.appendChild(link); }
+  return card;
+}
+async function openMediaDrawer() {
+  if (!state.currentChannelId) return toast('Önce bir kanal seç.');
+  openDrawer('media', '🖼 Medya galerisi', async (body) => {
+    body.innerHTML = '<div class="empty-state compact">Yükleniyor…</div>';
+    try {
+      const data = await api(`/api/channels/${state.currentChannelId}/media`);
+      const items = data.media || [];
+      body.innerHTML = '';
+      if (!items.length) { body.innerHTML = '<div class="empty-state compact">Bu kanalda medya yok.</div>'; return; }
+      const grid = document.createElement('div'); grid.className = 'media-grid';
+      for (const message of items) grid.appendChild(mediaCard(message));
+      body.appendChild(grid);
+    } catch (e) { body.innerHTML = `<div class="empty-state compact">${escapeHTML(e.message)}</div>`; }
+  });
+}
+async function openBookmarksDrawer() {
+  openDrawer('bookmarks', '🔖 Kaydedilen mesajlar', async (body) => {
+    body.innerHTML = '<div class="empty-state compact">Yükleniyor…</div>';
+    try {
+      const data = await api('/api/bookmarks');
+      const items = data.bookmarks || [];
+      body.innerHTML = items.length ? '' : '<div class="empty-state compact">Kaydedilen mesaj yok.</div>';
+      for (const message of items) {
+        body.appendChild(savedCard(message, { channelName: message.channelName, onJump: message.channelId === state.currentChannelId ? () => jumpToMessage(message.id) : null, onRemove: async () => { try { await api(`/api/bookmarks/${message.id}`, { method: 'DELETE', body: {} }); openBookmarksDrawer(); } catch (e) { toast(e.message); } }, removeLabel: 'Sil' }));
+      }
+    } catch (e) { body.innerHTML = `<div class="empty-state compact">${escapeHTML(e.message)}</div>`; }
+  });
+}
+function openChannelById(channelId) {
+  for (const server of state.servers) {
+    const channel = (server.channels || []).find((c) => c.id === channelId);
+    if (channel) { openChannel(channel, { title: `${channel.kind === 'voice' ? '🔊' : '#'} ${channel.name}`, subtitle: `${server.name}`, inviteCode: server.inviteCode, serverId: server.id }); return; }
+  }
+  toast('Bu sohbeti açmak için ilgili sunucuya/DM\'e geç.');
+}
+function openNotificationsDrawer() {
+  openDrawer('notifications', '🔔 Bildirimler', (body) => {
+    body.innerHTML = '';
+    const fr = state.notify.friendRequests || 0;
+    if (fr) { const c = document.createElement('button'); c.type = 'button'; c.className = 'notif-item'; c.innerHTML = `<strong>👋 ${fr} arkadaşlık isteği</strong><span>Arkadaşlar sekmesinde yanıtla.</span>`; c.addEventListener('click', () => { closeDrawer(); renderFriendsPanel(); }); body.appendChild(c); }
+    const items = state.notify.items || [];
+    if (!items.length && !fr) { body.innerHTML = '<div class="empty-state compact">Yeni bildirim yok.</div>'; return; }
+    for (const item of items) {
+      const c = document.createElement('button'); c.type = 'button'; c.className = 'notif-item';
+      const who = item.from?.displayName || item.from?.username || 'Biri';
+      c.innerHTML = `<strong>${item.kind === 'mention' ? '📣' : '✉️'} ${escapeHTML(who)}</strong><span>${escapeHTML(String(item.snippet || '').slice(0, 90))}</span>`;
+      c.addEventListener('click', () => { closeDrawer(); openChannelById(item.channelId); });
+      body.appendChild(c);
+    }
+  });
+}
+
+/* ---- Notification state ---- */
+function totalNotifCount() { return (state.notify.total || 0) + (state.notify.friendRequests || 0); }
+function renderNotifBadge() {
+  if (!els.notifBadge) return;
+  const n = totalNotifCount();
+  els.notifBadge.textContent = n > 99 ? '99+' : String(n);
+  els.notifBadge.classList.toggle('hidden', n <= 0);
+}
+async function loadNotifications() {
+  try {
+    const data = await api('/api/notifications');
+    state.notify.unread = data.unread || {};
+    state.notify.total = data.totalUnread || 0;
+    state.notify.friendRequests = data.friendRequests || 0;
+    renderNotifBadge();
+  } catch {}
+}
+function pushNotify(item) {
+  if (!item) return;
+  state.notify.items.unshift({ ...item });
+  if (state.notify.items.length > 50) state.notify.items = state.notify.items.slice(0, 50);
+  if (item.channelId && item.channelId !== state.currentChannelId) {
+    state.notify.unread[item.channelId] = (state.notify.unread[item.channelId] || 0) + 1;
+    state.notify.total = (state.notify.total || 0) + 1;
+    if (state.view === 'server') renderServerPanel(state.currentServerId);
+    else if (state.view === 'home') renderFriendsPanel();
+  }
+  renderNotifBadge();
+  const who = item.from?.displayName || item.from?.username || 'Biri';
+  toast(item.kind === 'mention' ? `📣 ${who} senden bahsetti` : `✉️ ${who}: ${String(item.snippet || '').slice(0, 60)}`);
+}
+async function markChannelRead(channelId) {
+  if (!channelId) return;
+  if (state.notify.unread[channelId]) { state.notify.total = Math.max(0, (state.notify.total || 0) - state.notify.unread[channelId]); delete state.notify.unread[channelId]; renderNotifBadge(); }
+  state.notify.items = (state.notify.items || []).filter((i) => i.channelId !== channelId);
+  try { await api(`/api/channels/${channelId}/read`, { method: 'POST', body: {} }); } catch {}
+}
+function dmChannelIdFor(friendId) { return state.user ? `dm_${[state.user.id, friendId].sort().join('_')}` : ''; }
+function unreadBadgeHTML(channelId) {
+  const n = state.notify.unread?.[channelId] || 0;
+  return n ? `<span class="unread-badge">${n > 99 ? '99+' : n}</span>` : '';
+}
+
+async function uploadProfileMedia(kind, file) {
+  if (!file) return;
+  if (!file.type?.startsWith('image/')) return toast('Lütfen bir görsel seç.');
+  if (file.size > 8 * 1024 * 1024) return toast('Görsel 8 MB sınırını aşıyor.');
+  try {
+    const fileData = await fileToDataURL(file);
+    const data = await api(`/api/me/${kind}`, { method: 'POST', body: { fileData, fileName: file.name || `${kind}.png`, mimeType: file.type } });
+    state.user = { ...state.user, ...data.user };
+    renderMe();
+    toast(kind === 'avatar' ? 'Avatar güncellendi.' : 'Afiş güncellendi.');
+  } catch (e) { toast(e.message); }
 }
 
 function wireEvents() {
@@ -1187,6 +1577,12 @@ function wireEvents() {
   els.logoutButton.addEventListener('click', async () => { discardRecording(); cleanupVoice({ manual: true }); state.e2ee.passphrases.clear(); state.e2ee.enabled.clear(); try { await api('/api/logout', { method: 'POST', body: {} }); } catch {} state.socket?.disconnect(); purgeLegacySensitiveLocalBackups(); state.user = null; showAuth(); });
   els.copyInviteButton.addEventListener('click', () => copyInvite());
   els.e2eeButton?.addEventListener('click', promptE2eeKey);
+  els.notificationsButton?.addEventListener('click', openNotificationsDrawer);
+  els.savedButton?.addEventListener('click', openBookmarksDrawer);
+  els.pinsButton?.addEventListener('click', openPinsDrawer);
+  els.mediaButton?.addEventListener('click', openMediaDrawer);
+  els.replyCancelButton?.addEventListener('click', cancelReply);
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeContextMenu(); closeDrawer(); document.getElementById('gcProfile')?.remove(); if (state.replyTo) cancelReply(); } });
   els.messageForm.addEventListener('submit', (event) => { event.preventDefault(); sendTextMessage(); });
   els.messageInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); sendTextMessage(); } });
   els.messageInput.addEventListener('input', () => { autoGrowInput(); syncComposerEnabled(); if (!state.currentChannelId || !state.socket?.connected) return; state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: true }); clearTimeout(state.typingTimeout); state.typingTimeout = setTimeout(() => state.socket.emit('typing', { channelId: state.currentChannelId, isTyping: false }), 900); });
