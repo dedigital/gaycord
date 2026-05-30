@@ -169,6 +169,64 @@ async function main() {
   assert(/function setLocalBackup\(\) \{ purgeLegacySensitiveLocalBackups\(\); return false; \}/.test(appJs), 'setLocalBackup must remain disabled');
   assert(/function startAutoBackup\(\)[\s\S]*state\.autoBackupTimer = null;[\s\S]*purgeLegacySensitiveLocalBackups\(\);/.test(appJs), 'admin auto backup timer must stay disabled');
 
+  // --- V7.3 static UI / composer / E2EE / asset checks ---
+  const indexHtml = read('public/index.html');
+  const stylesCss = read('public/styles.css');
+  const swJs = read('public/sw.js');
+  const serverJs = read('server.js');
+
+  // Composer + chat layout elements must exist in the shell.
+  for (const id of ['messageForm', 'messageInput', 'sendButton', 'fileButton', 'recordButton', 'composerLock', 'voicePanel', 'e2eeWarning', 'typingLine', 'messages']) {
+    assert(indexHtml.includes(`id="${id}"`), `index.html must contain #${id}`);
+  }
+
+  // Robust always-visible composer layout primitives.
+  assert(/100dvh/.test(stylesCss), 'styles.css must use 100dvh for the app shell');
+  assert(/minmax\(0,\s*1fr\)/.test(stylesCss), 'styles.css must use minmax(0, 1fr) for the scrollable messages row');
+
+  // Composer reliability: central enable/disable + socket ack timeout guard.
+  assert(/function syncComposerEnabled\(/.test(appJs), 'app.js must keep syncComposerEnabled to re-enable composer controls');
+  assert(/function emitWithTimeout\(/.test(appJs), 'app.js must guard socket sends with an ack timeout');
+
+  // E2EE UX: compact banner exists with the exact spec copy.
+  assert(indexHtml.includes('class="e2ee-warning'), 'index.html must keep the compact e2ee banner');
+  assert(appJs.includes('E2EE açık: yeni mesajlar bu sekmedeki anahtarla şifrelenir.'), 'E2EE ON banner copy must match spec');
+  assert(appJs.includes('E2EE kapalı: yeni mesajlar sunucuda okunabilir.'), 'E2EE OFF banner copy must match spec');
+  assert(appJs.includes('Bu mesaj şifreli. Anahtar gir.'), 'locked message copy must match spec');
+  assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
+
+  // Fresh cache/version strings so clients pull the new CSS/JS.
+  for (const asset of ['styles.css?v=7.3.0', 'mobile.css?v=7.3.0', 'app.js?v=7.3.0', 'mobile.js?v=7.3.0']) {
+    assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
+    assert(swJs.includes(asset), `sw.js must cache ${asset}`);
+  }
+  assert(/CACHE_NAME = 'gaycord-v7-3-shell'/.test(swJs), 'service worker cache name must be bumped for V7.3');
+
+  // Mobile assets must still be referenced (V7.1 drawer/sheet preserved).
+  assert(indexHtml.includes('/mobile.js'), 'index.html must reference mobile.js');
+  assert(indexHtml.includes('/mobile.css'), 'index.html must reference mobile.css');
+
+  // V7.2 voice stability must remain intact.
+  assert(/\/api\/voice\/keepalive/.test(serverJs), 'voice keepalive endpoint must remain');
+  assert(/voice:ping/.test(serverJs), 'server voice:ping handler must remain');
+  assert(/voice:ping/.test(appJs), 'client voice keepalive ping must remain');
+
+  // No admin localStorage backup may be reintroduced.
+  assert(!/localStorage\.setItem/.test(appJs), 'app.js must not write backups to localStorage');
+  assert(!/setLocalBackup\(\)\s*\{[^}]*localStorage\.setItem/.test(appJs), 'admin localStorage backup must not be reintroduced');
+
+  // No V8 injector / social-mega artifacts anywhere in the server tree.
+  for (const candidate of ['v8-injector.js', 'v8-social-extension.js', 'public/v8-injector.js', 'public/v8-social-extension.js']) {
+    assert(!fs.existsSync(path.join(ROOT, candidate)), `V8 file must not exist: ${candidate}`);
+  }
+  const assertNoV8 = (dir) => {
+    for (const entry of fs.readdirSync(dir)) {
+      assert(!/(^|[-_.])v8([-_.]|$)|social-mega|injector/i.test(entry), `V8/injector artifact must not exist: ${entry}`);
+    }
+  };
+  assertNoV8(ROOT);
+  assertNoV8(path.join(ROOT, 'public'));
+
   const port = await freePort();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gaycord-v7-security-'));
   const baseUrl = `http://127.0.0.1:${port}`;
