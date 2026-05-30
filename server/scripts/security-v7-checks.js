@@ -464,12 +464,18 @@ async function main() {
     // owner_v74 owns a server but is NOT the app owner; leaver_v74 is a normal user.
     const ownerExportDenied = await api(baseUrl, '/api/admin/export', { session: ownerA });
     assert.equal(ownerExportDenied.response.status, 403, 'server owner (not app owner) must not export the global backup');
-    const leaverExportDenied = await api(baseUrl, '/api/admin/export', { session: leaver });
-    assert.equal(leaverExportDenied.response.status, 403, 'normal user must not export the global backup');
     const leaverImportDenied = await api(baseUrl, '/api/admin/import', { method: 'POST', session: leaver, body: { db: { users: { x: { id: 'x' } }, servers: {} }, uploads: {} } });
     assert.equal(leaverImportDenied.response.status, 403, 'normal user must not import a global backup');
     const ownerImportDenied = await api(baseUrl, '/api/admin/import', { method: 'POST', session: ownerA, body: { db: { users: { x: { id: 'x' } }, servers: {} }, uploads: {} } });
     assert.equal(ownerImportDenied.response.status, 403, 'server owner (not app owner) must not import a global backup');
+
+    // Repeated non-owner export attempts must ALL return 403, but admin_denied logging must be
+    // rate-limited so a non-owner cannot spam unbounded securityEvents + DB writes.
+    const deniedAttempts = 9;
+    for (let i = 0; i < deniedAttempts; i += 1) {
+      const denied = await api(baseUrl, '/api/admin/export', { session: leaver });
+      assert.equal(denied.response.status, 403, 'every non-owner export attempt must return 403');
+    }
 
     // The app owner (admin_v7, first registered = db.adminUserId) logs back in and CAN export.
     const appOwner = await login(baseUrl, 'admin_v7');
@@ -477,6 +483,14 @@ async function main() {
     assert.equal(appOwnerExport.response.status, 200, 'app owner can export the global backup');
     assert.deepEqual(appOwnerExport.json.db.sessions, {}, 'export must not contain active session tokens');
     assert(appOwnerExport.json.db.adminUserId, 'export carries the app owner id');
+
+    // admin_denied logging for the spammed (user, path) must be capped at the 5/min log limit,
+    // not one event per attempt. (securityEvents was reset by the earlier import, so the App Owner's
+    // recent-events view contains all of them.)
+    const securityStatus = await api(baseUrl, '/api/security/status', { session: appOwner });
+    const leaverExportDenials = (securityStatus.json.recentSecurityEvents || []).filter((ev) => ev.type === 'admin_denied' && ev.details && ev.details.userId === leaver.user.id && ev.details.path === '/api/admin/export');
+    assert(leaverExportDenials.length >= 1, 'at least one denied admin attempt must be logged');
+    assert(leaverExportDenials.length <= 5, `admin_denied logging must be rate-limited; saw ${leaverExportDenials.length} events for ${deniedAttempts} attempts`);
     console.log('V7.4.1 admin boundary checks passed');
   } catch (error) {
     error.message += `\n\nServer output:\n${output}`;

@@ -352,11 +352,17 @@ function isAdminUser(user) {
 // App Owner / Super Admin gate. The App Owner is db.adminUserId (first registered admin); server
 // owners/admins are NOT app owners and must never pass this gate (global backup/import/invalidate).
 function requireAdmin(req, res, next) {
-  if (!isAdminUser(req.user)) {
-    recordSecurityEvent('admin_denied', { userId: req.user?.id || '', path: req.path, ip: clientIp(req) });
-    return res.status(403).json({ error: 'Bu işlem yalnızca uygulama sahibine (Super Admin) açıktır.' });
+  if (isAdminUser(req.user)) return next();
+  // Always deny non-owners with 403 (boundary is never weakened). The route-level admin rate limits
+  // run AFTER this guard, so throttle the denial LOGGING here: rate-limit recordSecurityEvent so a
+  // non-owner cannot spam admin endpoints into unbounded securityEvents + DB writes. checkRateLimit
+  // is in-memory only, so denied requests never trigger a DB write once the log cap is reached.
+  const ip = clientIp(req);
+  const logKey = `${req.user?.id || 'anon'}:${ip}:${req.path}`;
+  if (checkRateLimit('admin_denied_log', logKey, 5, 60 * 1000).ok) {
+    recordSecurityEvent('admin_denied', { userId: req.user?.id || '', path: req.path, ip });
   }
-  next();
+  return res.status(403).json({ error: 'Bu işlem yalnızca uygulama sahibine (Super Admin) açıktır.' });
 }
 
 function friendshipKey(a, b) { return [a, b].sort().join(':'); }
