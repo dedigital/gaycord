@@ -13,5 +13,5 @@ WPF tabanlı native Windows istemcisidir. V6 Security güncellemesinin en güçl
 - Orijinal seviyeler kısma sırasında snapshot'lanır; `Deactivate` (çıkış), `Dispose` (kapanış) ve `RecoverFromCrash` (sonraki açılış) ile geri yüklenir. Aktifken `%APPDATA%/Gaycord/duck-state.json` marker dosyası tutulur.
 - UI: sağ üstteki "🔉 Oyun odağı" onay kutusu + kısma seviyesi (20/35/50/70). `MainWindow` `LiveVoiceButton` katıl/ayrıl ve `OnClosed` ile bağlanır.
 
-### Derleme notu
-`dotnet build` bu ortamda çalıştırılamadı: yalnızca .NET SDK 9.0.314 kurulu, **.NET 8 WindowsDesktop targeting pack yok** (`net8.0-windows` referans assembly'leri çözülemiyor — `IDisposable`/`Task`/`byte` dahil tüm BCL tipleri CS0246 veriyor). Bu durum bu PR'dan **bağımsızdır**: değişiklikler stash'lendiğinde baseline de aynı 97 hatayı verir. .NET 8 desktop runtime + targeting pack kurulu bir makinede `dotnet build windows-native/Gaycord.Native.csproj -c Release` ile derlenir. C# tarafı NAudio 2.2.1 Core Audio API'sine göre yazıldı ve elle gözden geçirildi.
+### Derleme
+`dotnet build windows-native/Gaycord.Native.csproj -c Release` ile **başarıyla derlenir** (0 hata; .NET SDK 8.0.420 + Microsoft.WindowsDesktop.App 8 ile doğrulandı, `Gaycord.dll` üretildi). `AudioDuckingService.cs` mevcut NAudio 2.2.1 paketinin Core Audio API'sini (`MMDeviceEnumerator` / `AudioSessionManager` / `SimpleAudioVolume`) kullanır; ek bağımlılık gerekmez. Gerçek uygulama-başına ses kısma davranışı çalışan bir Windows makinesinde manuel test edilmelidir.
