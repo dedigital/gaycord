@@ -121,9 +121,17 @@ jobs:
           $v = $env:VERSION
           $setup = Get-ChildItem releases -Filter '*Setup*.exe' | Select-Object -First 1
           if ($setup) { Copy-Item $setup.FullName "releases/Gaycord-Setup-$v.exe" -Force }
-          Get-ChildItem releases -File | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)"
-          } | Out-File -Encoding ascii "releases/CHECKSUMS-SHA256.txt"
+          # Write checksums to RUNNER_TEMP first: hashing into releases/ while Out-File holds the output
+          # file open there makes Get-FileHash fail with "being used by another process". Also exclude any
+          # existing checksum file from hashing and sort for deterministic output.
+          $checksumTemp = Join-Path $env:RUNNER_TEMP "CHECKSUMS-SHA256.txt"
+          Get-ChildItem releases -File |
+            Where-Object { $_.Name -ne "CHECKSUMS-SHA256.txt" } |
+            Sort-Object Name |
+            ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)"
+            } | Set-Content -Encoding ascii $checksumTemp
+          Move-Item $checksumTemp "releases/CHECKSUMS-SHA256.txt" -Force
 
       - name: Publish GitHub Release
         shell: bash
