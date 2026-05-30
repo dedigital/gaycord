@@ -251,11 +251,11 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.7.0', 'mobile.css?v=7.7.0', 'app.js?v=7.7.0', 'mobile.js?v=7.7.0']) {
+  for (const asset of ['styles.css?v=7.9.0', 'mobile.css?v=7.9.0', 'app.js?v=7.9.0', 'mobile.js?v=7.9.0']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-7-shell'/.test(swJs), 'service worker cache name must be bumped for V7.7');
+  assert(/CACHE_NAME = 'gaycord-v7-9-shell'/.test(swJs), 'service worker cache name must be bumped for V7.9');
 
   // --- V7.7 voice clarity / game ducking static checks ---
   // No NEW sensitive localStorage keys: every localStorage.setItem must still be a gaycord:voice-* pref.
