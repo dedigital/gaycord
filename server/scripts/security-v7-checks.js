@@ -261,7 +261,10 @@ async function main() {
   assert(appJs.includes('Tarayıcı sürümü diğer uygulamaların sesini kısamaz. Bunun için Windows uygulamasını kullan.'), 'V7.7 web call-focus fallback text must be present');
   // Voice diagnostics with a safe copy (no secrets).
   assert(/function collectVoiceDiagnostics\(/.test(appJs) && /function copyVoiceDiagnostics\(/.test(appJs), 'V7.7 voice diagnostics + copy must exist');
-  assert(!/collectVoiceDiagnostics[\s\S]*?(document\.cookie|csrfToken|passphrase|DATABASE_URL|sessionToken)/.test(appJs), 'V7.7 diagnostics must not include secrets');
+  // Scope to the diagnostics function body only, so unrelated later uses of csrfToken/etc. in app.js
+  // don't trigger a false positive.
+  const diagBody = (appJs.match(/async function collectVoiceDiagnostics\([\s\S]*?\n\}/) || [''])[0];
+  assert(diagBody && !/(document\.cookie|csrfToken|passphrase|DATABASE_URL|sessionToken|\.token\b)/i.test(diagBody), 'V7.7 diagnostics must not include secrets');
   // V7.5 device switching + stale-device fallback preserved.
   assert(/sender\.replaceTrack\(/.test(appJs) && /setSinkId/.test(appJs), 'V7.5 mic/speaker switching must remain');
   assert(/function acquireMicStream\(/.test(appJs) && /function isMissingDeviceError\(/.test(appJs), 'V7.5 stale-device mic fallback must remain');
@@ -275,7 +278,9 @@ async function main() {
   assert(/DuckOthers \{ get; set; \} = false;/.test(fs.readFileSync(path.join(nativeRoot, 'Models.cs'), 'utf8')), 'native ducking must be OFF by default');
   assert(/public void Deactivate\(/.test(nativeDuck) && /public void RecoverFromCrash\(/.test(nativeDuck), 'native ducking must expose restore + crash recovery');
   assert(/SELF_NAME_RE|gaycord/i.test(nativeDuck) && /Environment\.ProcessId/.test(nativeDuck), 'native ducking must exclude its own (Gaycord) audio session');
-  assert(!/AudioEndpointVolume/.test(nativeDuck), 'native ducking must not touch the system master volume');
+  // Flag ACTUAL master-volume usage (member access / master APIs), not the safety comment that
+  // documents "AudioEndpointVolume is never written".
+  assert(!/AudioEndpointVolume\s*\.|MasterVolumeLevelScalar|MasterVolumeLevel\b|SetMasterVolume/.test(nativeDuck), 'native ducking must not touch the system master volume');
   assert(!/(Process\.Start|ShellExecute|cmd\.exe|powershell)/i.test(nativeDuck), 'native ducking must not run arbitrary commands');
   assert(!/requestedExecutionLevel|requireAdministrator|highestAvailable/i.test(nativeDuck + nativeMain), 'native ducking must not require admin');
   assert(/_ducking\.Deactivate\(\)/.test(nativeMain) && /_ducking\.Dispose\(\)/.test(nativeMain), 'native app must restore volumes on leave + exit');
