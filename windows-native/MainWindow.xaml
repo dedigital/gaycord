@@ -24,6 +24,20 @@
                         <Button x:Name="RegisterButton" Content="Hesap oluştur" Click="RegisterButton_Click" MinWidth="150"/>
                     </DockPanel>
                     <TextBlock x:Name="LoginStatus" Foreground="#FF8EA5" TextWrapping="Wrap" Margin="0,12,0,0"/>
+
+                    <!-- V7.8 About / auto-updater -->
+                    <Border BorderBrush="#252D48" BorderThickness="0,1,0,0" Margin="0,16,0,0" Padding="0,12,0,0">
+                        <StackPanel>
+                            <TextBlock x:Name="UpdateVersionText" Text="Sürüm 7.8.0" Foreground="{StaticResource MutedBrush}" FontWeight="Bold"/>
+                            <TextBlock Text="Windows uygulaması GitHub Releases üzerinden güncellenir" Foreground="#6F7C98" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,8"/>
+                            <DockPanel>
+                                <Button x:Name="UpdateApplyButton" DockPanel.Dock="Right" Content="Güncelle ve yeniden başlat" Click="UpdateApplyButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold" Margin="8,0,0,0" Visibility="Collapsed"/>
+                                <Button x:Name="UpdateCheckButton" Content="Güncellemeleri kontrol et" Click="UpdateCheckButton_Click" HorizontalAlignment="Left"/>
+                            </DockPanel>
+                            <TextBlock x:Name="UpdateStatusText" Text="" Foreground="{StaticResource MutedBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                            <CheckBox x:Name="AutoCheckUpdatesCheck" Content="Açılışta güncellemeleri otomatik kontrol et" Foreground="#A2A8BD" Margin="0,8,0,0" Click="AutoCheckUpdatesCheck_Click"/>
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
             </Border>
         </Grid>
@@ -131,6 +145,7 @@
                         <WrapPanel DockPanel.Dock="Right">
                             <Button x:Name="CopyInviteButton" Content="Davet kodu" Click="CopyInviteButton_Click"/>
                             <Button x:Name="LiveVoiceButton" Content="🎧 Ses odası" Click="LiveVoiceButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold"/>
+                            <Button x:Name="HeaderUpdateButton" Content="🔔 Yeni sürüm" Click="UpdateApplyButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold" Margin="10,0,0,0" Visibility="Collapsed" ToolTip="Yeni sürüm mevcut — güncelle ve yeniden başlat"/>
                             <CheckBox x:Name="DuckOthersCheck" Content="🔉 Oyun odağı" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="#A2A8BD" Click="DuckOthersCheck_Click" ToolTip="Aramadayken diğer uygulama seslerini kıs (yönetici gerekmez; çıkışta geri yüklenir)"/>
                             <ComboBox x:Name="DuckLevelCombo" Width="78" VerticalAlignment="Center" Margin="6,0,0,0" SelectionChanged="DuckLevelCombo_SelectionChanged" ToolTip="Diğer uygulamalar bu seviyeye kısılır">
                                 <ComboBoxItem Content="20%"/>

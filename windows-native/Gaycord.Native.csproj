@@ -14,6 +14,9 @@
     <Product>Gaycord</Product>
     <ApplicationIcon>Assets\gaycord.ico</ApplicationIcon>
     <RootNamespace>Gaycord.Native</RootNamespace>
+    <!-- V7.8: single source of truth for the app version. CI overrides via /p:Version=<tag> during the
+         release build so the binary version matches the published GitHub Release tag. -->
+    <Version>7.8.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,6 +29,7 @@
     <!-- NAudio brings NAudio.CoreAudioApi (MMDeviceEnumerator / AudioSessionManager / SimpleAudioVolume),
          used by AudioDuckingService for per-app system audio ducking (V7.7). No admin required. -->
     <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Velopack" Version="1.0.1" />
   </ItemGroup>
   <ItemGroup>
     <None Include="server.txt.example" CopyToOutputDirectory="PreserveNewest" />

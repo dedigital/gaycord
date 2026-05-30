@@ -1,0 +1,138 @@
+name: V7.8 Windows Release
+
+# Builds the Windows native app and publishes a Velopack auto-update release to GitHub Releases.
+# Triggers ONLY on a manual dispatch or a version tag push — never on fork-PR events, so a fork
+# cannot publish a release nor obtain write permissions, and PR/CI artifacts are never released.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without the v prefix (e.g. 7.8.0). Used only for manual runs.'
+        required: false
+        default: '7.8.0'
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege by default; only the release job elevates to contents: write.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write # required only to create the GitHub Release and upload assets
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Resolve + STRICTLY validate the version. Context values (tag name / manual input) are passed in
+      # as env vars — never interpolated into the script text — and the result must match a strict
+      # semver pattern or the job fails. This blocks any shell-injection via a crafted tag/input, and
+      # everything downstream consumes only the validated steps.ver.outputs.* values (also via env).
+      - name: Resolve version (validated)
+        id: ver
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -match '^v(.+)$') {
+            $v = $Matches[1]
+          } else {
+            $v = $env:INPUT_VERSION
+            if ([string]::IsNullOrWhiteSpace($v)) { $v = '7.8.0' }
+          }
+          if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.\-][0-9A-Za-z]+)*$') {
+            throw "Refusing to release: invalid version string '$v' (expected strict semver like 7.8.0)."
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=v$v"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Releasing version $v (tag v$v)"
+
+      - name: Server static checks
+        shell: bash
+        run: |
+          node --check server/server.js
+          node --check server/public/app.js
+          node --check server/scripts/security-v7-checks.js
+          git diff --check
+
+      - name: Security suite (best effort; never blocks a release)
+        shell: bash
+        continue-on-error: true
+        working-directory: server
+        run: |
+          npm install --no-audit --no-fund
+          npm run test:security
+
+      - name: Build native app
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: dotnet build windows-native/Gaycord.Native.csproj -c Release -p:Version="$VERSION"
+
+      - name: Publish native app (self-contained; NOT single-file, so Velopack can apply updates)
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: >
+          dotnet publish windows-native/Gaycord.Native.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=false
+          -p:Version="$VERSION"
+          -o publish
+
+      - name: Install Velopack CLI (pinned to the library version)
+        shell: bash
+        run: dotnet tool install -g vpk --version 1.0.1
+
+      - name: Package installer + update feed with Velopack
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          vpk pack `
+            --packId Gaycord `
+            --packTitle Gaycord `
+            --packVersion $env:VERSION `
+            --packDir publish `
+            --mainExe Gaycord.exe `
+            --outputDir releases
+
+      - name: Friendly installer name + SHA-256 checksums
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $v = $env:VERSION
+          $setup = Get-ChildItem releases -Filter '*Setup*.exe' | Select-Object -First 1
+          if ($setup) { Copy-Item $setup.FullName "releases/Gaycord-Setup-$v.exe" -Force }
+          Get-ChildItem releases -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)"
+          } | Out-File -Encoding ascii "releases/CHECKSUMS-SHA256.txt"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" releases/* --clobber
+          else
+            gh release create "$TAG" releases/* --title "Gaycord $TAG" --generate-notes
+          fi

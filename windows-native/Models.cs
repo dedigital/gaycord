@@ -183,4 +183,8 @@ public sealed class LocalSettings
     // V7.7 system audio ducking prefs (non-sensitive). OFF by default; DuckLevel = % other apps are lowered to.
     public bool DuckOthers { get; set; } = false;
     public int DuckLevel { get; set; } = 50;
+    // V7.8 updater prefs (non-sensitive; NO tokens/secrets). Check once on launch (non-blocking) by
+    // default; auto-download is OFF by default so the user controls when an update actually applies.
+    public bool AutoCheckUpdates { get; set; } = true;
+    public bool AutoDownloadUpdates { get; set; } = false;
 }
