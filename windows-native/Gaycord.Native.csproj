@@ -23,6 +23,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- NAudio brings NAudio.CoreAudioApi (MMDeviceEnumerator / AudioSessionManager / SimpleAudioVolume),
+         used by AudioDuckingService for per-app system audio ducking (V7.7). No admin required. -->
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
   <ItemGroup>

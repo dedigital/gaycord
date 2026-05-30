@@ -131,6 +131,13 @@
                         <WrapPanel DockPanel.Dock="Right">
                             <Button x:Name="CopyInviteButton" Content="Davet kodu" Click="CopyInviteButton_Click"/>
                             <Button x:Name="LiveVoiceButton" Content="🎧 Ses odası" Click="LiveVoiceButton_Click" Background="{StaticResource BrandBrush}" FontWeight="Bold"/>
+                            <CheckBox x:Name="DuckOthersCheck" Content="🔉 Oyun odağı" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="#A2A8BD" Click="DuckOthersCheck_Click" ToolTip="Aramadayken diğer uygulama seslerini kıs (yönetici gerekmez; çıkışta geri yüklenir)"/>
+                            <ComboBox x:Name="DuckLevelCombo" Width="78" VerticalAlignment="Center" Margin="6,0,0,0" SelectionChanged="DuckLevelCombo_SelectionChanged" ToolTip="Diğer uygulamalar bu seviyeye kısılır">
+                                <ComboBoxItem Content="20%"/>
+                                <ComboBoxItem Content="35%"/>
+                                <ComboBoxItem Content="50%"/>
+                                <ComboBoxItem Content="70%"/>
+                            </ComboBox>
                         </WrapPanel>
                     </DockPanel>
                 </Border>

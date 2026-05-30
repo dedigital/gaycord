@@ -659,3 +659,14 @@ body[data-theme="rainbow"] { --brand: #ec4899; --brand-2: #22d3ee; --accent-grad
 .perm-roles, .perm-users { display: grid; gap: 6px; }
 .perm-users { max-height: 240px; overflow: auto; padding-right: 2px; }
 .perm-note { color: var(--muted-2); font-size: 12px; }
+
+/* ===================== V7.7 Voice Clarity & Game Ducking ===================== */
+.voice-badges { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: 6px; vertical-align: middle; }
+.voice-badge { display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 800; border: 1px solid var(--line-2); background: var(--surface-2); color: var(--text); }
+.voice-badge.boost { color: #8ee7f5; border-color: rgba(34, 211, 238, 0.3); background: rgba(34, 211, 238, 0.12); }
+.voice-badge.game { color: #c4b3ff; border-color: rgba(139, 92, 246, 0.34); background: rgba(139, 92, 246, 0.16); }
+.voice-badge.mute, .voice-badge.deaf { color: #ffb4c3; border-color: rgba(251, 113, 133, 0.32); background: rgba(251, 113, 133, 0.14); }
+.voice-diag { display: grid; gap: 4px; padding: 10px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
+.voice-diag-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
+.voice-diag-row span { color: var(--muted-2); }
+.voice-diag-row strong { color: var(--text); overflow-wrap: anywhere; text-align: right; }
