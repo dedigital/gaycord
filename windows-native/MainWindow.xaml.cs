@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Input;
+using Velopack;
 
 namespace Gaycord.Native;
 
@@ -12,6 +13,8 @@ public partial class MainWindow : Window
     private readonly RealtimeClient _rt = new();
     private readonly AudioService _audio = new();
     private readonly AudioDuckingService _ducking = new(); // V7.7 system audio ducking
+    private readonly UpdateService _updater = new();        // V7.8 GitHub Releases auto-updater
+    private UpdateInfo? _pendingUpdate;                     // set once an update is found/downloaded
     private readonly LocalSettings _settings;
     private readonly ObservableCollection<MessageView> _messages = new();
 
@@ -32,6 +35,9 @@ public partial class MainWindow : Window
         try { _ducking.RecoverFromCrash(); } catch { }
         DuckOthersCheck.IsChecked = _settings.DuckOthers;
         DuckLevelCombo.SelectedIndex = DuckLevelIndexFor(_settings.DuckLevel);
+        // V7.8: show current version + reflect the saved auto-check pref.
+        UpdateVersionText.Text = $"Sürüm {_updater.CurrentVersion}";
+        AutoCheckUpdatesCheck.IsChecked = _settings.AutoCheckUpdates;
         _uiReady = true;
 
         _rt.MessageReceived += message => Dispatcher.Invoke(() => AddMessageIfCurrent(message));
@@ -55,6 +61,8 @@ public partial class MainWindow : Window
                     LoginStatus.Text = "Kaydedilmiş giriş süresi bitmiş olabilir. Tekrar giriş yap.";
                 }
             }
+            // V7.8: non-blocking startup update check (fire-and-forget; no popup, no launch delay).
+            if (_settings.AutoCheckUpdates) _ = CheckForUpdatesCoreAsync(manual: false);
         };
     }
 
@@ -508,6 +516,78 @@ public partial class MainWindow : Window
         // Restore originals first, then re-duck at the new level, so snapshots always hold TRUE originals
         // (never a previously-ducked value).
         if (_settings.DuckOthers && _isLiveVoice) { try { _ducking.Deactivate(); _ducking.Activate(_settings.DuckLevel / 100f); } catch { } }
+    }
+
+    // ---- V7.8 auto-updater UI handlers ----
+    private async void UpdateCheckButton_Click(object sender, RoutedEventArgs e)
+        => await CheckForUpdatesCoreAsync(manual: true);
+
+    private void AutoCheckUpdatesCheck_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_uiReady) return;
+        _settings.AutoCheckUpdates = AutoCheckUpdatesCheck.IsChecked == true;
+        SettingsStore.Save(_settings);
+    }
+
+    private void SetUpdateStatus(string text) => UpdateStatusText.Text = text;
+
+    private void ShowUpdateAvailable()
+    {
+        UpdateApplyButton.Visibility = Visibility.Visible;
+        HeaderUpdateButton.Visibility = Visibility.Visible;
+    }
+
+    private async Task CheckForUpdatesCoreAsync(bool manual)
+    {
+        if (!_updater.IsInstalled)
+        {
+            // Plain dev / `dotnet run` build (not Velopack-installed): updates are delivered by
+            // reinstalling from GitHub Releases, so there is nothing to apply in-place here.
+            if (manual) SetUpdateStatus("Windows uygulaması GitHub Releases üzerinden güncellenir.");
+            return;
+        }
+        try
+        {
+            if (manual) SetUpdateStatus("Kontrol ediliyor…");
+            var info = await _updater.CheckForUpdatesAsync();
+            if (info == null)
+            {
+                if (manual) SetUpdateStatus("Güncel sürümdesin.");
+                return;
+            }
+            _pendingUpdate = info;
+            SetUpdateStatus("Yeni sürüm mevcut.");
+            ShowUpdateAvailable();
+            // Auto-download only when the user opted in; otherwise wait for an explicit click.
+            if (_settings.AutoDownloadUpdates) await DownloadPendingAsync(info);
+        }
+        catch
+        {
+            SetUpdateStatus("Güncelleme başarısız oldu.");
+        }
+    }
+
+    private async Task DownloadPendingAsync(UpdateInfo info)
+    {
+        SetUpdateStatus("İndiriliyor…");
+        await _updater.DownloadAsync(info, p => Dispatcher.Invoke(() => SetUpdateStatus($"İndiriliyor… %{p}")));
+        SetUpdateStatus("Güncelleme hazır, yeniden başlat.");
+    }
+
+    private async void UpdateApplyButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate == null) { await CheckForUpdatesCoreAsync(manual: true); return; }
+        try
+        {
+            // DownloadUpdatesAsync is safe to (re)call — Velopack caches packages and verifies their
+            // integrity before applying. ApplyUpdatesAndRestart then swaps the version and relaunches.
+            await DownloadPendingAsync(_pendingUpdate);
+            _updater.ApplyAndRestart(_pendingUpdate);
+        }
+        catch
+        {
+            SetUpdateStatus("Güncelleme başarısız oldu.");
+        }
     }
 
     protected override async void OnClosed(EventArgs e)

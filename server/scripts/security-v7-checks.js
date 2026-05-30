@@ -292,6 +292,37 @@ async function main() {
   assert(/_ducking\.Deactivate\(\)/.test(nativeMain) && /_ducking\.Dispose\(\)/.test(nativeMain), 'native app must restore volumes on leave + exit');
   assert(/_ducking\.RecoverFromCrash\(\)/.test(nativeMain), 'native app must restore volumes after a crash on next launch');
 
+  // --- V7.8 Windows auto-updater & release pipeline static checks ---
+  // (nativeRoot/nativeMain/nativeModels are declared in the V7.7 block above.)
+  const nativeUpdater = fs.readFileSync(path.join(nativeRoot, 'UpdateService.cs'), 'utf8');
+  const nativeAppCs = fs.readFileSync(path.join(nativeRoot, 'App.xaml.cs'), 'utf8');
+  const nativeXamlV78 = fs.readFileSync(path.join(nativeRoot, 'MainWindow.xaml'), 'utf8');
+  const nativeCsproj = fs.readFileSync(path.join(nativeRoot, 'Gaycord.Native.csproj'), 'utf8');
+  const releaseWf = fs.readFileSync(path.join(ROOT, '..', '.github', 'workflows', 'windows-release.yml'), 'utf8');
+  // Updates come ONLY from the official dedigital/gaycord GitHub Releases, no token, stable releases
+  // only (prerelease:false) — so PR/CI artifacts can never be installed.
+  assert(/github\.com\/dedigital\/gaycord/.test(nativeUpdater), 'updater source must be the dedigital/gaycord GitHub Releases feed');
+  assert(/new GithubSource\([^)]*null[^)]*false\)/.test(nativeUpdater), 'updater must use no access token and stable releases only (prerelease:false)');
+  // Velopack startup hook is wired early (handles install/update hooks; runs no arbitrary code).
+  assert(/VelopackApp\.Build\(\)\.Run\(\)/.test(nativeAppCs), 'Velopack startup hook must run in App.OnStartup');
+  // No hardcoded GitHub token / credential anywhere in the updater surface or the workflow.
+  assert(!/ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}/.test(nativeUpdater + nativeAppCs + nativeCsproj + releaseWf), 'no GitHub token may be hardcoded');
+  assert(!/(accessToken|apiKey|password|secret)\s*[:=]\s*"[^"]+"/i.test(nativeUpdater), 'updater must not embed a credential literal');
+  // Velopack must NOT be the 0.0.x line carrying advisory GHSA-f5f8-9w7r-pq367 / NU1903.
+  assert(/PackageReference Include="Velopack"/.test(nativeCsproj) && !/Velopack" Version="0\.0\./.test(nativeCsproj), 'Velopack must be pinned to a patched (non-0.0.x advisory) version');
+  // Updater persists only non-sensitive prefs (no tokens/secrets/sessions/backups/E2EE).
+  assert(/AutoCheckUpdates/.test(nativeModels) && /AutoDownloadUpdates/.test(nativeModels), 'updater must persist only non-sensitive auto-check/auto-download prefs');
+  // Update-check UI + required Turkish copy.
+  assert(/Güncellemeleri kontrol et/.test(nativeXamlV78), 'manual "Güncellemeleri kontrol et" UI must exist');
+  assert(/Windows uygulaması GitHub Releases üzerinden güncellenir/.test(nativeXamlV78), 'update-source note must be shown in the UI');
+  // Release workflow: dispatch + v* tags only, builds native, least-privilege, GITHUB_TOKEN only,
+  // and NEVER publishes on pull_request (no fork release publishing / no PR-artifact updates).
+  assert(/workflow_dispatch/.test(releaseWf) && /tags:[\s\S]{0,40}- 'v\*'/.test(releaseWf), 'release workflow must trigger on workflow_dispatch + v* tags');
+  assert(!/pull_request/.test(releaseWf), 'release workflow must NOT run on pull_request (no fork release publishing)');
+  assert(/permissions:[\s\S]*?contents: read/.test(releaseWf) && /contents: write/.test(releaseWf), 'release workflow must use least-privilege permissions (read default, write only in the release job)');
+  assert(/dotnet (build|publish) windows-native\/Gaycord\.Native\.csproj/.test(releaseWf), 'release workflow must build the native app');
+  assert(/GITHUB_TOKEN/.test(releaseWf) && !/secrets\.(?!GITHUB_TOKEN)[A-Z_]+/.test(releaseWf), 'release workflow must use only the built-in GITHUB_TOKEN');
+
   // DB_STATE_KEY must remain the fixed V4 key (no migration break).
   assert(/DB_STATE_KEY = String\(process\.env\.DB_STATE_KEY \|\| 'gaycord_state_v4'\)/.test(serverJs), 'DB_STATE_KEY must remain unchanged');
 
