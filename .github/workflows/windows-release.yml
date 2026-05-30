@@ -1,8 +1,8 @@
 name: V7.8 Windows Release
 
 # Builds the Windows native app and publishes a Velopack auto-update release to GitHub Releases.
-# Triggers ONLY on a manual dispatch or a version tag push — never on pull_request, so a fork PR
-# can neither publish a release nor obtain write permissions, and PR/CI artifacts are never released.
+# Triggers ONLY on a manual dispatch or a version tag push — never on fork-PR events, so a fork
+# cannot publish a release nor obtain write permissions, and PR/CI artifacts are never released.
 on:
   workflow_dispatch:
     inputs:

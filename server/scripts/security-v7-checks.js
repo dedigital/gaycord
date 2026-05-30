@@ -293,7 +293,8 @@ async function main() {
   assert(/_ducking\.RecoverFromCrash\(\)/.test(nativeMain), 'native app must restore volumes after a crash on next launch');
 
   // --- V7.8 Windows auto-updater & release pipeline static checks ---
-  // (nativeRoot/nativeMain/nativeModels are declared in the V7.7 block above.)
+  // (nativeRoot is declared in the V7.7 block above; Models.cs is re-read here for local scope.)
+  const nativeModels = fs.readFileSync(path.join(nativeRoot, 'Models.cs'), 'utf8');
   const nativeUpdater = fs.readFileSync(path.join(nativeRoot, 'UpdateService.cs'), 'utf8');
   const nativeAppCs = fs.readFileSync(path.join(nativeRoot, 'App.xaml.cs'), 'utf8');
   const nativeXamlV78 = fs.readFileSync(path.join(nativeRoot, 'MainWindow.xaml'), 'utf8');
@@ -318,7 +319,8 @@ async function main() {
   // Release workflow: dispatch + v* tags only, builds native, least-privilege, GITHUB_TOKEN only,
   // and NEVER publishes on pull_request (no fork release publishing / no PR-artifact updates).
   assert(/workflow_dispatch/.test(releaseWf) && /tags:[\s\S]{0,40}- 'v\*'/.test(releaseWf), 'release workflow must trigger on workflow_dispatch + v* tags');
-  assert(!/pull_request/.test(releaseWf), 'release workflow must NOT run on pull_request (no fork release publishing)');
+  // Match an actual pull_request TRIGGER key (line-leading `pull_request:`), not a mention in a comment.
+  assert(!/^\s*pull_request\s*:/m.test(releaseWf), 'release workflow must NOT run on pull_request (no fork release publishing)');
   assert(/permissions:[\s\S]*?contents: read/.test(releaseWf) && /contents: write/.test(releaseWf), 'release workflow must use least-privilege permissions (read default, write only in the release job)');
   assert(/dotnet (build|publish) windows-native\/Gaycord\.Native\.csproj/.test(releaseWf), 'release workflow must build the native app');
   assert(/GITHUB_TOKEN/.test(releaseWf) && !/secrets\.(?!GITHUB_TOKEN)[A-Z_]+/.test(releaseWf), 'release workflow must use only the built-in GITHUB_TOKEN');
