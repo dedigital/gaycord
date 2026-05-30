@@ -1168,13 +1168,17 @@ function toggleMute() { if (!state.voice.stream) return; state.voice.muted = !st
 
 async function showSettings() {
   const settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(state.settings || {}) };
+  const ownedServers = (state.servers || []).filter((s) => s.isOwner || s.ownerId === state.user?.id);
   els.settingsContent.innerHTML = `
     <section class="settings-section"><h3>Profil</h3><div class="profile-edit-row"><span class="avatar small" id="settingsAvatarPreview"></span><div class="row-grow"><button id="settingsAvatarButton" class="ghost" type="button">Avatar yükle</button> <button id="settingsBannerButton" class="ghost" type="button">Afiş yükle</button></div></div><input id="settingsAvatarInput" class="hidden" type="file" accept="image/*"><input id="settingsBannerInput" class="hidden" type="file" accept="image/*"><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><label>Hakkımda<textarea id="settingsBio" maxlength="280" rows="3" placeholder="Kısa bir bio...">${escapeHTML(state.user?.bio || '')}</textarea></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
     <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
-    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>E2EE kapalıyken yeni mesajlar sunucuda okunabilir biçimde saklanır; kanal üstünde ayrıca uyarı görünür.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V7 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button>${state.isAppOwner ? '<button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm kullanıcı oturumlarını sıfırla</button>' : ''}</section>
+    <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>E2EE kapalıyken yeni mesajlar sunucuda okunabilir biçimde saklanır; kanal üstünde ayrıca uyarı görünür.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V7 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button></section>
     <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
-    <section class="settings-section"><h3>Yedek</h3>${state.isAppOwner ? '<button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button>' : '<p>Yedek alma/yükleme sadece ilk kayıt olan yönetici hesabında görünür.</p>'}</section>`;
+    ${ownedServers.length ? `<section class="settings-section"><h3>Sunucu yönetimi</h3><p>Sahibi olduğun sunucuları yönet: kanal/üye düzeni, sabitlenen mesajlar ve mesaj moderasyonu (kendi sunucundaki mesajları silebilirsin). Sunucu yöneticiliği yalnızca kendi sunucunla sınırlıdır; genel uygulama yedeğine erişim vermez.</p><div id="ownedServerList" class="stack"></div></section>` : ''}
+    ${state.isAppOwner
+      ? `<section class="settings-section owner-panel"><h3>Uygulama sahibi paneli <span class="security-pill">Super Admin</span></h3><p>Bu panel yalnızca uygulama sahibine (ilk kayıt olan Super Admin) görünür. Genel yedek tüm hesapları, sunucuları, mesajları ve dosyaları içerir; aktif oturum anahtarları yedeğe <strong>dahil edilmez</strong>.</p><div class="wrap-actions"><button id="downloadBackupButton" class="ghost" type="button">Yedek indir</button><input id="backupFileInput" type="file" accept="application/json,.json"><button id="importBackupButton" class="ghost danger" type="button">Yedek yükle</button><button id="invalidateAllSessionsButton" class="ghost danger" type="button">Tüm oturumları sıfırla</button></div><div class="section-title-row"><div class="section-title">Güvenlik olayları</div><button id="refreshSecurityEventsButton" class="mini-button" type="button">Yenile</button></div><div id="securityEventsList" class="security-events"><small>Yükleniyor…</small></div></section>`
+      : '<section class="settings-section"><h3>Yedek</h3><p>Yedek alma yalnızca uygulama sahibine açıktır.</p></section>'}`;
   const theme = $('settingsTheme'), compact = $('compactModeToggle'), reduce = $('reduceMotionToggle');
   theme.value = settings.theme || 'dark'; compact.checked = Boolean(settings.compactMode); reduce.checked = Boolean(settings.reduceMotion);
   setAvatar($('settingsAvatarPreview'), state.user);
@@ -1197,10 +1201,39 @@ async function showSettings() {
     const info = await api('/api/storage-info'); const ok = Boolean(info.persistentData);
     $('storageInfo').innerHTML = `<span class="avatar ${ok ? 'online' : ''}">${ok ? '✓' : '!'}</span><span class="row-grow"><strong>${ok ? 'Kalıcı veri aktif' : 'Kalıcı veri garanti değil'}</strong><br><small>${escapeHTML(info.storageMode || 'file')} • ${escapeHTML(info.dataDir || '')} • ${info.uploadCount || 0} dosya • ${escapeHTML(info.warning || '')}</small></span>`;
   } catch { $('storageInfo').innerHTML = '<span class="row-grow"><strong>Veri bilgisi alınamadı</strong><br><small>/api/storage-info yanıt vermedi.</small></span>'; }
-  try {
-    const sec = await api('/api/security/status');
-    $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V7 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
-  } catch { $('securityInfo').innerHTML = '<span class="row-grow"><strong>Güvenlik durumu alınamadı</strong><br><small>/api/security/status yanıt vermedi.</small></span>'; }
+  const renderSecurityEvents = (events) => {
+    const list = $('securityEventsList');
+    if (!list) return;
+    if (!Array.isArray(events) || !events.length) { list.innerHTML = '<small>Henüz güvenlik olayı yok.</small>'; return; }
+    list.innerHTML = '';
+    for (const ev of events.slice(0, 25)) {
+      const row = document.createElement('div'); row.className = 'security-event';
+      const head = document.createElement('div'); head.className = 'security-event-head';
+      head.innerHTML = `<strong>${escapeHTML(ev.type || '?')}</strong><time>${escapeHTML(formatTime(ev.createdAt))}</time>`;
+      const detail = document.createElement('small'); detail.textContent = JSON.stringify(ev.details || {}).slice(0, 220);
+      row.append(head, detail); list.appendChild(row);
+    }
+  };
+  const loadSecurityStatus = async () => {
+    try {
+      const sec = await api('/api/security/status');
+      $('securityInfo').innerHTML = `<span class="avatar online">✓</span><span class="row-grow"><strong>V7 Security aktif</strong><br><small>${escapeHTML(sec.sessionStorage)} • ${escapeHTML(sec.passwordKdf)} • CSRF/rate-limit/upload yetkisi açık</small></span>`;
+      if (state.isAppOwner) renderSecurityEvents(sec.recentSecurityEvents);
+    } catch { $('securityInfo').innerHTML = '<span class="row-grow"><strong>Güvenlik durumu alınamadı</strong><br><small>/api/security/status yanıt vermedi.</small></span>'; }
+  };
+  await loadSecurityStatus();
+  $('refreshSecurityEventsButton')?.addEventListener('click', loadSecurityStatus);
+  const ownedList = $('ownedServerList');
+  if (ownedList) {
+    ownedList.innerHTML = ownedServers.length ? '' : '<div class="empty-state compact">Sahibi olduğun sunucu yok.</div>';
+    for (const server of ownedServers) {
+      const row = document.createElement('div'); row.className = 'info-card';
+      row.innerHTML = `<span class="avatar server">${escapeHTML(initials(server.name))}</span><span class="row-grow"><strong>${escapeHTML(server.name)}</strong><br><small>${server.memberCount || server.memberIds?.length || 0} üye • sahip</small></span>`;
+      const manage = document.createElement('button'); manage.type = 'button'; manage.className = 'mini-button'; manage.textContent = 'Yönet';
+      manage.addEventListener('click', () => { els.settingsModal.close?.(); renderServerPanel(server.id); });
+      row.appendChild(manage); ownedList.appendChild(row);
+    }
+  }
   $('logoutAllButton')?.addEventListener('click', async () => { if (!confirm('Tüm cihazlardaki oturumların kapatılsın mı?')) return; try { await api('/api/security/logout-all', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Oturumlar kapatıldı.'); setTimeout(() => location.reload(), 500); } catch (e) { toast(e.message); } });
   $('invalidateAllSessionsButton')?.addEventListener('click', async () => { if (!confirm('Tüm kullanıcıların tüm oturumları kapatılsın mı? Herkes yeniden giriş yapmak zorunda kalır.')) return; try { await api('/api/admin/security/invalidate-sessions', { method: 'POST', body: {} }); purgeLegacySensitiveLocalBackups(); toast('Tüm oturumlar sıfırlandı. Yeniden giriş yapman gerekecek.'); setTimeout(() => location.reload(), 700); } catch (e) { toast(e.message); } });
   $('downloadBackupButton')?.addEventListener('click', async () => {

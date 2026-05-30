@@ -1,10 +1,10 @@
-const CACHE_NAME = 'gaycord-v7-4-shell';
+const CACHE_NAME = 'gaycord-v7-4-1-shell';
 const APP_SHELL = [
   '/',
-  '/styles.css?v=7.4.0',
-  '/mobile.css?v=7.4.0',
-  '/app.js?v=7.4.0',
-  '/mobile.js?v=7.4.0',
+  '/styles.css?v=7.4.1',
+  '/mobile.css?v=7.4.1',
+  '/app.js?v=7.4.1',
+  '/mobile.js?v=7.4.1',
   '/manifest.webmanifest',
   '/brand/favicon.ico',
   '/brand/app-mark.png',

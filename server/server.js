@@ -349,8 +349,13 @@ function isAdminUser(user) {
   return Boolean(user && db.adminUserId && user.id === db.adminUserId);
 }
 
+// App Owner / Super Admin gate. The App Owner is db.adminUserId (first registered admin); server
+// owners/admins are NOT app owners and must never pass this gate (global backup/import/invalidate).
 function requireAdmin(req, res, next) {
-  if (!isAdminUser(req.user)) return res.status(403).json({ error: 'Bu işlem için Gaycord yöneticisi olmalısın.' });
+  if (!isAdminUser(req.user)) {
+    recordSecurityEvent('admin_denied', { userId: req.user?.id || '', path: req.path, ip: clientIp(req) });
+    return res.status(403).json({ error: 'Bu işlem yalnızca uygulama sahibine (Super Admin) açıktır.' });
+  }
   next();
 }
 
@@ -1259,15 +1264,17 @@ app.get('/api/admin/export', auth, requireAdmin, rateLimit('admin_export', 12, 6
   saveDbNow();
   const light = String(req.query.light || '') === '1';
   const outDb = makeAdminExport(light);
+  recordSecurityEvent('backup_export', { adminUserId: req.user.id, light, ip: clientIp(req) });
   res.json({ app: 'gaycord', version: APP_VERSION, exportedAt: now(), light, db: outDb, uploads: light ? {} : exportUploads() });
 });
-app.post('/api/admin/import', auth, requireAdmin, (req, res) => {
+app.post('/api/admin/import', auth, requireAdmin, rateLimit('admin_import', 6, 60 * 1000, (req) => req.user?.id || clientIp(req)), (req, res) => {
   const incoming = req.body?.db;
   if (!incoming || typeof incoming !== 'object' || !incoming.users || !incoming.servers) return res.status(400).json({ error: 'Geçersiz yedek dosyası.' });
-  db = normalizeImportedDb(incoming);
+  db = normalizeImportedDb(incoming); // strips sessions/securityEvents; never restores active session tokens
   if (!db.adminUserId || !db.users[db.adminUserId]) db.adminUserId = req.user.id;
   const uploadCount = importUploads(req.body.uploads || {});
   saveDbNow();
+  recordSecurityEvent('backup_import', { adminUserId: req.user.id, uploads: uploadCount, ip: clientIp(req) });
   io.emit('data:imported', { ok: true });
   broadcastNative('data:imported', { ok: true });
   res.json({ ok: true, uploads: uploadCount });
