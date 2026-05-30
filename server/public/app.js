@@ -58,7 +58,11 @@ const VOICE_ICE_RESTART_DELAY_MS = 5000;
 const VOICE_SPEAKING_THRESHOLD = 14; // 0-255 average frequency energy above which a stream is "speaking"
 
 /* ===================== V7.5 Voice Controls (client-only; non-sensitive UI prefs) ===================== */
-const voicePrefsDefault = { inputDeviceId: '', outputDeviceId: '', echoCancellation: true, noiseSuppression: true, autoGainControl: true, inputGain: 100 };
+const voicePrefsDefault = { inputDeviceId: '', outputDeviceId: '', echoCancellation: true, noiseSuppression: true, autoGainControl: true, inputGain: 100, voiceBoost: false, gameMode: false, normalizeVoices: false, masterVolume: 100, noiseGate: false };
+// V7.7: remote per-user volume can exceed 100% (Web Audio GainNode); slider cap is 250%.
+const MAX_USER_VOLUME = 250;
+const VOICE_GAMEMODE_BOOST = 1.6;   // game mode raises remote voices to ~160%
+const VOICE_BOOST_MULT = 1.25;      // plain boost ~125%
 function loadVoicePrefs() {
   try {
     const parsed = JSON.parse(localStorage.getItem('gaycord:voice-prefs') || '{}') || {};
@@ -68,7 +72,12 @@ function loadVoicePrefs() {
       echoCancellation: parsed.echoCancellation !== false,
       noiseSuppression: parsed.noiseSuppression !== false,
       autoGainControl: parsed.autoGainControl !== false,
-      inputGain: Math.min(200, Math.max(0, Number(parsed.inputGain ?? 100) || 0))
+      inputGain: Math.min(200, Math.max(0, Number(parsed.inputGain ?? 100) || 0)),
+      voiceBoost: Boolean(parsed.voiceBoost),
+      gameMode: Boolean(parsed.gameMode),
+      normalizeVoices: Boolean(parsed.normalizeVoices),
+      masterVolume: Math.min(150, Math.max(0, Number(parsed.masterVolume ?? 100) || 0)),
+      noiseGate: Boolean(parsed.noiseGate)
     };
   } catch { return { ...voicePrefsDefault }; }
 }
@@ -78,11 +87,11 @@ function saveVoicePrefs() {
 }
 function getUserVolume(userId) {
   if (!userId) return 100;
-  try { const v = localStorage.getItem(`gaycord:voice-volume:${userId}`); return v == null ? 100 : Math.min(100, Math.max(0, Number(v) || 0)); } catch { return 100; }
+  try { const v = localStorage.getItem(`gaycord:voice-volume:${userId}`); return v == null ? 100 : Math.min(MAX_USER_VOLUME, Math.max(0, Number(v) || 0)); } catch { return 100; }
 }
 function setUserVolume(userId, vol) {
   if (!userId) return;
-  try { localStorage.setItem(`gaycord:voice-volume:${userId}`, String(Math.min(100, Math.max(0, Math.round(vol))))); } catch {}
+  try { localStorage.setItem(`gaycord:voice-volume:${userId}`, String(Math.min(MAX_USER_VOLUME, Math.max(0, Math.round(vol))))); } catch {}
 }
 function applyAudioConstraints(deviceId) {
   const p = state.voicePrefs || voicePrefsDefault;
@@ -213,9 +222,151 @@ async function setAudioToggle(key, value) {
   state.voicePrefs[key] = Boolean(value); saveVoicePrefs();
   if (state.voice.channelId) await changeMicDevice(state.voicePrefs.inputDeviceId);
 }
+/* ===================== V7.7 Voice Clarity (client) ===================== */
+// Remote voices route through Web Audio so per-user volume can exceed 100% while a compressor/limiter
+// tames loud peaks: MediaStreamSource -> Gain -> [DynamicsCompressor] -> dest, feeding the existing
+// <audio id="remote-:id"> element (kept for setSinkId output routing + deafen/local-mute via .muted).
+// Falls back to the element's 0..1 volume if Web Audio is unavailable/blocked, so audio is never lost.
+function remoteBoostMultiplier() {
+  if (state.voicePrefs?.gameMode) return VOICE_GAMEMODE_BOOST;
+  if (state.voicePrefs?.voiceBoost) return VOICE_BOOST_MULT;
+  return 1;
+}
+function effectiveRemoteGain(userId) {
+  const user = getUserVolume(userId) / 100;
+  const master = Math.min(150, Math.max(0, Number(state.voicePrefs?.masterVolume ?? 100))) / 100;
+  return Math.min(4, Math.max(0, user * master * remoteBoostMultiplier())); // ceiling; compressor tames >1
+}
+// Compressor engages on boost/normalize or whenever effective gain exceeds unity (so any >100% path is
+// clip-protected). Below unity with no toggles = plain gain (low-latency, low-CPU; no echo/reverb).
+function remoteCompressorActive(userId) {
+  return Boolean(state.voicePrefs?.gameMode || state.voicePrefs?.normalizeVoices || state.voicePrefs?.voiceBoost || effectiveRemoteGain(userId) > 1.05);
+}
+function teardownRemoteChain(socketId) {
+  const chain = state.voice.remoteChains?.get(socketId);
+  if (!chain) return;
+  for (const node of [chain.source, chain.gain, chain.comp, chain.dest]) { try { node?.disconnect(); } catch {} }
+  state.voice.remoteChains.delete(socketId);
+}
+function buildRemoteChain(socketId, stream, userId) {
+  state.voice.remoteChains ||= new Map();
+  const audio = document.getElementById(`remote-${socketId}`);
+  if (!audio) return;
+  teardownRemoteChain(socketId);
+  const ctx = ensureVoiceAudioCtx();
+  if (ctx) {
+    let source = null, gain = null, comp = null, dest = null;
+    try {
+      source = ctx.createMediaStreamSource(stream);
+      gain = ctx.createGain();
+      gain.gain.value = effectiveRemoteGain(userId);
+      dest = ctx.createMediaStreamDestination();
+      if (remoteCompressorActive(userId)) {
+        comp = ctx.createDynamicsCompressor();
+        comp.threshold.value = -28; comp.knee.value = 6; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.25;
+        source.connect(gain); gain.connect(comp); comp.connect(dest);
+      } else {
+        source.connect(gain); gain.connect(dest);
+      }
+      audio.srcObject = dest.stream;
+      audio.volume = 1; // gain handled by the node so >100% works
+      state.voice.remoteChains.set(socketId, { mode: 'webaudio', userId, stream, source, gain, comp, dest });
+      return;
+    } catch {
+      for (const node of [comp, dest, gain, source]) { try { node?.disconnect(); } catch {} }
+      if (!state.voice.audioCtxWarned && (window.AudioContext || window.webkitAudioContext)) {
+        state.voice.audioCtxWarned = true;
+        toast('Ses güçlendirme başlatılamadı; normal ses kullanılıyor.');
+      }
+    }
+  }
+  audio.srcObject = stream;
+  audio.volume = Math.min(1, effectiveRemoteGain(userId));
+  state.voice.remoteChains.set(socketId, { mode: 'element', userId, stream });
+}
+function applyRemoteGain(socketId) {
+  const chain = state.voice.remoteChains?.get(socketId);
+  if (!chain) return;
+  if (chain.mode === 'element') { const a = document.getElementById(`remote-${socketId}`); if (a) a.volume = Math.min(1, effectiveRemoteGain(chain.userId)); return; }
+  if (Boolean(chain.comp) === remoteCompressorActive(chain.userId)) { try { chain.gain.gain.value = effectiveRemoteGain(chain.userId); return; } catch {} }
+  buildRemoteChain(socketId, chain.stream, chain.userId); // compressor topology changed -> rebuild
+}
+function applyAllRemoteGains() {
+  for (const socketId of state.voice.remoteChains?.keys?.() || []) applyRemoteGain(socketId);
+}
+function setVoicePref(key, value) {
+  state.voicePrefs = state.voicePrefs || loadVoicePrefs();
+  state.voicePrefs[key] = value;
+  saveVoicePrefs();
+}
+function resetVoicePrefs() {
+  const keep = { inputDeviceId: state.voicePrefs?.inputDeviceId || '', outputDeviceId: state.voicePrefs?.outputDeviceId || '' };
+  state.voicePrefs = { ...voicePrefsDefault, ...keep };
+  saveVoicePrefs();
+}
+function voiceConnectionQuality() {
+  if (!state.voice.channelId) return '—';
+  if (state.voice.reconnecting || !state.socket?.connected) return 'Yeniden bağlanıyor';
+  for (const pc of state.voice.peers?.values?.() || []) {
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') return 'Dengesiz';
+  }
+  return 'İyi';
+}
+function deviceLabelById(devices, id, fallback) {
+  const d = devices.find((x) => x.deviceId === id);
+  return (d && d.label) || fallback;
+}
+// Safe debugging info only: NO tokens, cookies, sessions, E2EE keys, URLs, or secrets.
+async function collectVoiceDiagnostics() {
+  const p = state.voicePrefs || voicePrefsDefault;
+  let devices = [];
+  try { devices = await navigator.mediaDevices.enumerateDevices(); } catch {}
+  return {
+    timestamp: new Date().toISOString(),
+    browser: navigator.userAgent,
+    webAudioSupported: Boolean(window.AudioContext || window.webkitAudioContext),
+    outputDeviceSelectionSupported: setSinkIdSupported(),
+    micDevice: p.inputDeviceId ? deviceLabelById(devices, p.inputDeviceId, 'seçili') : 'Sistem varsayılanı',
+    speakerDevice: p.outputDeviceId ? deviceLabelById(devices, p.outputDeviceId, 'seçili') : 'Sistem varsayılanı',
+    voiceBoost: Boolean(p.voiceBoost),
+    gameMode: Boolean(p.gameMode),
+    normalizeVoices: Boolean(p.normalizeVoices),
+    masterVolume: p.masterVolume,
+    muted: Boolean(state.voice.muted),
+    deafened: Boolean(state.voice.deafened),
+    inCall: Boolean(state.voice.channelId),
+    participants: (state.voice.roster?.length || 0),
+    connectionQuality: voiceConnectionQuality()
+  };
+}
+async function copyVoiceDiagnostics() {
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(await collectVoiceDiagnostics(), null, 2));
+    toast('Tanılama panoya kopyalandı.');
+  } catch { toast('Tanılama kopyalanamadı.'); }
+}
+async function renderVoiceDiagnostics() {
+  const el = $('voiceDiag');
+  if (!el) return;
+  const d = await collectVoiceDiagnostics();
+  const rows = [
+    ['Mikrofon', d.micDevice],
+    ['Hoparlör', d.speakerDevice],
+    ['Çıkış cihazı seçimi', d.outputDeviceSelectionSupported ? 'destekleniyor' : 'desteklenmiyor'],
+    ['Web Audio', d.webAudioSupported ? 'var' : 'yok'],
+    ['Sistem ducking', 'sadece Windows uygulaması'],
+    ['Boost / Oyun Modu', `${d.voiceBoost ? 'Boost' : ''}${d.gameMode ? ' Oyun' : ''}`.trim() || 'kapalı'],
+    ['Katılımcı', String(d.participants)],
+    ['Bağlantı', d.connectionQuality]
+  ];
+  el.innerHTML = rows.map(([k, v]) => `<div class="voice-diag-row"><span>${escapeHTML(k)}</span><strong>${escapeHTML(String(v))}</strong></div>`).join('');
+}
 function configureRemoteAudio(audio, participant) {
   const userId = participant?.user?.id;
-  audio.volume = Math.min(1, getUserVolume(userId) / 100);
+  const socketId = participant?.socketId;
+  const chain = socketId && state.voice.remoteChains?.get(socketId);
+  if (chain && chain.mode === 'webaudio') audio.volume = 1; // gain handled by the Web Audio node
+  else audio.volume = Math.min(1, effectiveRemoteGain(userId));
   const locallyMuted = userId && state.voice.localMuted?.has(userId);
   audio.muted = Boolean(state.voice.deafened || locallyMuted);
   if (state.voicePrefs?.outputDeviceId && setSinkIdSupported()) audio.setSinkId(state.voicePrefs.outputDeviceId).catch(() => {});
@@ -223,8 +374,7 @@ function configureRemoteAudio(audio, participant) {
 function setRemoteVolume(socketId, vol) {
   const userId = state.voice.participants.get(socketId)?.user?.id;
   setUserVolume(userId, vol);
-  const audio = document.getElementById(`remote-${socketId}`);
-  if (audio) audio.volume = Math.min(1, vol / 100);
+  applyRemoteGain(socketId); // V7.7: gain via Web Audio chain (supports >100%)
 }
 function toggleLocalMuteUser(socketId) {
   const userId = state.voice.participants.get(socketId)?.user?.id;
@@ -311,10 +461,26 @@ async function openVoiceSettings() {
         <label class="toggle-row"><input id="voiceNS" type="checkbox"${p.noiseSuppression ? ' checked' : ''}> Gürültü bastırma</label>
         <label class="toggle-row"><input id="voiceAGC" type="checkbox"${p.autoGainControl ? ' checked' : ''}> Otomatik kazanç</label>
         <div class="voice-meter"><div id="voiceMeterBar" class="voice-meter-bar"></div></div>
+        <small id="voiceMeterLabel" class="voice-hint"></small>
         <button id="voiceMicTest" class="ghost" type="button">Mikrofonu test et</button>
       </div>
       <div class="settings-section"><h3>Hoparlör / çıkış</h3>
         ${spkSupported ? `<label>Çıkış cihazı<select id="voiceSpkSelect">${spkDefault}${spkOptions}</select></label>` : '<p>Tarayıcın çıkış cihazı seçimini desteklemiyor.</p>'}
+      </div>
+      <div class="settings-section"><h3>Ses netliği (arkadaş sesleri)</h3>
+        <label class="toggle-row"><input id="voiceBoost" type="checkbox"${p.voiceBoost ? ' checked' : ''}> Ses güçlendirme (Voice Boost)</label>
+        <label class="toggle-row"><input id="voiceGameMode" type="checkbox"${p.gameMode ? ' checked' : ''}> Oyun Modu (sesleri oyun üstünde duy)</label>
+        <label class="toggle-row"><input id="voiceNormalize" type="checkbox"${p.normalizeVoices ? ' checked' : ''}> Sesleri dengele (kısık konuşanlara yardım)</label>
+        <label>Ana ses seviyesi: <span id="voiceMasterVal">${p.masterVolume}%</span><input id="voiceMaster" type="range" min="0" max="150" value="${p.masterVolume}"></label>
+        <p class="voice-hint">Kişi başına ses seviyesini (%0–${MAX_USER_VOLUME}) ses panelindeki kaydırıcılardan ayarlayabilirsin.</p>
+      </div>
+      <div class="settings-section"><h3>Oyun sırasında diğer uygulama sesleri</h3>
+        <p class="voice-hint">Tarayıcı sürümü diğer uygulamaların sesini kısamaz. Bunun için Windows uygulamasını kullan.</p>
+        <p class="voice-hint">Diğer uygulamaların sesini kısmak Windows uygulamasında desteklenir.</p>
+      </div>
+      <div class="settings-section"><h3>Tanılama</h3>
+        <div id="voiceDiag" class="voice-diag"><small>Yükleniyor…</small></div>
+        <div class="wrap-actions"><button id="voiceCopyDiag" class="ghost" type="button">Tanılamayı kopyala</button><button id="voiceResetBtn" class="ghost danger" type="button">Ses ayarlarını sıfırla</button></div>
       </div>`;
     $('voiceMicSelect')?.addEventListener('change', (e) => changeMicDevice(e.target.value));
     $('voiceGain')?.addEventListener('input', (e) => { const el = $('voiceGainVal'); if (el) el.textContent = e.target.value + '%'; });
@@ -323,11 +489,18 @@ async function openVoiceSettings() {
     $('voiceNS')?.addEventListener('change', (e) => setAudioToggle('noiseSuppression', e.target.checked));
     $('voiceAGC')?.addEventListener('change', (e) => setAudioToggle('autoGainControl', e.target.checked));
     if (spkSupported) $('voiceSpkSelect')?.addEventListener('change', (e) => changeOutputDevice(e.target.value));
-    $('voiceMicTest')?.addEventListener('click', () => testMicrophone($('voiceMeterBar')));
+    $('voiceMicTest')?.addEventListener('click', () => testMicrophone($('voiceMeterBar'), $('voiceMeterLabel')));
+    $('voiceBoost')?.addEventListener('change', (e) => { setVoicePref('voiceBoost', e.target.checked); applyAllRemoteGains(); renderVoicePanel(); });
+    $('voiceGameMode')?.addEventListener('change', (e) => { setVoicePref('gameMode', e.target.checked); applyAllRemoteGains(); renderVoicePanel(); });
+    $('voiceNormalize')?.addEventListener('change', (e) => { setVoicePref('normalizeVoices', e.target.checked); applyAllRemoteGains(); });
+    $('voiceMaster')?.addEventListener('input', (e) => { const el = $('voiceMasterVal'); if (el) el.textContent = e.target.value + '%'; setVoicePref('masterVolume', Number(e.target.value)); applyAllRemoteGains(); });
+    $('voiceCopyDiag')?.addEventListener('click', copyVoiceDiagnostics);
+    $('voiceResetBtn')?.addEventListener('click', () => { if (confirm('Tüm ses ayarları sıfırlansın mı?')) { resetVoicePrefs(); applyAllRemoteGains(); renderVoicePanel(); toast('Ses ayarları sıfırlandı.'); closeDrawer(); openVoiceSettings(); } });
+    renderVoiceDiagnostics();
   });
 }
-async function testMicrophone(barEl) {
-  let stream = null; let ownStream = false; let ctx = null;
+async function testMicrophone(barEl, labelEl) {
+  let stream = null; let ownStream = false; let ctx = null; let peak = 0;
   try {
     if (state.voice.channelId && state.voice.stream) { stream = state.voice.stream; }
     else { stream = await acquireMicStream(); ownStream = true; }
@@ -339,7 +512,14 @@ async function testMicrophone(barEl) {
     const loop = () => {
       if (frames++ > 260 || !barEl || !barEl.isConnected) { try { source.disconnect(); } catch {} ctx.close().catch(() => {}); if (ownStream) stream.getTracks().forEach((t) => t.stop()); if (barEl && barEl.isConnected) barEl.style.width = '0%'; return; }
       analyser.getByteFrequencyData(data); let sum = 0; for (let i = 0; i < data.length; i += 1) sum += data[i];
-      if (barEl) barEl.style.width = Math.min(100, Math.round((sum / data.length) / 1.4)) + '%';
+      const pct = Math.min(100, Math.round((sum / data.length) / 1.4));
+      peak = Math.max(peak, pct);
+      if (barEl) barEl.style.width = pct + '%';
+      if (labelEl) {
+        if (pct >= 92) { labelEl.textContent = 'Clipping (çok yüksek)'; labelEl.style.color = 'var(--danger)'; }
+        else if (pct >= 12) { labelEl.textContent = 'Good (iyi)'; labelEl.style.color = 'var(--good)'; }
+        else { labelEl.textContent = 'Too quiet (çok kısık)'; labelEl.style.color = 'var(--muted-2)'; }
+      }
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
@@ -1398,12 +1578,12 @@ function renderVoicePanel() {
     const sid = userSocket.get(m.id);
     const lm = state.voice.localMuted?.has(m.id);
     const controls = sid
-      ? `<input class="voice-vol" type="range" min="0" max="100" value="${getUserVolume(m.id)}" data-peer-vol="${escapeHTML(sid)}" aria-label="Ses düzeyi"><button class="voice-mute-user ${lm ? 'on' : ''}" type="button" data-peer-mute="${escapeHTML(sid)}" title="Bu kullanıcıyı yerel olarak sustur">${lm ? '🔇' : '🔈'}</button>`
+      ? `<input class="voice-vol" type="range" min="0" max="${MAX_USER_VOLUME}" value="${getUserVolume(m.id)}" data-peer-vol="${escapeHTML(sid)}" aria-label="Ses düzeyi"><button class="voice-mute-user ${lm ? 'on' : ''}" type="button" data-peer-mute="${escapeHTML(sid)}" title="Bu kullanıcıyı yerel olarak sustur">${lm ? '🔇' : '🔈'}</button>`
       : '<small class="voice-connecting">bağlanıyor…</small>';
     return `<div class="voice-prow"${sid ? ` data-voice-peer="${escapeHTML(sid)}"` : ''}><span class="voice-dot"></span><strong class="row-grow min-0">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</strong>${controls}</div>`;
   }).join('');
   els.voicePanel.innerHTML = `
-    <div class="voice-head"><div class="min-0"><strong>${escapeHTML(title)}</strong><small>${status}</small></div><div class="voice-local-actions">${localActions}</div></div>
+    <div class="voice-head"><div class="min-0"><strong>${escapeHTML(title)}</strong><small>${status}</small>${inCall ? `<span class="voice-badges">${state.voicePrefs?.gameMode ? '<span class="voice-badge game">🎮 Oyun</span>' : (state.voicePrefs?.voiceBoost ? '<span class="voice-badge boost">🔊 Boost</span>' : '')}${state.voice.muted ? '<span class="voice-badge mute">🔇</span>' : ''}${state.voice.deafened ? '<span class="voice-badge deaf">🔈</span>' : ''}</span>` : ''}</div><div class="voice-local-actions">${localActions}</div></div>
     ${inCall ? `<div class="voice-participants">${selfRow}${peerRows}</div>` : ''}`;
   $('joinVoiceButton')?.addEventListener('click', joinVoice);
   $('leaveVoiceButton')?.addEventListener('click', () => leaveVoice(true));
@@ -1425,7 +1605,8 @@ function createPeer(socketId, user) {
   pc.ontrack = (event) => {
     let audio = document.getElementById(`remote-${socketId}`);
     if (!audio) { audio = document.createElement('audio'); audio.id = `remote-${socketId}`; audio.autoplay = true; audio.playsInline = true; els.remoteAudio.appendChild(audio); }
-    audio.srcObject = event.streams[0]; audio.play?.().catch(() => {});
+    buildRemoteChain(socketId, event.streams[0], user.id); // V7.7 boost/compressor chain (reconnect-safe)
+    audio.play?.().catch(() => {});
     configureRemoteAudio(audio, { socketId, user });
     attachAnalyser(socketId, event.streams[0]);
   };
@@ -1473,6 +1654,7 @@ function closePeer(socketId) {
   detachAnalyser(socketId);
   state.voice.peers.delete(socketId);
   state.voice.participants.delete(socketId);
+  teardownRemoteChain(socketId); // V7.7: disconnect this participant's Web Audio nodes
   document.getElementById(`remote-${socketId}`)?.remove();
   try { if (pc && pc.connectionState !== 'closed') pc.close(); } catch {}
   renderVoicePanel();

@@ -240,11 +240,60 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.6.0', 'mobile.css?v=7.6.0', 'app.js?v=7.6.0', 'mobile.js?v=7.6.0']) {
+  for (const asset of ['styles.css?v=7.7.0', 'mobile.css?v=7.7.0', 'app.js?v=7.7.0', 'mobile.js?v=7.7.0']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-6-shell'/.test(swJs), 'service worker cache name must be bumped for V7.6');
+  assert(/CACHE_NAME = 'gaycord-v7-7-shell'/.test(swJs), 'service worker cache name must be bumped for V7.7');
+
+  // --- V7.7 voice clarity / game ducking static checks ---
+  // No NEW sensitive localStorage keys: every localStorage.setItem must still be a gaycord:voice-* pref.
+  for (const m of appJs.matchAll(/localStorage\.setItem\(([^,]+),/g)) {
+    assert(/gaycord:voice-/.test(m[1]), `localStorage.setItem only allowed for non-sensitive voice prefs; found: ${m[1].trim()}`);
+  }
+  assert(!/localStorage\.setItem\([^)]*(token|passphrase|password|backup|secret|e2ee|\bsid\b|csrf|session)/i.test(appJs), 'V7.7 must not write sensitive data to localStorage');
+  // Voice boost / clarity chain exists (Web Audio gain + compressor for remote voices, supports >100%).
+  assert(/function buildRemoteChain\(/.test(appJs) && /createDynamicsCompressor\(/.test(appJs) && /createGain\(/.test(appJs), 'V7.7 remote voice boost/compressor chain must exist');
+  assert(/voiceBoost/.test(appJs) && /gameMode/.test(appJs) && /normalizeVoices/.test(appJs), 'V7.7 voice boost / game mode / normalize prefs must exist');
+  assert(/MAX_USER_VOLUME\s*=\s*250/.test(appJs), 'V7.7 per-user volume must support up to 250% via Web Audio gain');
+  // Honest web fallback: the browser cannot lower other apps' audio.
+  assert(appJs.includes('Diğer uygulamaların sesini kısmak Windows uygulamasında desteklenir.'), 'V7.7 web UI must state system ducking is Windows-only');
+  assert(appJs.includes('Tarayıcı sürümü diğer uygulamaların sesini kısamaz. Bunun için Windows uygulamasını kullan.'), 'V7.7 web call-focus fallback text must be present');
+  // Voice diagnostics with a safe copy (no secrets).
+  assert(/function collectVoiceDiagnostics\(/.test(appJs) && /function copyVoiceDiagnostics\(/.test(appJs), 'V7.7 voice diagnostics + copy must exist');
+  // Scope to the diagnostics function body only, so unrelated later uses of csrfToken/etc. in app.js
+  // don't trigger a false positive.
+  const diagBody = (appJs.match(/async function collectVoiceDiagnostics\([\s\S]*?\n\}/) || [''])[0];
+  assert(diagBody && !/(document\.cookie|csrfToken|passphrase|DATABASE_URL|sessionToken|\.token\b)/i.test(diagBody), 'V7.7 diagnostics must not include secrets');
+  // V7.5 device switching + stale-device fallback preserved.
+  assert(/sender\.replaceTrack\(/.test(appJs) && /setSinkId/.test(appJs), 'V7.5 mic/speaker switching must remain');
+  assert(/function acquireMicStream\(/.test(appJs) && /function isMissingDeviceError\(/.test(appJs), 'V7.5 stale-device mic fallback must remain');
+  // V7.2 voice keepalive / ping preserved.
+  assert(/voice:ping/.test(appJs) && /\/api\/voice\/keepalive/.test(serverJs), 'V7.2 voice keepalive/ping must remain');
+
+  // --- V7.7 Windows native ducking static checks (windows-native/, C#/.NET WPF) ---
+  const nativeRoot = path.join(ROOT, '..', 'windows-native');
+  const nativeDuck = fs.readFileSync(path.join(nativeRoot, 'AudioDuckingService.cs'), 'utf8');
+  const nativeMain = fs.readFileSync(path.join(nativeRoot, 'MainWindow.xaml.cs'), 'utf8');
+  assert(/DuckOthers \{ get; set; \} = false;/.test(fs.readFileSync(path.join(nativeRoot, 'Models.cs'), 'utf8')), 'native ducking must be OFF by default');
+  assert(/public void Deactivate\(/.test(nativeDuck) && /public void RecoverFromCrash\(/.test(nativeDuck), 'native ducking must expose restore + crash recovery');
+  assert(/SELF_NAME_RE|gaycord/i.test(nativeDuck) && /Environment\.ProcessId/.test(nativeDuck), 'native ducking must exclude its own (Gaycord) audio session');
+  // Flag ACTUAL master-volume usage (member access / master APIs), not the safety comment that
+  // documents "AudioEndpointVolume is never written".
+  assert(!/AudioEndpointVolume\s*\.|MasterVolumeLevelScalar|MasterVolumeLevel\b|SetMasterVolume/.test(nativeDuck), 'native ducking must not touch the system master volume');
+  assert(!/(Process\.Start|ShellExecute|cmd\.exe|powershell)/i.test(nativeDuck), 'native ducking must not run arbitrary commands');
+  // V7.7 P2: ducking must only LOWER — never raise an app already quieter than the duck level
+  // (target = Math.Min(original, level)), and must never set the raw level unconditionally.
+  assert(/Math\.Min\(original, level\)/.test(nativeDuck), 'native ducking must duck to Math.Min(original, level), never raising quiet apps');
+  assert(!/simple\.Volume = level;/.test(nativeDuck), 'native ducking must not set session volume to the raw duck level unconditionally');
+  // V7.7 P2: leaving a call must restore local volumes even if the network leave throws.
+  assert(/_ducking\.Deactivate\(\)[\s\S]{0,120}await _rt\.LeaveVoiceAsync\(\)/.test(nativeMain), 'native leave must restore ducking before/independent of the network leave');
+  assert(!/requestedExecutionLevel|requireAdministrator|highestAvailable/i.test(nativeDuck + nativeMain), 'native ducking must not require admin');
+  assert(/_ducking\.Deactivate\(\)/.test(nativeMain) && /_ducking\.Dispose\(\)/.test(nativeMain), 'native app must restore volumes on leave + exit');
+  assert(/_ducking\.RecoverFromCrash\(\)/.test(nativeMain), 'native app must restore volumes after a crash on next launch');
+
+  // DB_STATE_KEY must remain the fixed V4 key (no migration break).
+  assert(/DB_STATE_KEY = String\(process\.env\.DB_STATE_KEY \|\| 'gaycord_state_v4'\)/.test(serverJs), 'DB_STATE_KEY must remain unchanged');
 
   // --- V7.4.1 admin boundary: global backup is App Owner (Super Admin) only ---
   assert(appJs.includes('Yedek alma yalnızca uygulama sahibine açıktır.'), 'non-owner backup note copy must match spec');

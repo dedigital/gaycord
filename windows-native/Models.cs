@@ -180,4 +180,7 @@ public sealed class LocalSettings
     public string ServerUrl { get; set; } = "https://gaycord.onrender.com";
     public string Token { get; set; } = "";
     public string Username { get; set; } = "";
+    // V7.7 system audio ducking prefs (non-sensitive). OFF by default; DuckLevel = % other apps are lowered to.
+    public bool DuckOthers { get; set; } = false;
+    public int DuckLevel { get; set; } = 50;
 }

@@ -11,6 +11,7 @@ public partial class MainWindow : Window
     private readonly ApiClient _api = new();
     private readonly RealtimeClient _rt = new();
     private readonly AudioService _audio = new();
+    private readonly AudioDuckingService _ducking = new(); // V7.7 system audio ducking
     private readonly LocalSettings _settings;
     private readonly ObservableCollection<MessageView> _messages = new();
 
@@ -26,6 +27,12 @@ public partial class MainWindow : Window
         ServerUrlBox.Text = _settings.ServerUrl;
         UsernameBox.Text = _settings.Username;
         MessageList.ItemsSource = _messages;
+
+        // V7.7: restore any volumes left ducked by an unclean previous exit, then reflect saved prefs.
+        try { _ducking.RecoverFromCrash(); } catch { }
+        DuckOthersCheck.IsChecked = _settings.DuckOthers;
+        DuckLevelCombo.SelectedIndex = DuckLevelIndexFor(_settings.DuckLevel);
+        _uiReady = true;
 
         _rt.MessageReceived += message => Dispatcher.Invoke(() => AddMessageIfCurrent(message));
         _rt.JoinedChannel += (channelId, messages) => Dispatcher.Invoke(() => RenderJoinedMessages(channelId, messages));
@@ -316,16 +323,23 @@ public partial class MainWindow : Window
                 await _rt.JoinVoiceAsync(_currentChannel.Id);
                 _audio.StartLive(pcm => _rt.SendVoiceFrameAsync(_currentChannel.Id, pcm));
                 _isLiveVoice = true;
+                if (_settings.DuckOthers) { try { _ducking.Activate(_settings.DuckLevel / 100f); } catch { } } // V7.7: lower other apps' audio
                 LiveVoiceButton.Content = "⏹ Sesten çık";
                 SetStatus("Canlı ses başladı.");
             }
             else
             {
                 _audio.StopLive();
-                await _rt.LeaveVoiceAsync();
                 _isLiveVoice = false;
-                LiveVoiceButton.Content = "🎧 Ses odası";
-                SetStatus("Canlı sesten çıkıldı.");
+                // V7.7: restore other apps' volumes FIRST, so a network leave failure can never leave
+                // other apps ducked. Local restore must not depend on the realtime/network leave.
+                try { _ducking.Deactivate(); } catch { }
+                try { await _rt.LeaveVoiceAsync(); }
+                finally
+                {
+                    LiveVoiceButton.Content = "🎧 Ses odası";
+                    SetStatus("Canlı sesten çıkıldı.");
+                }
             }
         }
         catch (Exception ex) { SetStatus(ex.Message); }
@@ -472,8 +486,33 @@ public partial class MainWindow : Window
         PresenceText.Text = message.Length > 32 ? message[..32] + "..." : message;
     }
 
+    // ---- V7.7 system audio ducking UI handlers ----
+    private bool _uiReady;
+    private static int DuckLevelIndexFor(int level) => level switch { 20 => 0, 35 => 1, 70 => 3, _ => 2 };
+    private static int DuckLevelForIndex(int index) => index switch { 0 => 20, 1 => 35, 3 => 70, _ => 50 };
+
+    private void DuckOthersCheck_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_uiReady) return;
+        _settings.DuckOthers = DuckOthersCheck.IsChecked == true;
+        SettingsStore.Save(_settings);
+        if (_settings.DuckOthers) { if (_isLiveVoice) { try { _ducking.Activate(_settings.DuckLevel / 100f); } catch { } } }
+        else { try { _ducking.Deactivate(); } catch { } }
+    }
+
+    private void DuckLevelCombo_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (!_uiReady) return;
+        _settings.DuckLevel = DuckLevelForIndex(DuckLevelCombo.SelectedIndex);
+        SettingsStore.Save(_settings);
+        // Restore originals first, then re-duck at the new level, so snapshots always hold TRUE originals
+        // (never a previously-ducked value).
+        if (_settings.DuckOthers && _isLiveVoice) { try { _ducking.Deactivate(); _ducking.Activate(_settings.DuckLevel / 100f); } catch { } }
+    }
+
     protected override async void OnClosed(EventArgs e)
     {
+        try { _ducking.Dispose(); } catch { } // V7.7: always restore ducked volumes on exit
         _audio.Dispose();
         await _rt.DisposeAsync();
         base.OnClosed(e);
