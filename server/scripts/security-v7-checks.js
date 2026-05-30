@@ -204,7 +204,12 @@ function connectSocketIo(baseUrl, session) {
 
 async function main() {
   const appJs = read('public/app.js');
-  assert(!/localStorage\.setItem\s*\(/.test(appJs), 'app must not write backups, tokens, or secrets to localStorage');
+  // localStorage.setItem is allowed ONLY for non-sensitive voice UI preferences (gaycord:voice-*).
+  // Never tokens, E2EE passphrases, backups, or secrets.
+  for (const m of appJs.matchAll(/localStorage\.setItem\(([^,]+),/g)) {
+    assert(/gaycord:voice-/.test(m[1]), `localStorage.setItem only allowed for non-sensitive voice prefs (gaycord:voice-*); found: ${m[1].trim()}`);
+  }
+  assert(!/localStorage\.setItem\([^)]*(token|passphrase|password|backup|secret|e2ee|\bsid\b|csrf)/i.test(appJs), 'no sensitive data may be written to localStorage');
   assert(/function setLocalBackup\(\) \{ purgeLegacySensitiveLocalBackups\(\); return false; \}/.test(appJs), 'setLocalBackup must remain disabled');
   assert(/function startAutoBackup\(\)[\s\S]*state\.autoBackupTimer = null;[\s\S]*purgeLegacySensitiveLocalBackups\(\);/.test(appJs), 'admin auto backup timer must stay disabled');
 
@@ -235,11 +240,11 @@ async function main() {
   assert(/composerLock/.test(appJs), 'composer lock badge must be wired up');
 
   // Fresh cache/version strings so clients pull the new CSS/JS.
-  for (const asset of ['styles.css?v=7.4.1', 'mobile.css?v=7.4.1', 'app.js?v=7.4.1', 'mobile.js?v=7.4.1']) {
+  for (const asset of ['styles.css?v=7.5.0', 'mobile.css?v=7.5.0', 'app.js?v=7.5.0', 'mobile.js?v=7.5.0']) {
     assert(indexHtml.includes(asset), `index.html must reference ${asset}`);
     assert(swJs.includes(asset), `sw.js must cache ${asset}`);
   }
-  assert(/CACHE_NAME = 'gaycord-v7-4-1-shell'/.test(swJs), 'service worker cache name must be bumped for V7.4.1');
+  assert(/CACHE_NAME = 'gaycord-v7-5-shell'/.test(swJs), 'service worker cache name must be bumped for V7.5');
 
   // --- V7.4.1 admin boundary: global backup is App Owner (Super Admin) only ---
   assert(appJs.includes('Yedek alma yalnızca uygulama sahibine açıktır.'), 'non-owner backup note copy must match spec');
@@ -262,8 +267,21 @@ async function main() {
   assert(/voice:ping/.test(serverJs), 'server voice:ping handler must remain');
   assert(/voice:ping/.test(appJs), 'client voice keepalive ping must remain');
 
+  // V7.5 voice controls: new local/per-user controls + device switching present; V7.2 core preserved.
+  assert(/function toggleDeafen\(/.test(appJs), 'voice deafen control must exist');
+  assert(/getUserVolume|setUserVolume/.test(appJs), 'per-user volume controls must exist');
+  assert(/sender\.replaceTrack\(/.test(appJs), 'mic device switching must use sender.replaceTrack (no rejoin needed)');
+  assert(/setSinkId/.test(appJs), 'output device switching must use setSinkId');
+  assert(appJs.includes('Tarayıcın çıkış cihazı seçimini desteklemiyor.'), 'unsupported output device must degrade gracefully with a clear message');
+  assert(/function reconnectVoiceManual\(/.test(appJs) && /rejoinVoiceAfterReconnect/.test(appJs), 'manual reconnect must reuse the V7.2 reconnect path');
+  assert(/localStorage\.setItem\(`gaycord:voice-volume:/.test(appJs), 'per-user volume persisted as a non-sensitive gaycord:voice- preference');
+  // V7.2 reconnect stability must remain intact.
+  assert(/VOICE_RECONNECT_GRACE_MS/.test(appJs) && /function startVoiceReconnectGrace\(/.test(appJs), 'V7.2 reconnect grace must remain');
+  assert(/function restartPeerIce\(/.test(appJs), 'V7.2 ICE restart must remain');
+  assert(/state\.voice\.manualLeave = true/.test(appJs), 'manual leave must set manualLeave (no auto-rejoin)');
+
   // No admin localStorage backup may be reintroduced.
-  assert(!/localStorage\.setItem/.test(appJs), 'app.js must not write backups to localStorage');
+  assert(!/localStorage\.setItem\([^)]*['"`][^'"`]*backup/i.test(appJs), 'app.js must not write backups to localStorage');
   assert(!/setLocalBackup\(\)\s*\{[^}]*localStorage\.setItem/.test(appJs), 'admin localStorage backup must not be reintroduced');
 
   // No V8 injector / social-mega artifacts anywhere in the server tree.

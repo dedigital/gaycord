@@ -45,6 +45,7 @@ const state = {
   autoBackupTimer: null,
   replyTo: null,
   notify: { unread: {}, total: 0, items: [], friendRequests: 0 },
+  voicePrefs: null,
   e2ee: { passphrases: new Map(), enabled: new Set(), objectUrls: new Map() }
 };
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '😮', '😢', '🔥', '👀', '✅', '🙏'];
@@ -53,6 +54,254 @@ const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { url
 const VOICE_KEEPALIVE_MS = 27000;
 const VOICE_RECONNECT_GRACE_MS = 90000;
 const VOICE_ICE_RESTART_DELAY_MS = 5000;
+const VOICE_SPEAKING_THRESHOLD = 14; // 0-255 average frequency energy above which a stream is "speaking"
+
+/* ===================== V7.5 Voice Controls (client-only; non-sensitive UI prefs) ===================== */
+const voicePrefsDefault = { inputDeviceId: '', outputDeviceId: '', echoCancellation: true, noiseSuppression: true, autoGainControl: true, inputGain: 100 };
+function loadVoicePrefs() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('gaycord:voice-prefs') || '{}') || {};
+    return {
+      inputDeviceId: typeof parsed.inputDeviceId === 'string' ? parsed.inputDeviceId : '',
+      outputDeviceId: typeof parsed.outputDeviceId === 'string' ? parsed.outputDeviceId : '',
+      echoCancellation: parsed.echoCancellation !== false,
+      noiseSuppression: parsed.noiseSuppression !== false,
+      autoGainControl: parsed.autoGainControl !== false,
+      inputGain: Math.min(200, Math.max(0, Number(parsed.inputGain ?? 100) || 0))
+    };
+  } catch { return { ...voicePrefsDefault }; }
+}
+function saveVoicePrefs() {
+  // Only non-sensitive voice UI preferences are persisted. Never tokens/E2EE keys/secrets.
+  try { localStorage.setItem('gaycord:voice-prefs', JSON.stringify(state.voicePrefs || voicePrefsDefault)); } catch {}
+}
+function getUserVolume(userId) {
+  if (!userId) return 100;
+  try { const v = localStorage.getItem(`gaycord:voice-volume:${userId}`); return v == null ? 100 : Math.min(100, Math.max(0, Number(v) || 0)); } catch { return 100; }
+}
+function setUserVolume(userId, vol) {
+  if (!userId) return;
+  try { localStorage.setItem(`gaycord:voice-volume:${userId}`, String(Math.min(100, Math.max(0, Math.round(vol))))); } catch {}
+}
+function applyAudioConstraints(deviceId) {
+  const p = state.voicePrefs || voicePrefsDefault;
+  const audio = { echoCancellation: p.echoCancellation, noiseSuppression: p.noiseSuppression, autoGainControl: p.autoGainControl };
+  const dev = deviceId || p.inputDeviceId;
+  if (dev) audio.deviceId = { exact: dev };
+  return audio;
+}
+function setSinkIdSupported() { return typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype; }
+function ensureVoiceAudioCtx() {
+  if (state.voice.audioCtx) return state.voice.audioCtx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  try { state.voice.audioCtx = new Ctx(); } catch { return null; }
+  return state.voice.audioCtx;
+}
+// Outgoing track: raw mic track by default (V7.2 behavior, zero risk). Only when gain != 100% do we
+// route through a Web Audio GainNode and send the processed track, with a safe fallback to raw.
+function teardownGain() {
+  try { state.voice.gainSource?.disconnect(); } catch {}
+  try { state.voice.gainNode?.disconnect(); } catch {}
+  state.voice.gainDest?.stream.getTracks().forEach((t) => { try { t.stop(); } catch {} });
+  state.voice.gainSource = null; state.voice.gainNode = null; state.voice.gainDest = null;
+}
+function buildSendTrack() {
+  const raw = state.voice.stream?.getAudioTracks()[0] || null;
+  const gainValue = state.voicePrefs?.inputGain ?? 100;
+  if (gainValue === 100 || !raw) { teardownGain(); return raw; }
+  const ctx = ensureVoiceAudioCtx();
+  if (!ctx) { toast('Mikrofon kazancı bu tarayıcıda uygulanamadı.'); return raw; }
+  try {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    teardownGain();
+    const source = ctx.createMediaStreamSource(state.voice.stream);
+    const gain = ctx.createGain(); gain.gain.value = gainValue / 100;
+    const dest = ctx.createMediaStreamDestination();
+    source.connect(gain); gain.connect(dest);
+    state.voice.gainSource = source; state.voice.gainNode = gain; state.voice.gainDest = dest;
+    return dest.stream.getAudioTracks()[0] || raw;
+  } catch (e) { console.warn('gain pipeline failed', e); toast('Mikrofon kazancı uygulanamadı; ham mikrofon kullanılıyor.'); return raw; }
+}
+function applyMicEnabled() {
+  const enabled = !state.voice.muted;
+  if (state.voice.sendTrack) state.voice.sendTrack.enabled = enabled;
+  state.voice.stream?.getAudioTracks().forEach((t) => { t.enabled = enabled; });
+}
+function applySendTrack(track) {
+  if (!track) return;
+  const prev = state.voice.sendTrack;
+  state.voice.sendTrack = track;
+  applyMicEnabled();
+  for (const pc of state.voice.peers.values()) {
+    const sender = pc.getSenders?.().find((s) => s.track && s.track.kind === 'audio') || pc.getSenders?.()[0];
+    if (sender) sender.replaceTrack(track).catch((e) => console.warn('replaceTrack failed', e));
+  }
+  const rawTrack = state.voice.stream?.getAudioTracks()[0];
+  if (prev && prev !== track && prev !== rawTrack) { try { prev.stop(); } catch {} }
+}
+async function changeMicDevice(deviceId) {
+  if (state.voicePrefs) { state.voicePrefs.inputDeviceId = deviceId || ''; saveVoicePrefs(); }
+  if (!state.voice.channelId) return;
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints(deviceId) });
+    const oldStream = state.voice.stream;
+    state.voice.stream = newStream;
+    const track = buildSendTrack();
+    applySendTrack(track);
+    attachAnalyser('self', newStream);
+    oldStream?.getTracks().forEach((t) => { try { t.stop(); } catch {} });
+    toast('Mikrofon güncellendi.');
+  } catch (e) { toast('Mikrofon değiştirilemedi: ' + (e?.message || 'izin reddedildi')); }
+}
+async function changeOutputDevice(deviceId) {
+  if (state.voicePrefs) { state.voicePrefs.outputDeviceId = deviceId || ''; saveVoicePrefs(); }
+  if (!setSinkIdSupported()) { toast('Tarayıcın çıkış cihazı seçimini desteklemiyor.'); return; }
+  for (const audio of els.remoteAudio.querySelectorAll('audio')) { try { await audio.setSinkId(deviceId); } catch (e) { console.warn('setSinkId failed', e); } }
+}
+function setInputGain(value) {
+  if (!state.voicePrefs) return;
+  state.voicePrefs.inputGain = Math.min(200, Math.max(0, Math.round(value || 0))); saveVoicePrefs();
+  if (!state.voice.channelId) return;
+  if (state.voice.gainNode && state.voicePrefs.inputGain !== 100) { state.voice.gainNode.gain.value = state.voicePrefs.inputGain / 100; return; }
+  applySendTrack(buildSendTrack());
+}
+async function setAudioToggle(key, value) {
+  if (!state.voicePrefs) return;
+  state.voicePrefs[key] = Boolean(value); saveVoicePrefs();
+  if (state.voice.channelId) await changeMicDevice(state.voicePrefs.inputDeviceId);
+}
+function configureRemoteAudio(audio, participant) {
+  const userId = participant?.user?.id;
+  audio.volume = Math.min(1, getUserVolume(userId) / 100);
+  const locallyMuted = userId && state.voice.localMuted?.has(userId);
+  audio.muted = Boolean(state.voice.deafened || locallyMuted);
+  if (state.voicePrefs?.outputDeviceId && setSinkIdSupported()) audio.setSinkId(state.voicePrefs.outputDeviceId).catch(() => {});
+}
+function setRemoteVolume(socketId, vol) {
+  const userId = state.voice.participants.get(socketId)?.user?.id;
+  setUserVolume(userId, vol);
+  const audio = document.getElementById(`remote-${socketId}`);
+  if (audio) audio.volume = Math.min(1, vol / 100);
+}
+function toggleLocalMuteUser(socketId) {
+  const userId = state.voice.participants.get(socketId)?.user?.id;
+  if (!userId) return;
+  state.voice.localMuted ||= new Set();
+  if (state.voice.localMuted.has(userId)) state.voice.localMuted.delete(userId); else state.voice.localMuted.add(userId);
+  const audio = document.getElementById(`remote-${socketId}`);
+  if (audio) audio.muted = Boolean(state.voice.deafened || state.voice.localMuted.has(userId));
+  renderVoicePanel();
+}
+function toggleDeafen() {
+  if (!state.voice.channelId) return;
+  state.voice.deafened = !state.voice.deafened;
+  if (state.voice.deafened) { state.voice.preDeafenMuted = state.voice.muted; state.voice.muted = true; }
+  else { state.voice.muted = Boolean(state.voice.preDeafenMuted); }
+  applyMicEnabled();
+  for (const audio of els.remoteAudio.querySelectorAll('audio')) {
+    const uid = state.voice.participants.get(audio.id.replace('remote-', ''))?.user?.id;
+    audio.muted = Boolean(state.voice.deafened || (uid && state.voice.localMuted?.has(uid)));
+  }
+  renderVoicePanel();
+}
+async function reconnectVoiceManual() {
+  if (!state.voice.channelId || !state.voice.stream) return;
+  if (!state.socket?.connected) return toast('Önce sunucu bağlantısı kurulmalı.');
+  toast('Ses yeniden bağlanıyor…');
+  await rejoinVoiceAfterReconnect();
+}
+function attachAnalyser(key, stream) {
+  const ctx = ensureVoiceAudioCtx();
+  if (!ctx || !stream) return;
+  detachAnalyser(key);
+  try {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.6;
+    source.connect(analyser); // read-only tap, not connected to destination (no feedback)
+    state.voice.analysers.set(key, { source, analyser, data: new Uint8Array(analyser.frequencyBinCount) });
+    startSpeakingLoop();
+  } catch (e) { console.warn('analyser attach failed', e); }
+}
+function detachAnalyser(key) {
+  const a = state.voice.analysers?.get(key);
+  if (a) { try { a.source.disconnect(); } catch {} state.voice.analysers.delete(key); }
+}
+function startSpeakingLoop() {
+  if (state.voice.speakingRaf || typeof requestAnimationFrame !== 'function') return;
+  let last = 0;
+  const tick = (ts) => {
+    if (!state.voice.channelId) { state.voice.speakingRaf = null; return; }
+    state.voice.speakingRaf = requestAnimationFrame(tick);
+    if (ts - last < 90) return; // ~11 fps
+    last = ts;
+    for (const [key, a] of state.voice.analysers) {
+      a.analyser.getByteFrequencyData(a.data);
+      let sum = 0; for (let i = 0; i < a.data.length; i += 1) sum += a.data[i];
+      const avg = sum / a.data.length;
+      const speaking = avg > VOICE_SPEAKING_THRESHOLD && (key !== 'self' || (!state.voice.muted && !state.voice.deafened));
+      const el = key === 'self' ? els.voicePanel.querySelector('.voice-self-chip') : els.voicePanel.querySelector(`[data-voice-peer="${CSS.escape(key)}"]`);
+      if (el) el.classList.toggle('speaking', speaking);
+    }
+  };
+  state.voice.speakingRaf = requestAnimationFrame(tick);
+}
+function stopSpeakingLoop() {
+  if (state.voice.speakingRaf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(state.voice.speakingRaf);
+  state.voice.speakingRaf = null;
+}
+async function openVoiceSettings() {
+  openDrawer('voice', '🎧 Ses ayarları', async (body) => {
+    body.innerHTML = '<div class="empty-state compact">Cihazlar yükleniyor…</div>';
+    const p = state.voicePrefs || (state.voicePrefs = loadVoicePrefs());
+    let mics = [], speakers = [];
+    try { const devices = await navigator.mediaDevices.enumerateDevices(); mics = devices.filter((d) => d.kind === 'audioinput'); speakers = devices.filter((d) => d.kind === 'audiooutput'); } catch {}
+    const micOptions = mics.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId === p.inputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Mikrofon ' + (i + 1)))}</option>`).join('');
+    const spkSupported = setSinkIdSupported();
+    const spkOptions = speakers.map((d, i) => `<option value="${escapeHTML(d.deviceId)}"${d.deviceId === p.outputDeviceId ? ' selected' : ''}>${escapeHTML(d.label || ('Hoparlör ' + (i + 1)))}</option>`).join('');
+    body.innerHTML = `
+      <div class="settings-section"><h3>Mikrofon</h3>
+        <label>Giriş cihazı<select id="voiceMicSelect">${micOptions || '<option value="">Mikrofon bulunamadı</option>'}</select></label>
+        <label>Kazanç: <span id="voiceGainVal">${p.inputGain}%</span><input id="voiceGain" type="range" min="0" max="200" value="${p.inputGain}"></label>
+        <label class="toggle-row"><input id="voiceEC" type="checkbox"${p.echoCancellation ? ' checked' : ''}> Yankı engelleme</label>
+        <label class="toggle-row"><input id="voiceNS" type="checkbox"${p.noiseSuppression ? ' checked' : ''}> Gürültü bastırma</label>
+        <label class="toggle-row"><input id="voiceAGC" type="checkbox"${p.autoGainControl ? ' checked' : ''}> Otomatik kazanç</label>
+        <div class="voice-meter"><div id="voiceMeterBar" class="voice-meter-bar"></div></div>
+        <button id="voiceMicTest" class="ghost" type="button">Mikrofonu test et</button>
+      </div>
+      <div class="settings-section"><h3>Hoparlör / çıkış</h3>
+        ${spkSupported ? `<label>Çıkış cihazı<select id="voiceSpkSelect">${spkOptions || '<option value="">Cihaz bulunamadı</option>'}</select></label>` : '<p>Tarayıcın çıkış cihazı seçimini desteklemiyor.</p>'}
+      </div>`;
+    $('voiceMicSelect')?.addEventListener('change', (e) => changeMicDevice(e.target.value));
+    $('voiceGain')?.addEventListener('input', (e) => { const el = $('voiceGainVal'); if (el) el.textContent = e.target.value + '%'; });
+    $('voiceGain')?.addEventListener('change', (e) => setInputGain(Number(e.target.value)));
+    $('voiceEC')?.addEventListener('change', (e) => setAudioToggle('echoCancellation', e.target.checked));
+    $('voiceNS')?.addEventListener('change', (e) => setAudioToggle('noiseSuppression', e.target.checked));
+    $('voiceAGC')?.addEventListener('change', (e) => setAudioToggle('autoGainControl', e.target.checked));
+    if (spkSupported) $('voiceSpkSelect')?.addEventListener('change', (e) => changeOutputDevice(e.target.value));
+    $('voiceMicTest')?.addEventListener('click', () => testMicrophone($('voiceMeterBar')));
+  });
+}
+async function testMicrophone(barEl) {
+  let stream = null; let ownStream = false; let ctx = null;
+  try {
+    if (state.voice.channelId && state.voice.stream) { stream = state.voice.stream; }
+    else { stream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints() }); ownStream = true; }
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) { toast('Tarayıcı ses ölçümünü desteklemiyor.'); if (ownStream) stream.getTracks().forEach((t) => t.stop()); return; }
+    ctx = new Ctx();
+    const source = ctx.createMediaStreamSource(stream); const analyser = ctx.createAnalyser(); analyser.fftSize = 256; source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount); let frames = 0;
+    const loop = () => {
+      if (frames++ > 260 || !barEl || !barEl.isConnected) { try { source.disconnect(); } catch {} ctx.close().catch(() => {}); if (ownStream) stream.getTracks().forEach((t) => t.stop()); if (barEl && barEl.isConnected) barEl.style.width = '0%'; return; }
+      analyser.getByteFrequencyData(data); let sum = 0; for (let i = 0; i < data.length; i += 1) sum += data[i];
+      if (barEl) barEl.style.width = Math.min(100, Math.round((sum / data.length) / 1.4)) + '%';
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  } catch { toast('Mikrofon test edilemedi: izin reddedildi.'); if (ownStream && stream) stream.getTracks().forEach((t) => t.stop()); if (ctx) ctx.close().catch(() => {}); }
+}
 
 function toast(message) {
   els.toast.textContent = String(message || '');
@@ -729,7 +978,7 @@ function connectSocket() {
   state.socket.on('data:imported', () => { toast('Yedek yüklendi; sayfa yenileniyor.'); setTimeout(() => location.reload(), 900); });
   state.socket.on('voice:user_joined', ({ channelId, peer } = {}) => { if (channelId !== state.voice.channelId || !peer?.socketId || peer.socketId === state.voice.selfId) return; createPeer(peer.socketId, peer.user); renderVoicePanel(); });
   state.socket.on('voice:user_left', ({ socketId } = {}) => { if (socketId) closePeer(socketId); });
-  state.socket.on('voice:members', ({ channelId, members } = {}) => { if (channelId !== state.voice.channelId) return; renderVoicePanel(members || null); });
+  state.socket.on('voice:members', ({ channelId, members } = {}) => { if (channelId !== state.voice.channelId) return; state.voice.roster = members || []; renderVoicePanel(); });
   state.socket.on('voice:signal', handleVoiceSignal);
 }
 
@@ -955,15 +1204,26 @@ function freshVoiceState(overrides = {}) {
   return {
     channelId: null,
     stream: null,
+    sendTrack: null,
     peers: new Map(),
     participants: new Map(),
+    roster: [],
     muted: false,
+    deafened: false,
+    preDeafenMuted: false,
+    localMuted: new Set(),
     selfId: state.socket?.id || null,
     keepaliveTimer: null,
     reconnectGraceTimer: null,
     reconnecting: false,
     manualLeave: false,
     peerRestartTimers: new Map(),
+    analysers: new Map(),
+    audioCtx: null,
+    speakingRaf: null,
+    gainSource: null,
+    gainNode: null,
+    gainDest: null,
     ...overrides
   };
 }
@@ -1020,7 +1280,7 @@ function emitVoiceJoin(channelId) {
         state.voice.manualLeave = false;
         state.voice.reconnecting = false;
         state.voice.participants.clear();
-        for (const member of response.members || []) state.voice.participants.set(member.id, { user: member });
+        state.voice.roster = response.members || []; // server-authoritative roster (separate from socketId-keyed peers)
         for (const peer of response.peers || []) { createPeer(peer.socketId, peer.user); await offerPeer(peer.socketId); }
         startVoiceKeepalive();
         renderVoicePanel(response.members || null);
@@ -1050,36 +1310,67 @@ async function rejoinVoiceAfterReconnect() {
     toast(e.message || 'Ses odasına yeniden bağlanılamadı.');
   }
 }
-function renderVoicePanel(serverMembers = null) {
+function renderVoicePanel() {
   const inCall = Boolean(state.voice.channelId);
   const viewingCallable = canCallCurrentChannel();
-  if (!inCall && !viewingCallable) { els.voicePanel.classList.add('hidden'); els.voicePanel.classList.remove('reconnecting'); els.voicePanel.innerHTML = ''; return; }
+  if (!inCall && !viewingCallable) { els.voicePanel.classList.add('hidden'); els.voicePanel.classList.remove('reconnecting', 'in-call'); els.voicePanel.innerHTML = ''; return; }
   els.voicePanel.classList.remove('hidden');
   els.voicePanel.classList.toggle('reconnecting', Boolean(inCall && state.voice.reconnecting));
-  const members = serverMembers || [...state.voice.participants.values()].map((p) => p.user || p).filter(Boolean);
-  const count = inCall ? Math.max(1, members.filter((m) => m.id !== state.user?.id).length + 1) : 0;
+  els.voicePanel.classList.toggle('in-call', inCall);
   const activeHere = inCall && state.voice.channelId === state.currentChannelId;
-  const title = state.voice.reconnecting ? 'Bağlantı koptu, ses odasına yeniden bağlanılıyor...' : (activeHere ? callLabel() : (inCall ? 'Başka bir ses kanalındasın' : callLabel()));
-  const status = state.voice.reconnecting ? 'mikrofon açık tutuluyor' : `${count} kişi bağlı • ${state.voice.muted ? 'mikrofon kapalı' : 'mikrofon açık'}`;
+  // Roster (server-authoritative member list) drives the list + count so it is accurate immediately,
+  // even before WebRTC peers finish (re)connecting. Per-peer controls target the remote <audio> by socketId.
+  const userSocket = new Map();
+  for (const sid of state.voice.peers.keys()) { const uid = state.voice.participants.get(sid)?.user?.id; if (uid) userSocket.set(uid, sid); }
+  const others = inCall ? (state.voice.roster || []).filter((m) => m && m.id && m.id !== state.user?.id) : [];
+  const seenIds = new Set(others.map((m) => m.id));
+  for (const sid of state.voice.peers.keys()) { const u = state.voice.participants.get(sid)?.user; if (u && u.id && !seenIds.has(u.id)) { others.push(u); seenIds.add(u.id); } }
+  const count = inCall ? others.length + 1 : 0;
+  const title = state.voice.reconnecting ? 'Yeniden bağlanılıyor…' : (activeHere ? callLabel() : (inCall ? 'Başka bir ses kanalında' : callLabel()));
+  const stateLabel = state.voice.reconnecting ? 'Yeniden bağlanıyor' : state.voice.deafened ? 'Sağırlaştırıldı' : state.voice.muted ? 'Mikrofon kapalı' : 'Bağlı';
+  const status = inCall ? `${count} kişi • ${escapeHTML(stateLabel)}` : 'Canlı konuşmak için katıl.';
+  const localActions = inCall
+    ? `<button id="muteVoiceButton" class="voice-ctl ${state.voice.muted ? 'on' : ''}" type="button" title="${state.voice.muted ? 'Mikrofonu aç' : 'Mikrofonu kapat'}">${state.voice.muted ? '🔇' : '🎙'}</button>`
+      + `<button id="deafenVoiceButton" class="voice-ctl ${state.voice.deafened ? 'on' : ''}" type="button" title="${state.voice.deafened ? 'Sesi aç' : 'Sağırlaştır'}">${state.voice.deafened ? '🔇🎧' : '🎧'}</button>`
+      + `<button id="voiceSettingsButton" class="voice-ctl" type="button" title="Ses ayarları">⚙</button>`
+      + `<button id="reconnectVoiceButton" class="voice-ctl" type="button" title="Yeniden bağlan">⟳</button>`
+      + `<button id="leaveVoiceButton" class="ghost danger" type="button">Ayrıl</button>`
+    : '<button id="joinVoiceButton" class="primary" type="button">Sese katıl</button>';
+  const selfRow = `<div class="voice-prow voice-self-chip ${state.voice.muted ? 'self-muted' : ''}"><span class="voice-dot"></span><strong class="row-grow min-0">Sen</strong><span class="voice-self-state">${state.voice.deafened ? '🔇🎧' : state.voice.muted ? '🔇' : '🎙'}</span></div>`;
+  const peerRows = others.map((m) => {
+    const sid = userSocket.get(m.id);
+    const lm = state.voice.localMuted?.has(m.id);
+    const controls = sid
+      ? `<input class="voice-vol" type="range" min="0" max="100" value="${getUserVolume(m.id)}" data-peer-vol="${escapeHTML(sid)}" aria-label="Ses düzeyi"><button class="voice-mute-user ${lm ? 'on' : ''}" type="button" data-peer-mute="${escapeHTML(sid)}" title="Bu kullanıcıyı yerel olarak sustur">${lm ? '🔇' : '🔈'}</button>`
+      : '<small class="voice-connecting">bağlanıyor…</small>';
+    return `<div class="voice-prow"${sid ? ` data-voice-peer="${escapeHTML(sid)}"` : ''}><span class="voice-dot"></span><strong class="row-grow min-0">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</strong>${controls}</div>`;
+  }).join('');
   els.voicePanel.innerHTML = `
-    <div class="min-0"><strong>${escapeHTML(title)}</strong><small>${inCall ? status : 'Canlı konuşmak için katıl.'}</small></div>
-    <div class="voice-members">${inCall ? `<span class="voice-chip ${state.voice.muted ? 'muted' : ''}">Sen ${state.voice.muted ? '🔇' : '🎙'}</span>${members.filter((m) => m.id !== state.user?.id).map((m) => `<span class="voice-chip">${escapeHTML(m.displayName || m.username || 'Kullanıcı')}</span>`).join('')}` : '<span class="voice-chip">Hazır</span>'}</div>
-    <div class="voice-actions">${inCall ? '<button id="muteVoiceButton" class="ghost" type="button">' + (state.voice.muted ? 'Mikrofonu aç' : 'Mikrofonu kapat') + '</button><button id="leaveVoiceButton" class="ghost danger" type="button">Ayrıl</button>' : '<button id="joinVoiceButton" class="primary" type="button">Sese katıl</button>'}</div>`;
+    <div class="voice-head"><div class="min-0"><strong>${escapeHTML(title)}</strong><small>${status}</small></div><div class="voice-local-actions">${localActions}</div></div>
+    ${inCall ? `<div class="voice-participants">${selfRow}${peerRows}</div>` : ''}`;
   $('joinVoiceButton')?.addEventListener('click', joinVoice);
   $('leaveVoiceButton')?.addEventListener('click', () => leaveVoice(true));
   $('muteVoiceButton')?.addEventListener('click', toggleMute);
+  $('deafenVoiceButton')?.addEventListener('click', toggleDeafen);
+  $('voiceSettingsButton')?.addEventListener('click', openVoiceSettings);
+  $('reconnectVoiceButton')?.addEventListener('click', reconnectVoiceManual);
+  els.voicePanel.querySelectorAll('[data-peer-vol]').forEach((sl) => sl.addEventListener('input', () => setRemoteVolume(sl.dataset.peerVol, Number(sl.value))));
+  els.voicePanel.querySelectorAll('[data-peer-mute]').forEach((b) => b.addEventListener('click', () => toggleLocalMuteUser(b.dataset.peerMute)));
 }
 function createPeer(socketId, user) {
   if (!state.voice.stream) return null;
   if (state.voice.peers.has(socketId)) return state.voice.peers.get(socketId);
   const pc = new RTCPeerConnection(rtcConfig);
   state.voice.peers.set(socketId, pc); state.voice.participants.set(socketId, { socketId, user });
-  state.voice.stream.getTracks().forEach((track) => pc.addTrack(track, state.voice.stream));
+  const sendTrack = state.voice.sendTrack || state.voice.stream.getAudioTracks()[0];
+  if (sendTrack) pc.addTrack(sendTrack, state.voice.stream);
   pc.onicecandidate = (event) => { if (event.candidate) state.socket?.emit('voice:signal', { to: socketId, signal: { candidate: event.candidate } }); };
   pc.ontrack = (event) => {
     let audio = document.getElementById(`remote-${socketId}`);
     if (!audio) { audio = document.createElement('audio'); audio.id = `remote-${socketId}`; audio.autoplay = true; audio.playsInline = true; els.remoteAudio.appendChild(audio); }
     audio.srcObject = event.streams[0]; audio.play?.().catch(() => {});
+    configureRemoteAudio(audio, { socketId, user });
+    attachAnalyser(socketId, event.streams[0]);
   };
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'closed') { closePeer(socketId); return; }
@@ -1122,6 +1413,7 @@ async function handleVoiceSignal({ from, user, signal } = {}) {
 function closePeer(socketId) {
   const pc = state.voice.peers.get(socketId);
   clearPeerRestartTimer(socketId);
+  detachAnalyser(socketId);
   state.voice.peers.delete(socketId);
   state.voice.participants.delete(socketId);
   document.getElementById(`remote-${socketId}`)?.remove();
@@ -1134,9 +1426,13 @@ async function joinVoice() {
   if (state.voice.channelId === state.currentChannelId) return;
   if (state.voice.channelId) await leaveVoice(true);
   if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast('Tarayıcı canlı sesi desteklemiyor.');
+  if (!state.voicePrefs) state.voicePrefs = loadVoicePrefs();
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: applyAudioConstraints() });
     state.voice = freshVoiceState({ channelId: state.currentChannelId, stream, selfId: state.socket.id, manualLeave: false });
+    state.voice.sendTrack = buildSendTrack();
+    applyMicEnabled();
+    attachAnalyser('self', stream);
     renderVoicePanel();
     await emitVoiceJoin(state.currentChannelId);
     toast('Sesli odaya bağlandın.');
@@ -1157,6 +1453,10 @@ function cleanupVoice(options = {}) {
   state.voice.manualLeave = manual;
   clearVoiceKeepalive();
   clearVoiceReconnectGrace();
+  stopSpeakingLoop();
+  for (const key of [...(state.voice.analysers?.keys() || [])]) detachAnalyser(key);
+  teardownGain();
+  try { state.voice.audioCtx?.close(); } catch {}
   for (const socketId of [...(state.voice.peerRestartTimers?.keys() || [])]) clearPeerRestartTimer(socketId);
   closeAllVoicePeers();
   state.voice.stream?.getTracks().forEach((track) => track.stop());
@@ -1164,7 +1464,13 @@ function cleanupVoice(options = {}) {
   els.remoteAudio.innerHTML = '';
   renderVoicePanel();
 }
-function toggleMute() { if (!state.voice.stream) return; state.voice.muted = !state.voice.muted; state.voice.stream.getAudioTracks().forEach((track) => { track.enabled = !state.voice.muted; }); renderVoicePanel(); }
+function toggleMute() {
+  if (!state.voice.channelId) return;
+  if (state.voice.deafened) { toggleDeafen(); return; }
+  state.voice.muted = !state.voice.muted;
+  applyMicEnabled();
+  renderVoicePanel();
+}
 
 async function showSettings() {
   const settings = { theme: 'dark', compactMode: false, reduceMotion: false, ...(state.settings || {}) };
@@ -1172,7 +1478,7 @@ async function showSettings() {
   els.settingsContent.innerHTML = `
     <section class="settings-section"><h3>Profil</h3><div class="profile-edit-row"><span class="avatar small" id="settingsAvatarPreview"></span><div class="row-grow"><button id="settingsAvatarButton" class="ghost" type="button">Avatar yükle</button> <button id="settingsBannerButton" class="ghost" type="button">Afiş yükle</button></div></div><input id="settingsAvatarInput" class="hidden" type="file" accept="image/*"><input id="settingsBannerInput" class="hidden" type="file" accept="image/*"><label>Görünen ad<input id="settingsDisplayName" value="${escapeHTML(state.user?.displayName || '')}" maxlength="32"></label><label>Durum yazısı<input id="settingsStatus" value="${escapeHTML(state.user?.status || '')}" maxlength="80" placeholder="Müsait, oyundayım..."></label><label>Hakkımda<textarea id="settingsBio" maxlength="280" rows="3" placeholder="Kısa bir bio...">${escapeHTML(state.user?.bio || '')}</textarea></label><button id="saveProfileButton" class="primary" type="button">Kaydet</button></section>
     <section class="settings-section"><h3>Görünüm</h3><label>Tema<select id="settingsTheme"><option value="dark">Dark</option><option value="midnight">Midnight</option><option value="rainbow">Rainbow</option></select></label><label class="toggle-row"><input id="compactModeToggle" type="checkbox"> Kompakt görünüm</label><label class="toggle-row"><input id="reduceMotionToggle" type="checkbox"> Animasyonları azalt</label><button id="saveUiButton" class="ghost" type="button">Görünümü kaydet</button></section>
-    <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
+    <section class="settings-section"><h3>Ses</h3><p>Mikrofon iznini buradan test edebilirsin. Sesli mesaj ve arama HTTPS üzerinde çalışır.</p><div class="wrap-actions"><button id="testMicButton" class="ghost" type="button">Mikrofonu test et</button><button id="openVoiceSettingsButton" class="ghost" type="button">🎧 Cihaz ve gelişmiş ses ayarları</button></div><div id="micTestResult" class="info-card"><span class="row-grow"><strong>Hazır</strong><br><small>Butona basınca tarayıcı mikrofon izni ister.</small></span></div></section>
     <section class="settings-section"><h3>Güvenlik</h3><div id="securityInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>CSRF, rate-limit, upload yetkisi ve E2EE durumu.</small></span></div><ul class="security-list"><li>E2EE kanal başlığındaki kilit butonuyla açılır. Anahtar servera gönderilmez.</li><li>Yeni şifreli mesajları sadece aynı anahtarı bilen kişiler okuyabilir.</li><li>E2EE kapalıyken yeni mesajlar sunucuda okunabilir biçimde saklanır; kanal üstünde ayrıca uyarı görünür.</li><li>Canlı ses odası içeriği bu sürümde WebRTC/HTTPS ile gider; E2EE kilidi canlı ses için değil, mesaj/dosya/sesli mesaj içindir.</li><li>V7 otomatik tarayıcı yedeğini kapatır ve eski hassas localStorage yedeğini temizler.</li></ul><button id="logoutAllButton" class="ghost danger" type="button">Kendi oturumlarımı kapat</button></section>
     <section class="settings-section"><h3>Veri kalıcılığı</h3><div id="storageInfo" class="info-card"><span class="row-grow"><strong>Kontrol ediliyor...</strong><br><small>Hesaplar, sunucular, mesajlar ve dosyalar server tarafında saklanır.</small></span></div><p>Render Free dosya sistemi deploy/restart sonrası silinebilir. Hesaplar ve sunucular kesin kalsın istiyorsan PostgreSQL bağlantısı (DATABASE_URL) kullan. Yedek indir butonu acil geri dönüş içindir.</p></section>
     ${ownedServers.length ? `<section class="settings-section"><h3>Sunucu yönetimi</h3><p>Sahibi olduğun sunucuları yönet: kanal/üye düzeni, sabitlenen mesajlar ve mesaj moderasyonu (kendi sunucundaki mesajları silebilirsin). Sunucu yöneticiliği yalnızca kendi sunucunla sınırlıdır; genel uygulama yedeğine erişim vermez.</p><div id="ownedServerList" class="stack"></div></section>` : ''}
@@ -1197,6 +1503,7 @@ async function showSettings() {
     try { const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); target.innerHTML = '<span class="avatar online">✓</span><span class="row-grow"><strong>Mikrofon çalışıyor</strong><br><small>İzin verildi. Artık sesli mesaj ve arama kullanabilirsin.</small></span>'; stream.getTracks().forEach((track) => track.stop()); }
     catch { target.innerHTML = '<span class="avatar">!</span><span class="row-grow"><strong>Mikrofon izni alınamadı</strong><br><small>Tarayıcı adres çubuğundan mikrofon iznini kontrol et.</small></span>'; }
   });
+  $('openVoiceSettingsButton')?.addEventListener('click', () => { els.settingsModal.close?.(); openVoiceSettings(); });
   try {
     const info = await api('/api/storage-info'); const ok = Boolean(info.persistentData);
     $('storageInfo').innerHTML = `<span class="avatar ${ok ? 'online' : ''}">${ok ? '✓' : '!'}</span><span class="row-grow"><strong>${ok ? 'Kalıcı veri aktif' : 'Kalıcı veri garanti değil'}</strong><br><small>${escapeHTML(info.storageMode || 'file')} • ${escapeHTML(info.dataDir || '')} • ${info.uploadCount || 0} dosya • ${escapeHTML(info.warning || '')}</small></span>`;
@@ -1642,6 +1949,10 @@ function wireEvents() {
 }
 async function bootstrap() {
   wireEvents(); setAuthMode('login'); resetChat(); refreshPublicStatus();
+  state.voicePrefs = loadVoicePrefs();
+  if (navigator.mediaDevices?.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', () => { if (currentDrawerKind === 'voice') openVoiceSettings(); });
+  }
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   try { enterApp(await api('/api/me')); } catch { showAuth(); }
 }
