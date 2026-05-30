@@ -608,3 +608,23 @@ body[data-theme="rainbow"] { --brand: #ec4899; --brand-2: #22d3ee; --accent-grad
 .security-event-head strong { color: #e9efff; font-size: 13px; }
 .security-event-head time { color: var(--muted-2); font-size: 11px; }
 .security-event small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+/* ===================== V7.5 Voice Controls ===================== */
+.voice-panel { display: flex; flex-direction: column; gap: 10px; }
+.voice-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.voice-local-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.voice-ctl { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; font-size: 15px; line-height: 1; border: 1px solid var(--line-2); background: var(--surface-2); color: var(--text); }
+.voice-ctl:hover { background: var(--surface-3); }
+.voice-ctl.on { background: rgba(251, 113, 133, 0.2); border-color: rgba(251, 113, 133, 0.45); color: #ffb4c3; }
+.voice-participants { display: grid; gap: 4px; max-height: 200px; overflow: auto; padding-right: 2px; }
+.voice-prow { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 8px; border-radius: 10px; background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line); }
+.voice-prow strong { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 999px; background: rgba(255, 255, 255, 0.18); transition: background 0.1s ease, box-shadow 0.1s ease; }
+.voice-prow.speaking .voice-dot { background: var(--good); box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.25); }
+.voice-self-state { font-size: 13px; flex: 0 0 auto; }
+.voice-vol { flex: 0 0 110px; width: 110px; max-width: 42vw; accent-color: var(--brand); }
+.voice-mute-user { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 9px; background: var(--surface-2); border: 1px solid var(--line); font-size: 13px; }
+.voice-mute-user.on { background: rgba(251, 113, 133, 0.18); border-color: rgba(251, 113, 133, 0.4); color: #ffb4c3; }
+.voice-meter { height: 10px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; margin: 4px 0; }
+.voice-meter-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--good), var(--brand-2)); transition: width 0.06s linear; }
+.voice-connecting { flex: 0 0 auto; font-size: 11px; color: var(--muted-2); }

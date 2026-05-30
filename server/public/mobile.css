@@ -194,14 +194,19 @@
     align-items: stretch !important;
     gap: 8px !important;
     padding: 9px 10px !important;
-    max-height: 150px !important;
+    max-height: 42dvh !important;
     overflow: auto !important;
   }
 
-  .voice-actions {
+  .voice-actions,
+  .voice-local-actions {
     justify-content: flex-start !important;
     flex-wrap: wrap !important;
   }
+
+  /* V7.5: voice control rows fit the mobile sheet without horizontal overflow */
+  .voice-participants { max-height: 30dvh !important; }
+  .voice-vol { flex: 1 1 auto !important; width: auto !important; max-width: none !important; }
 
   .e2ee-warning {
     margin: 7px 8px 0 !important;
