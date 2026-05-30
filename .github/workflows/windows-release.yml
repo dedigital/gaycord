@@ -37,15 +37,26 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Resolve version from tag (or manual input)
+      # Resolve + STRICTLY validate the version. Context values (tag name / manual input) are passed in
+      # as env vars — never interpolated into the script text — and the result must match a strict
+      # semver pattern or the job fails. This blocks any shell-injection via a crafted tag/input, and
+      # everything downstream consumes only the validated steps.ver.outputs.* values (also via env).
+      - name: Resolve version (validated)
         id: ver
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -match '^v(.+)$') {
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -match '^v(.+)$') {
             $v = $Matches[1]
           } else {
-            $v = '${{ github.event.inputs.version }}'
+            $v = $env:INPUT_VERSION
             if ([string]::IsNullOrWhiteSpace($v)) { $v = '7.8.0' }
+          }
+          if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.\-][0-9A-Za-z]+)*$') {
+            throw "Refusing to release: invalid version string '$v' (expected strict semver like 7.8.0)."
           }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=v$v"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -69,15 +80,19 @@ jobs:
 
       - name: Build native app
         shell: bash
-        run: dotnet build windows-native/Gaycord.Native.csproj -c Release -p:Version=${{ steps.ver.outputs.version }}
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: dotnet build windows-native/Gaycord.Native.csproj -c Release -p:Version="$VERSION"
 
       - name: Publish native app (self-contained; NOT single-file, so Velopack can apply updates)
         shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: >
           dotnet publish windows-native/Gaycord.Native.csproj
           -c Release -r win-x64 --self-contained true
           -p:PublishSingleFile=false
-          -p:Version=${{ steps.ver.outputs.version }}
+          -p:Version="$VERSION"
           -o publish
 
       - name: Install Velopack CLI (pinned to the library version)
@@ -86,20 +101,24 @@ jobs:
 
       - name: Package installer + update feed with Velopack
         shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
           vpk pack `
             --packId Gaycord `
             --packTitle Gaycord `
-            --packVersion ${{ steps.ver.outputs.version }} `
+            --packVersion $env:VERSION `
             --packDir publish `
             --mainExe Gaycord.exe `
             --outputDir releases
 
       - name: Friendly installer name + SHA-256 checksums
         shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          $v = '${{ steps.ver.outputs.version }}'
+          $v = $env:VERSION
           $setup = Get-ChildItem releases -Filter '*Setup*.exe' | Select-Object -First 1
           if ($setup) { Copy-Item $setup.FullName "releases/Gaycord-Setup-$v.exe" -Force }
           Get-ChildItem releases -File | ForEach-Object {
@@ -110,10 +129,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          tag="${{ steps.ver.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" releases/* --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" releases/* --clobber
           else
-            gh release create "$tag" releases/* --title "Gaycord $tag" --generate-notes
+            gh release create "$TAG" releases/* --title "Gaycord $TAG" --generate-notes
           fi
